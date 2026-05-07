@@ -1,0 +1,98 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "連接 AIFA Smart",
+        "description": "使用你的 AIFA Smart 帳號登入。",
+        "data": {
+          "email": "電子郵件",
+          "password": "密碼"
+        }
+      },
+      "reauth_confirm": {
+        "title": "重新驗證 AIFA Smart",
+        "description": "{email} 的憑證已過期，請重新輸入密碼以取得新的連線。",
+        "data": {
+          "password": "密碼"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "無法連線到 AIFA Smart API。",
+      "invalid_auth": "登入失敗。",
+      "unknown": "發生未預期錯誤。"
+    },
+    "abort": {
+      "already_configured": "這個 AIFA Smart 帳號已經設定過了。",
+      "reauth_successful": "AIFA Smart 重新驗證成功。"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "temperature": {
+        "name": "溫度"
+      },
+      "humidity": {
+        "name": "濕度"
+      },
+      "firmware": {
+        "name": "韌體"
+      },
+      "macro_count": {
+        "name": "巨集數量"
+      },
+      "sub_device_code": {
+        "name": "裝置代碼"
+      },
+      "sub_device_code_source": {
+        "name": "代碼來源",
+        "state": {
+          "catalog": "本地目錄",
+          "cloud": "雲端"
+        }
+      },
+      "sub_device_brand": {
+        "name": "目錄品牌"
+      },
+      "sub_device_function_count": {
+        "name": "功能數量"
+      }
+    },
+    "binary_sensor": {
+      "online": {
+        "name": "裝置連線狀態"
+      }
+    },
+    "climate": {
+      "climate": {
+        "name": "冷氣"
+      }
+    },
+    "switch": {
+      "turbo": {
+        "name": "強力運轉"
+      },
+      "sleep": {
+        "name": "舒眠"
+      },
+      "power_saving": {
+        "name": "省電"
+      }
+    },
+    "button": {
+      "force_refresh": {
+        "name": "重新整理"
+      }
+    }
+  },
+  "issues": {
+    "catalog_refresh_failing": {
+      "title": "AIFA 冷氣型號資料更新失敗",
+      "description": "整合無法從 AIFA Firebase Remote Config 抓最新冷氣 metadata（{kind}）。控制指令仍正常運作，但 AIFA 新增的冷氣型號要等整合更新後才會正確顯示。詳情：{detail}"
+    },
+    "polling_failing": {
+      "title": "無法連線至 AIFA Smart API",
+      "description": "整合條目 {entry_id} 的資料更新已連續失敗。請確認 Home Assistant 可以連到 AIFA Smart 雲端，並查看整合的紀錄取得詳細錯誤。連線恢復後，這則通知會自動消失。"
+    }
+  }
+}

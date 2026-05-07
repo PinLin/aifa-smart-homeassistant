@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+coverage.xml
+.venv/
+
+# Home Assistant
+.storage/
+
+# Project
+aifa-avd.log
+.vscode/
+.idea/
+.env
+.claude/settings.local.json
+
+# OS
+.DS_Store
+.thumbs.db

@@ -1,0 +1,84 @@
+rules:
+  # Bronze
+  action-setup: done
+  appropriate-polling: done
+  brands:
+    status: exempt
+    comment: |
+      Custom integration ships its own brand/ assets; the upstream
+      home-assistant/brands repo rule does not apply.
+  common-modules: done
+  config-flow-test-coverage: done
+  config-flow: done
+  dependency-transparency:
+    status: exempt
+    comment: |
+      No third-party dependencies beyond what HA already ships
+      (aiohttp, voluptuous, async_timeout). Firebase Remote Config is
+      hit via aiohttp, not the firebase-admin SDK.
+  docs-actions: done
+  docs-high-level-description: done
+  docs-installation-instructions: done
+  docs-removal-instructions: done
+  entity-event-setup:
+    status: exempt
+    comment: |
+      Coordinator + classic-listener push pattern; entities subscribe
+      via CoordinatorEntity, no external event sources.
+  entity-unique-id: done
+  has-entity-name: done
+  runtime-data: done
+  test-before-configure: done
+  test-before-setup: done
+  unique-config-entry: done
+
+  # Silver
+  action-exceptions:
+    status: exempt
+    comment: |
+      Service actions (force_refresh, macro buttons) only kick the
+      coordinator or send IR commands; they do not perform user-visible
+      side effects that warrant translated exceptions.
+  config-entry-unloading: done
+  docs-configuration-parameters: done
+  docs-installation-parameters: done
+  entity-unavailable: done
+  integration-owner: done
+  log-when-unavailable: done
+  parallel-updates: done
+  reauthentication-flow: done
+  test-coverage: done
+
+  # Gold
+  devices: done
+  diagnostics: done
+  discovery:
+    status: exempt
+    comment: |
+      Cloud-only setup; no local network discovery.
+  discovery-update-info:
+    status: exempt
+    comment: |
+      Cloud-only setup; no local network discovery.
+  docs-data-update: done
+  docs-examples: done
+  docs-known-limitations: done
+  docs-supported-devices: done
+  docs-supported-functions: done
+  docs-troubleshooting: done
+  docs-use-cases: done
+  dynamic-devices: done
+  entity-category: done
+  entity-device-class: done
+  entity-disabled-by-default: done
+  entity-translations: done
+  exception-translations: todo
+  icon-translations: done
+  reconfiguration-flow: todo
+  repair-issues: done
+  stale-devices: todo
+
+  # Platinum
+  async-dependency: done
+  inject-websession: done
+  strict-typing: todo

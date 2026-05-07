@@ -1,0 +1,12 @@
+{
+  "domain": "aifa_smart",
+  "name": "AIFA Smart",
+  "version": "0.1.0",
+  "documentation": "https://github.com/PinLin/aifa-smart-homeassistant",
+  "issue_tracker": "https://github.com/PinLin/aifa-smart-homeassistant/issues",
+  "requirements": [],
+  "dependencies": [],
+  "codeowners": ["@PinLin"],
+  "iot_class": "cloud_polling",
+  "config_flow": true
+}

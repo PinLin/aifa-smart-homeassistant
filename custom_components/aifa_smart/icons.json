@@ -1,0 +1,40 @@
+{
+  "entity": {
+    "sensor": {
+      "macro_count": {
+        "default": "mdi:playlist-play"
+      },
+      "firmware": {
+        "default": "mdi:chip"
+      },
+      "sub_device_code": {
+        "default": "mdi:remote"
+      },
+      "sub_device_code_source": {
+        "default": "mdi:cloud-outline"
+      },
+      "sub_device_brand": {
+        "default": "mdi:tag"
+      },
+      "sub_device_function_count": {
+        "default": "mdi:format-list-numbered"
+      }
+    },
+    "button": {
+      "force_refresh": {
+        "default": "mdi:refresh"
+      }
+    },
+    "switch": {
+      "turbo": {
+        "default": "mdi:rocket-launch-outline"
+      },
+      "sleep": {
+        "default": "mdi:sleep"
+      },
+      "power_saving": {
+        "default": "mdi:leaf"
+      }
+    }
+  }
+}

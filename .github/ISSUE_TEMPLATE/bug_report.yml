@@ -1,0 +1,73 @@
+name: Bug report
+description: Something is broken or behaving unexpectedly.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill in as much detail as you can — most importantly, **attach a diagnostics dump** (Settings → Devices & Services → AIFA Smart → ⋮ → Download diagnostics). Without it, root-causing cloud-API or IR encoding issues is usually impossible.
+
+  - type: input
+    id: ha_version
+    attributes:
+      label: Home Assistant version
+      placeholder: e.g. 2026.4.2
+    validations:
+      required: true
+
+  - type: input
+    id: integration_version
+    attributes:
+      label: Integration version
+      description: Find it under Settings → Devices & Services → AIFA Smart → ⋮ → System info, or in `manifest.json`.
+      placeholder: e.g. 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: hub_model
+    attributes:
+      label: Hub model
+      description: AIFA hub model and firmware version (visible in the device page).
+      placeholder: e.g. C3 / 1.2.3
+
+  - type: input
+    id: appliance_brand_model
+    attributes:
+      label: Appliance brand / model
+      description: Brand and model of the controlled appliance (esp. the AC), since IR encoding varies by manufacturer.
+      placeholder: e.g. Hitachi / RAS-50YJ4
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug. Include the entity that misbehaves and the value you saw vs. what you expected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Go to ...
+        2. Click ...
+        3. See ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Set the integration to debug logging (`logger.set_level: { custom_components.aifa_smart: debug }`) and paste the relevant lines.
+      render: text
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Attach the diagnostics JSON downloaded from Settings → Devices & Services → AIFA Smart → ⋮ → Download diagnostics. Drag-and-drop the file into this field.
+    validations:
+      required: true

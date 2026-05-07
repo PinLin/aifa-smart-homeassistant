@@ -1,0 +1,98 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect AIFA Smart",
+        "description": "Sign in with your AIFA Smart account.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate AIFA Smart",
+        "description": "The stored tokens for {email} have expired. Enter the password to obtain a new session.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to reach the AIFA Smart API.",
+      "invalid_auth": "Authentication failed.",
+      "unknown": "Unexpected error."
+    },
+    "abort": {
+      "already_configured": "This AIFA Smart account is already configured.",
+      "reauth_successful": "AIFA Smart re-authentication succeeded."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "temperature": {
+        "name": "Temperature"
+      },
+      "humidity": {
+        "name": "Humidity"
+      },
+      "firmware": {
+        "name": "Firmware"
+      },
+      "macro_count": {
+        "name": "Macro Count"
+      },
+      "sub_device_code": {
+        "name": "Device Code"
+      },
+      "sub_device_code_source": {
+        "name": "Code Source",
+        "state": {
+          "catalog": "Catalog",
+          "cloud": "Cloud"
+        }
+      },
+      "sub_device_brand": {
+        "name": "Catalog Brand"
+      },
+      "sub_device_function_count": {
+        "name": "Function Count"
+      }
+    },
+    "binary_sensor": {
+      "online": {
+        "name": "Device Connection Status"
+      }
+    },
+    "climate": {
+      "climate": {
+        "name": "Climate"
+      }
+    },
+    "switch": {
+      "turbo": {
+        "name": "Turbo"
+      },
+      "sleep": {
+        "name": "Sleep"
+      },
+      "power_saving": {
+        "name": "Power Saving"
+      }
+    },
+    "button": {
+      "force_refresh": {
+        "name": "Refresh"
+      }
+    }
+  },
+  "issues": {
+    "catalog_refresh_failing": {
+      "title": "AIFA catalog refresh is failing",
+      "description": "The integration could not refresh AC capability metadata from AIFA's Firebase Remote Config ({kind}). Control commands still work, but new AC models added by AIFA won't appear correctly until the integration is updated. Detail: {detail}"
+    },
+    "polling_failing": {
+      "title": "AIFA Smart API unreachable",
+      "description": "Sustained polling failures for entry {entry_id}. Check that Home Assistant can reach the AIFA Smart cloud API, then review the integration log for details. The notification clears automatically once polling succeeds again."
+    }
+  }
+}

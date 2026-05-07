@@ -1,0 +1,25 @@
+name: Feature request
+description: Suggest a new capability or improvement.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One-paragraph description of what you'd like to see.
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Why is this useful?
+      description: What automation, dashboard, or use case does this enable that isn't possible today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you've tried, or other ways the same need could be met.
