@@ -6,7 +6,8 @@ SDK; the integration ships a static snapshot to avoid bringing the
 Firebase SDK + AIFA's API key into the HA runtime.
 
 Run this script after refreshing `reverse/firebase_activate.json` (see
-`docs/regen-ac-catalog.md` for the full extraction procedure).
+the wiki's "Regen AC Catalog" page for the full extraction procedure:
+https://github.com/PinLin/aifa-smart-homeassistant/wiki/Regen-AC-Catalog).
 
 Usage:
     python3 tools/regen_ac_catalog.py
@@ -158,7 +159,7 @@ from __future__ import annotations
 
 # Generated from reverse/firebase_activate.json by tools/regen_ac_catalog.py.
 # Do NOT edit by hand — re-run the tool after refreshing the Firebase
-# snapshot. See docs/regen-ac-catalog.md.
+# snapshot. See https://github.com/PinLin/aifa-smart-homeassistant/wiki/Regen-AC-Catalog.
 
 AC_AVAILABLE_MODES_BY_DEVICE_CODE: dict[str, tuple[str, ...]] = {{
 {_emit_modes_map(available_modes)}
@@ -213,7 +214,7 @@ def main() -> int:
 
     if not args.firebase.exists():
         print(f"firebase_activate.json not found: {args.firebase}")
-        print("See docs/regen-ac-catalog.md for how to extract a fresh snapshot.")
+        print("See https://github.com/PinLin/aifa-smart-homeassistant/wiki/Regen-AC-Catalog for how to extract a fresh snapshot.")
         return 1
 
     content = regenerate(args.firebase, args.output)

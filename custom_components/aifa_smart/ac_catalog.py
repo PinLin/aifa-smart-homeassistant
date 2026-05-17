@@ -3,7 +3,7 @@ from __future__ import annotations
 
 # Generated from reverse/firebase_activate.json by tools/regen_ac_catalog.py.
 # Do NOT edit by hand — re-run the tool after refreshing the Firebase
-# snapshot. See docs/regen-ac-catalog.md.
+# snapshot. See https://github.com/PinLin/aifa-smart-homeassistant/wiki/Regen-AC-Catalog.
 
 AC_AVAILABLE_MODES_BY_DEVICE_CODE: dict[str, tuple[str, ...]] = {
     '1': ('auto', 'cool', 'heat', 'fan', 'dry'),
