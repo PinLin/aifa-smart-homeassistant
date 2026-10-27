@@ -864,33 +864,22 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         now = dt_util.utcnow()
         updated = False
 
-        if decoded.temperature is not None and device.temperature != decoded.temperature:
-            device.temperature = decoded.temperature
+        # The cloud value is what i-Ctrl Pro displays; the hub's raw packet
+        # converts differently, so it only fills readings the cloud lacks.
+        for key, value in (
+            ("temperature", decoded.temperature),
+            ("humidity", decoded.humidity),
+        ):
+            if value is None or getattr(device, key) is not None:
+                continue
+            setattr(device, key, value)
+            device.sensor_samples[key] = AifaSensorSample(
+                sensor_type=key,
+                value=value,
+                updated_at=now,
+                raw=dict(decoded.raw),
+            )
             updated = True
-        if decoded.humidity is not None and device.humidity != decoded.humidity:
-            device.humidity = decoded.humidity
-            updated = True
-
-        if decoded.temperature is not None:
-            current = device.sensor_samples.get("temperature")
-            if current is None or current.value != decoded.temperature or current.raw != decoded.raw:
-                device.sensor_samples["temperature"] = AifaSensorSample(
-                    sensor_type="temperature",
-                    value=decoded.temperature,
-                    updated_at=now,
-                    raw=dict(decoded.raw),
-                )
-                updated = True
-        if decoded.humidity is not None:
-            current = device.sensor_samples.get("humidity")
-            if current is None or current.value != decoded.humidity or current.raw != decoded.raw:
-                device.sensor_samples["humidity"] = AifaSensorSample(
-                    sensor_type="humidity",
-                    value=decoded.humidity,
-                    updated_at=now,
-                    raw=dict(decoded.raw),
-                )
-                updated = True
 
         if updated:
             device.updated_at = now

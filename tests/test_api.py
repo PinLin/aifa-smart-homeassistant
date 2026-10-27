@@ -280,6 +280,19 @@ class ApiNormalizationTests(unittest.TestCase):
         self.assertAlmostEqual(decoded.humidity or 0.0, expected_humidity, places=4)
         self.assertEqual(decoded.raw, {"temp": "28915", "hum": "37282"})
 
+    def test_decode_classic_sensor_packet_subtracts_one_degree_for_device_type_4(self) -> None:
+        """The app subtracts 1 °C for deviceType 4 hubs; other types are untouched."""
+        packet = bytes.fromhex(
+            "53454e534f527b0a2274656d70223a223238393135222c0a2268756d223a223337323832220a7d"
+        )
+        base = decode_classic_sensor_packet(packet)
+        ictrl_ac = decode_classic_sensor_packet(packet, device_type="4")
+        other = decode_classic_sensor_packet(packet, device_type="3")
+        assert base is not None and ictrl_ac is not None and other is not None
+        self.assertAlmostEqual(ictrl_ac.temperature or 0.0, (base.temperature or 0.0) - 1.0, places=6)
+        self.assertEqual(other.temperature, base.temperature)
+        self.assertEqual(ictrl_ac.humidity, base.humidity)
+
     def test_parse_function_keeps_commands_and_schedule(self) -> None:
         """Function rows should normalize nested commands."""
         function = _parse_function(

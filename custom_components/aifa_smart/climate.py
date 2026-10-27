@@ -252,6 +252,7 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
                 "sleep_enabled": runtime.exposed_sleep,
                 "power_saving_enabled": runtime.exposed_power_saving,
                 "aifa_available_modes": list(self._capabilities.available_modes),
+                "aifa_anti_mold_modes": list(self._capabilities.anti_mold_modes),
                 "aifa_supports_sleep": self._capabilities.supports_sleep,
                 "aifa_supports_power_saving": self._capabilities.supports_power_saving,
                 "aifa_supports_turbo": self._capabilities.supports_turbo,

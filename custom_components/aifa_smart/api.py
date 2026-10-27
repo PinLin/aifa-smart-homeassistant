@@ -578,7 +578,7 @@ def extract_classic_sensor_packets(buffer: bytes) -> tuple[list[bytes], bytes]:
 def decode_classic_sensor_packet(
     packet: bytes,
     *,
-    temperature_adjustment_mode: int | None = None,
+    device_type: str | None = None,
 ) -> AifaClassicSensorState | None:
     """Decode one live classic-socket sensor packet into temperature and humidity."""
     if not packet.startswith(_CLASSIC_SENSOR_PREFIX):
@@ -614,7 +614,8 @@ def decode_classic_sensor_packet(
                 + (1.05 * raw_temperature)
                 + 0.235
             )
-            if temperature_adjustment_mode == 4:
+            # i-Ctrl Pro subtracts 1 °C for deviceType 4 (i-Ctrl AC) hubs.
+            if device_type is not None and device_type.strip() == "4":
                 temperature -= 1.0
 
     return AifaClassicSensorState(

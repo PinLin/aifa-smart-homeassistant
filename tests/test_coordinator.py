@@ -6,6 +6,7 @@ import types
 import unittest
 import unittest.mock
 
+from custom_components.aifa_smart.api import AifaClassicSensorState, AifaDevice
 from custom_components.aifa_smart.coordinator import AifaSmartCoordinator
 from custom_components.aifa_smart.runtime import AifaAcRuntimeState
 
@@ -513,6 +514,46 @@ class ResolveHelperFlagMutexTests(unittest.TestCase):
 
     def test_all_none_and_clear_returns_clear(self) -> None:
         self.assertEqual(self._call(), (False, False, False))
+
+
+class ApplyClassicSensorStateTests(unittest.TestCase):
+    """Cloud readings win over the hub's raw sensor packet."""
+
+    @staticmethod
+    def _apply(device: AifaDevice, decoded: AifaClassicSensorState) -> bool:
+        coordinator = AifaSmartCoordinator.__new__(AifaSmartCoordinator)
+        coordinator.get_device = lambda device_id: device
+        return coordinator._apply_classic_sensor_state(device.id, decoded)
+
+    @staticmethod
+    def _device(temperature: float | None, humidity: float | None) -> AifaDevice:
+        return AifaDevice(
+            id="8014",
+            name="hub",
+            mac=None,
+            device_type="4",
+            online=True,
+            temperature=temperature,
+            humidity=humidity,
+            firmware=None,
+        )
+
+    def test_cloud_values_are_not_overwritten(self) -> None:
+        device = self._device(27.8, 67.5)
+        updated = self._apply(device, AifaClassicSensorState(28.3, 57.3))
+        self.assertFalse(updated)
+        self.assertEqual(device.temperature, 27.8)
+        self.assertEqual(device.humidity, 67.5)
+        self.assertEqual(device.sensor_samples, {})
+
+    def test_packet_fills_readings_missing_from_cloud(self) -> None:
+        device = self._device(27.8, None)
+        updated = self._apply(device, AifaClassicSensorState(28.3, 57.3))
+        self.assertTrue(updated)
+        self.assertEqual(device.temperature, 27.8)
+        self.assertEqual(device.humidity, 57.3)
+        self.assertEqual(device.sensor_samples["humidity"].value, 57.3)
+        self.assertNotIn("temperature", device.sensor_samples)
 
 
 if __name__ == "__main__":

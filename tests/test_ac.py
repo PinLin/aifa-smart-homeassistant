@@ -38,7 +38,8 @@ class AifaAcPacketTests(unittest.TestCase):
         self.assertTrue(is_supported_ac_device_code("136"))
         self.assertTrue(is_supported_ac_device_code("999"))
         self.assertFalse(is_supported_ac_device_code(None))
-        self.assertFalse(is_supported_ac_device_code("16"))
+        # Empty ac_available_modes only means "no anti-mold"; the AC is still controllable.
+        self.assertTrue(is_supported_ac_device_code("16"))
 
     def test_ac_sub_device_detection_checks_type_and_device_code(self) -> None:
         """Climate entities should only attach to AC-like sub-devices."""
@@ -46,7 +47,14 @@ class AifaAcPacketTests(unittest.TestCase):
         self.assertTrue(is_supported_ac_sub_device("0", "999"))
         self.assertFalse(is_supported_ac_sub_device("1", "136"))
         self.assertFalse(is_supported_ac_sub_device("0", None))
-        self.assertFalse(is_supported_ac_sub_device("0", "16"))
+        self.assertTrue(is_supported_ac_sub_device("0", "16"))
+
+    def test_empty_anti_mold_list_still_offers_every_mode(self) -> None:
+        """Code 16 (classic temp control) has no anti-mold modes but all five AC modes."""
+        capabilities = get_ac_capabilities("16")
+        self.assertEqual(capabilities.available_modes, ("auto", "cool", "heat", "fan", "dry"))
+        self.assertEqual(capabilities.anti_mold_modes, ())
+        self.assertTrue(capabilities.classic_temp_control)
 
     def test_remote_config_capabilities_for_a_known_ac_code(self) -> None:
         """A known AC catalog entry should expose the full mode/fan/swing set.
@@ -163,6 +171,14 @@ class AifaAcPacketTests(unittest.TestCase):
         assert dry_status is not None
         self.assertEqual(dry_status[1].mode, "dry")
         self.assertIsNone(dry_status[1].target_temperature)
+
+    def test_decode_observed_status_packet_drops_zero_setpoint_in_cool(self) -> None:
+        """A 0x00 setpoint byte means "no setpoint", never 0 °C."""
+        decoded = decode_observed_status_packet("fea00136000020110000000000f0")
+        self.assertIsNotNone(decoded)
+        assert decoded is not None
+        self.assertEqual(decoded[1].mode, "cool")
+        self.assertIsNone(decoded[1].target_temperature)
 
     def test_decode_observed_status_packet_sleep_mask_is_0x08(self) -> None:
         """Observed-packet decoder must use sleep mask 0x08, not stale 0x10.

@@ -136,6 +136,7 @@ class AifaAcCapabilities:
 
     device_code: str | None
     available_modes: tuple[str, ...]
+    anti_mold_modes: tuple[str, ...]
     fan_modes: tuple[str, ...]
     swing_modes: tuple[str, ...]
     classic_temp_control: bool
@@ -225,14 +226,9 @@ def get_ac_capabilities(device_code: str | None) -> AifaAcCapabilities:
     """Return remote-config derived capabilities for a device code."""
     cat = catalog.get_active()
     normalized_code = _normalize_device_code(device_code)
-    configured_modes = cat.available_modes_by_device_code.get(
-        normalized_code or "", None
-    )
-
-    if configured_modes is None:
-        available_modes = _DEFAULT_AVAILABLE_MODES
-    else:
-        available_modes = configured_modes
+    # Remote config's ac_available_modes lists the modes anti-mold may run in,
+    # not the AC's modes: the app always offers all five mode buttons.
+    anti_mold_modes = cat.available_modes_by_device_code.get(normalized_code or "", ())
 
     supports_extra_windspeed = normalized_code in (
         cat.extra_windspeed_codes | cat.observed_extra_windspeed_codes
@@ -248,7 +244,10 @@ def get_ac_capabilities(device_code: str | None) -> AifaAcCapabilities:
 
     return AifaAcCapabilities(
         device_code=normalized_code,
-        available_modes=tuple(normalize_catalog_mode(mode) for mode in available_modes),
+        available_modes=tuple(
+            normalize_catalog_mode(mode) for mode in _DEFAULT_AVAILABLE_MODES
+        ),
+        anti_mold_modes=tuple(normalize_catalog_mode(mode) for mode in anti_mold_modes),
         fan_modes=_DEFAULT_FAN_MODES,
         swing_modes=_DEFAULT_SWING_MODES,
         classic_temp_control=normalized_code in cat.classic_temp_control_codes,
@@ -305,11 +304,7 @@ def get_ac_profile(device_code: str | None) -> AifaAcProfile | None:
 
 def is_supported_ac_device_code(device_code: str | None) -> bool:
     """Return True when a device-code can use the shared AC packet family."""
-    normalized_code = _normalize_device_code(device_code)
-    if normalized_code is None:
-        return False
-    capabilities = get_ac_capabilities(normalized_code)
-    return len(capabilities.available_modes) > 0
+    return _normalize_device_code(device_code) is not None
 
 
 def is_supported_ac_sub_device(sub_device_type: str | None, device_code: str | None) -> bool:
@@ -650,7 +645,10 @@ def decode_observed_status_packet(
         mode = None
 
     target_temperature = _decode_bcd_byte(packet_bytes[4])
-    if mode in {"auto", "fan_only", "dry"} and packet_bytes[4] == 0x00:
+    # The hub reports 0x00 when it has no setpoint for the mode, including cool.
+    if target_temperature is not None and not (
+        AIFA_AC_MIN_TEMP <= target_temperature <= AIFA_AC_MAX_TEMP
+    ):
         target_temperature = None
 
     if mode is None:

@@ -96,6 +96,7 @@ class AifaClassicSocketListenerSpec:
     device_id: str
     mac: str
     targets: tuple[AifaClassicSocketTarget, ...]
+    device_type: str | None = None
 
 
 # Callback signatures. Manager calls back into the coordinator for any state
@@ -260,6 +261,7 @@ class ClassicSocketManager:
                 device_id=device.id,
                 mac=device.mac,
                 targets=targets,
+                device_type=device.device_type,
             )
         return specs
 
@@ -528,7 +530,9 @@ class ClassicSocketManager:
 
         sensor_packets, sensor_buffer = extract_classic_sensor_packets(sensor_buffer)
         for packet in sensor_packets:
-            decoded_sensor = decode_classic_sensor_packet(packet)
+            decoded_sensor = decode_classic_sensor_packet(
+                packet, device_type=spec.device_type
+            )
             if decoded_sensor is None:
                 continue
             updated = self._on_sensor_state(spec.device_id, decoded_sensor) or updated
