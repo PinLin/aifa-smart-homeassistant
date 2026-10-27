@@ -2,7 +2,6 @@
 
 [![GitHub Release](https://img.shields.io/github/release/PinLin/aifa-smart-homeassistant.svg?style=flat-square)](https://github.com/PinLin/aifa-smart-homeassistant/releases)
 [![HACS Badge](https://img.shields.io/badge/HACS-Custom-orange.svg?style=flat-square)](https://github.com/hacs/integration)
-[![MIT License](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
 
 把 AIFA Smart 帳號下的 i-Ctrl 主機與底下的冷氣遙控帶進 Home Assistant，提供裝置在線狀態、溫濕度感測，以及冷氣的即時控制。
 
@@ -125,7 +124,3 @@ python -m pytest tests/ -v
 ## 免責聲明
 
 本整合為非官方、社群維護的專案，與艾法科技股份有限公司（AIFA Technology）及 AIFA Remote 服務無任何關係。資料來源為 AIFA 雲端 API 與 i-Ctrl 主機 socket；這些介面為非公開介面，可能在沒有預告的情況下變更或停用，本整合可能因此暫時或永久無法繼續運作。
-
-## 授權
-
-[MIT License](LICENSE)
