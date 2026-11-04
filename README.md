@@ -84,22 +84,22 @@
 
 ## 冷氣控制
 
-`climate` entity 會自動掛到看起來是冷氣的子裝置（`type == 0` 且 `device_code` 存在），目前支援：
+`climate` entity 會自動掛到看起來是冷氣的子裝置（`type == 0` 且 `device_code` 存在），操作方式和 i-Ctrl Pro App 相同：
 
 - **HVAC mode**：`off / auto / cool / dry / fan_only / heat`
 - **Fan mode**：`auto / low / medium / high`
 - **Swing mode**：`off / auto / fixed_1 ~ fixed_5`
 - **目標溫度範圍**：17–30 °C
-- **目前溫度**：來自主機環境溫度感測器
+- **巨集**：和 App 一樣不等主機回報，每一步送出就接著送下一步。
 
-整合會主動讀回主機的真實狀態，所以從 AIFA App 或實體遙控器改冷氣，HA 也會跟著更新。實測 `cool 26` 約 5 秒內會同步；`off` 在某些情況可能慢一些，整合會在背景持續重新探測直到收斂。
+整合會主動讀回主機的真實狀態，所以從 AIFA App 或實體遙控器改冷氣，HA 也會跟著更新。`cool 26` 通常約 5 秒內會同步；`off` 在某些情況可能慢一些，整合會在背景持續重新探測直到收斂。
 
 > 主機只會回報 `hvac_mode` 與 `target_temperature` 的真實狀態，`fan_mode` / `swing_mode` 與 helper switch（強力運轉 / 節電 / 省電）目前沒有可靠的回讀路徑，整合會以「使用者最後設定」為準。`climate` 實體會用 attribute 暴露目前狀態的來源，方便除錯。
 
 ## 已知限制
 
 - 子裝置清單只會反映設定當下抓到的內容；之後在 AIFA App 改裝置清單時，重新載入整合最穩。
-- 冷氣以外的紅外線家具（TV、燈、風扇等）目前還沒有控制路徑。
+- 冷氣以外的紅外線家具（TV、燈、風扇等）目前還沒有控制路徑；`favorite_channels` 也還沒納入。
 - learned keys、`favorite_channels` 目前只做 read-only 診斷或還沒納入。
 
 ## 移除整合
@@ -117,9 +117,10 @@ python -m py_compile custom_components/aifa_smart/*.py tests/*.py
 python -m pytest tests/ -v
 ```
 
-## Notes
+## 備註
 
-- PRs 與 issues 歡迎 — 對應你手邊 AC 機型的測試樣本特別有幫助。
+- 歡迎 PR 與 issue，對應你手邊冷氣機型的測試樣本特別有幫助。
+- 各版本的變更見 [CHANGELOG](CHANGELOG.md)。
 
 ## 免責聲明
 

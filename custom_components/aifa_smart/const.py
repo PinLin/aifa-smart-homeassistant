@@ -35,8 +35,7 @@ CONF_REFRESH_TOKEN = "refresh_token"
 CONF_TOKEN_TYPE = "token_type"
 CONF_TOKEN_EXPIRES_AT = "token_expires_at"
 
-# Hub pushes SENSOR{...} every 60s via TLS 8751 broadcast — empirically
-# verified 2026-04-29 by 5-min passive observation. AC observed state and
+# Hub pushes SENSOR{...} every 60s via TLS 8751 broadcast. AC observed state and
 # sensor packets both arrive on the long-lived classic listener, so the
 # REST poll is mainly a structural-data refresher (devices, functions,
 # macros, favorites, device-codes catalog). Hard-coding to 60s aligns with

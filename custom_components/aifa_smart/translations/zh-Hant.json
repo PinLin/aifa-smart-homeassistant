@@ -82,6 +82,12 @@
     "button": {
       "force_refresh": {
         "name": "重新整理"
+      },
+      "temperature_up": {
+        "name": "溫度 +"
+      },
+      "temperature_down": {
+        "name": "溫度 −"
       }
     }
   },

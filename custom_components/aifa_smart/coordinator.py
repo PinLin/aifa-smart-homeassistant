@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from homeassistant.config_entries import ConfigEntry
@@ -19,13 +19,17 @@ from homeassistant.util import dt as dt_util
 
 from .ac import (
     AifaAcStatus,
+    build_classic_temperature_key_command,
     build_estimated_capabilities,
+    build_mode_key_command,
     build_power_off_command,
+    build_power_on_command,
     build_status_command,
     clamp_target_temperature,
     decode_status_command,
     get_ac_capabilities,
     get_default_mode,
+    hub_requires_mode_keys,
     is_supported_ac_sub_device,
     normalize_ac_mode,
 )
@@ -37,11 +41,11 @@ from .api import (
     AifaFunctionCommand,
     AifaMacro,
     AifaSensorSample,
-    AifaSubDevice,
     AifaSmartApiClient,
     AifaSmartAuthError,
     AifaSmartConnectionError,
     AifaSmartError,
+    AifaSubDevice,
 )
 from .classic_listener import (
     AifaClassicSocketListenerSpec,
@@ -310,11 +314,7 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         # without this, a second send racing the first observed packet
         # produces the "dropped command" symptom.
         lock_key = (device_id, sub_device_id)
-        lock = self._ac_apply_locks.get(lock_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._ac_apply_locks[lock_key] = lock
-        async with lock:
+        async with self._ac_apply_lock(lock_key):
             await self._async_throttle_ac_send(lock_key)
             return await self._async_apply_ac_state_locked(
                 device_id,
@@ -328,6 +328,37 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
                 power_saving=power_saving,
                 device_code=device_code,
             )
+
+    async def async_press_classic_temperature_key(
+        self, device_id: str, sub_device_id: str, *, up: bool
+    ) -> None:
+        """Send one +/- temperature key press to a classic-temperature AC."""
+        sub_device = self.get_sub_device(device_id, sub_device_id)
+        if sub_device is None:
+            raise AifaSmartError(f"Sub-device {sub_device_id} not found")
+        command = build_classic_temperature_key_command(
+            _ac_socket_sub_type(sub_device), up=up
+        )
+        lock_key = (device_id, sub_device_id)
+        async with self._ac_apply_lock(lock_key):
+            await self._async_throttle_ac_send(lock_key)
+            await self._async_dispatch_raw_commands(
+                [
+                    AifaFunctionCommand(
+                        id="classic-temperature-key",
+                        device_id=device_id,
+                        sub_device_id=sub_device_id,
+                        command=command,
+                    )
+                ]
+            )
+
+    def _ac_apply_lock(self, key: tuple[str, str | None]) -> asyncio.Lock:
+        lock = self._ac_apply_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._ac_apply_locks[key] = lock
+        return lock
 
     async def _async_throttle_ac_send(
         self, key: tuple[str, str | None]
@@ -437,16 +468,42 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
             sleep=resolved_sleep,
             power_saving=resolved_power_saving,
         )
-        await self.async_send_function_commands(
-            [
-                AifaFunctionCommand(
-                    id="manual-status",
-                    device_id=device_id,
-                    sub_device_id=sub_device_id,
-                    command=command,
-                )
-            ]
+        mode_only = all(
+            value is None
+            for value in (target_temperature, fan_mode, swing_mode, turbo, sleep, power_saving)
         )
+        power_on_command, mode_key_command = self._ac_mode_key_commands(
+            device_id,
+            sub_device_id,
+            state,
+            resolved_mode,
+            mode_only=mode_only,
+        )
+        # The status packet stays the source of the optimistic state below even
+        # when only key presses go out, so the runtime model is identical.
+        packets: list[tuple[str, str]] = []
+        if power_on_command is not None:
+            packets.append(("manual-power-on", power_on_command))
+        if mode_key_command is not None:
+            packets.append(("manual-mode-key", mode_key_command))
+        if mode_key_command is None or not mode_only:
+            packets.append(("manual-status", command))
+        lock_key = (device_id, sub_device_id)
+        for index, (command_id, packet) in enumerate(packets):
+            if index:
+                await self._async_throttle_ac_send(lock_key)
+            await self.async_send_function_commands(
+                [
+                    AifaFunctionCommand(
+                        id=command_id,
+                        device_id=device_id,
+                        sub_device_id=sub_device_id,
+                        command=packet,
+                    )
+                ]
+            )
+        sent_command = packets[-1][1]
+        keys_only = sent_command == mode_key_command
 
         state.requested_hvac_mode = resolved_mode
         state.requested_target_temperature = resolved_target_temperature
@@ -456,9 +513,13 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         state.requested_sleep = resolved_sleep
         state.requested_power_saving = resolved_power_saving
         state.last_active_hvac_mode = resolved_mode
-        state.last_status_command = command
-        state.last_power_command = None
+        state.last_status_command = sent_command
+        state.last_power_command = power_on_command
         decoded_command = decode_status_command(command, device_code=device_code)
+        if decoded_command is not None and keys_only:
+            # A mode key leaves the AC's own setpoint alone; claiming ours would
+            # make every observed packet look stale and pin the pending state.
+            decoded_command = replace(decoded_command, target_temperature=None)
         if decoded_command is not None:
             state.apply_sent_command_status(decoded_command)
         else:
@@ -468,12 +529,13 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
             state.state_source = "requested_fallback"
             state.helper_flags_state_source = "requested_fallback"
         self.async_update_listeners()
+        expected_target_temperature = None if keys_only else resolved_target_temperature
         await self._async_probe_ac_observed_state(
             device_id,
             sub_device_id,
             minimum_observed_revision=baseline_observed_revision,
             expected_mode=resolved_mode,
-            expected_target_temperature=resolved_target_temperature,
+            expected_target_temperature=expected_target_temperature,
             expected_fan_mode=resolved_fan_mode,
             expected_swing_mode=resolved_swing_mode,
         )
@@ -481,11 +543,40 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
             device_id,
             sub_device_id,
             expected_mode=resolved_mode,
-            expected_target_temperature=resolved_target_temperature,
+            expected_target_temperature=expected_target_temperature,
             expected_fan_mode=resolved_fan_mode,
             expected_swing_mode=resolved_swing_mode,
         )
-        return command
+        return sent_command
+
+    def _ac_mode_key_commands(
+        self,
+        device_id: str,
+        sub_device_id: str,
+        state: AifaAcRuntimeState,
+        resolved_mode: str,
+        *,
+        mode_only: bool,
+    ) -> tuple[str | None, str | None]:
+        """Return (power-on key, mode key) for hubs that take modes as key presses.
+
+        Callers pass the current mode along with fan/swing/temperature edits, so
+        a non-mode-only call only counts as a mode change when it differs from
+        what the AC is showing; otherwise the status packet alone carries it.
+        """
+        hub = self.get_device(device_id)
+        sub_device = None if hub is None else hub.get_sub_device(sub_device_id)
+        if sub_device is None or not hub_requires_mode_keys(hub.version, hub.subversion):
+            return None, None
+        current_mode = state.exposed_hvac_mode
+        if not mode_only and current_mode == resolved_mode:
+            return None, None
+        power_on_command = None
+        if current_mode == "off":
+            power_on_command = build_power_on_command(device_code=sub_device.device_code)
+        return power_on_command, build_mode_key_command(
+            resolved_mode, _ac_socket_sub_type(sub_device)
+        )
 
     async def _async_update_data(self) -> AifaAccountData:
         """Fetch device data from AIFA Smart."""

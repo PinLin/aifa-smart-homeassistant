@@ -58,7 +58,7 @@ class CoordinatorProbeTests(unittest.TestCase):
             try:
                 return await AifaSmartCoordinator._async_wait_for_classic_socket_update(
                     harness,
-                    "8014",
+                    "7001",
                     "31867",
                     minimum_observed_revision=0,
                     expected_mode="off",
@@ -84,7 +84,7 @@ class CoordinatorProbeTests(unittest.TestCase):
             try:
                 return await AifaSmartCoordinator._async_wait_for_classic_socket_update(
                     harness,
-                    "8014",
+                    "7001",
                     "31867",
                     minimum_observed_revision=0,
                     expected_mode="off",
@@ -310,6 +310,23 @@ class CoordinatorTlsDispatchTests(unittest.TestCase):
         # The send was attempted before raising
         self.assertEqual(coordinator._tls_sent, [("d1", "ffa0a2f0")])
 
+    def test_classic_temperature_key_sends_one_press_over_tls(self) -> None:
+        from custom_components.aifa_smart.api import AifaSubDevice
+
+        coordinator = self._make_coordinator(classic_send_results=True)
+        coordinator._ac_apply_locks = {}  # type: ignore[attr-defined]
+        coordinator._ac_last_send_at = {}  # type: ignore[attr-defined]
+        sub_device = AifaSubDevice(
+            id="s1", device_id="d1", name="AC", type="0", sub_type="0", device_code="115"
+        )
+        coordinator.get_sub_device = lambda device_id, sub_device_id: sub_device
+
+        asyncio.run(
+            coordinator.async_press_classic_temperature_key("d1", "s1", up=True)
+        )
+
+        self.assertEqual(coordinator._tls_sent, [("d1", "ffa006f0")])
+
     def test_dispatch_raises_on_first_no_tls_in_a_batch(self) -> None:
         """In a multi-device batch, the first device without TLS aborts the whole batch."""
         from custom_components.aifa_smart.api import AifaFunctionCommand, AifaSmartError
@@ -363,6 +380,7 @@ class CoordinatorHelperFlagMutexTests(unittest.TestCase):
         from custom_components.aifa_smart.api import AifaSubDevice
 
         coordinator = AifaSmartCoordinator.__new__(AifaSmartCoordinator)
+        coordinator.data = None  # type: ignore[attr-defined]
         coordinator._ac_runtime_states = {}  # type: ignore[attr-defined]
         coordinator._ac_apply_locks = {}  # type: ignore[attr-defined]
         coordinator._ac_last_send_at = {}  # type: ignore[attr-defined]
@@ -475,6 +493,171 @@ class CoordinatorHelperFlagMutexTests(unittest.TestCase):
         self.assertFalse(state.requested_turbo)
 
 
+class CoordinatorModeKeyTests(unittest.TestCase):
+    """Hubs at version 5 / subversion 210623 take HVAC modes as single key presses."""
+
+    _STATUS_PACKET_HEX_LENGTH = 30
+
+    def _make_coordinator(self, *, version=5, subversion=210623, sub_type="0"):
+        from custom_components.aifa_smart.api import AifaSubDevice
+        from custom_components.aifa_smart.coordinator import AifaAccountData
+
+        sub_device = AifaSubDevice(
+            id="s1", device_id="d1", name="冷氣", type="0", sub_type=sub_type,
+            device_code="136",
+        )
+        if sub_type == "1":
+            sub_device.type = "1"
+        hub = AifaDevice(
+            id="d1", name="Hub", mac=None, device_type=None, online=True,
+            temperature=None, humidity=None, firmware=None,
+            sub_devices=[sub_device], version=version, subversion=subversion,
+        )
+        coordinator = AifaSmartCoordinator.__new__(AifaSmartCoordinator)
+        coordinator.data = AifaAccountData(  # type: ignore[attr-defined]
+            devices={"d1": hub}, macros=[], fetched_at=None,  # type: ignore[arg-type]
+        )
+        coordinator._ac_runtime_states = {}  # type: ignore[attr-defined]
+        coordinator._ac_apply_locks = {}  # type: ignore[attr-defined]
+        coordinator._ac_last_send_at = {}  # type: ignore[attr-defined]
+        events: list[str] = []
+
+        async def fake_send_function_commands(commands):
+            events.extend(c.command for c in commands)
+            return [{"ok": True}]
+
+        async def fake_throttle(key):
+            events.append("throttle")
+
+        async def fake_probe(*args, **kwargs):
+            return None
+
+        coordinator.async_send_function_commands = fake_send_function_commands  # type: ignore[attr-defined]
+        coordinator._async_throttle_ac_send = fake_throttle  # type: ignore[attr-defined]
+        coordinator.async_update_listeners = lambda: None  # type: ignore[attr-defined]
+        coordinator._async_probe_ac_observed_state = fake_probe  # type: ignore[attr-defined]
+        coordinator._schedule_ac_follow_up_probe = lambda *a, **k: None  # type: ignore[attr-defined]
+        coordinator._events = events  # type: ignore[attr-defined]
+        state = coordinator.get_ac_runtime_state("d1", "s1", device_code="136")
+        state.requested_hvac_mode = "cool"
+        state.requested_target_temperature = 26
+        state.last_active_hvac_mode = "cool"
+        return coordinator, state
+
+    def _sent(self, coordinator) -> list[str]:
+        return [event for event in coordinator._events if event != "throttle"]
+
+    def test_mode_change_sends_only_the_mode_key(self) -> None:
+        coordinator, state = self._make_coordinator()
+
+        returned = asyncio.run(
+            coordinator.async_apply_ac_state("d1", "s1", hvac_mode="heat", device_code="136")
+        )
+
+        self.assertEqual(self._sent(coordinator), ["ffa017f0"])
+        self.assertEqual(returned, "ffa017f0")
+        self.assertEqual(state.requested_hvac_mode, "heat")
+        self.assertEqual(state.exposed_hvac_mode, "heat")
+        self.assertEqual(state.last_status_command, "ffa017f0")
+        self.assertIsNone(state.last_power_command)
+        assert state.command_status is not None
+        self.assertIsNone(state.command_status.target_temperature)
+
+    def test_every_mode_maps_to_its_key(self) -> None:
+        expected = {
+            "auto": "ffa015f0",
+            "cool": "ffa016f0",
+            "heat": "ffa017f0",
+            "dry": "ffa018f0",
+            "fan": "ffa019f0",
+        }
+        for mode, command in expected.items():
+            with self.subTest(mode=mode):
+                coordinator, _ = self._make_coordinator()
+                asyncio.run(
+                    coordinator.async_apply_ac_state("d1", "s1", hvac_mode=mode, device_code="136")
+                )
+                self.assertEqual(self._sent(coordinator), [command])
+
+    def test_reselecting_current_mode_still_sends_the_key(self) -> None:
+        coordinator, _ = self._make_coordinator()
+
+        asyncio.run(
+            coordinator.async_apply_ac_state("d1", "s1", hvac_mode="cool", device_code="136")
+        )
+
+        self.assertEqual(self._sent(coordinator), ["ffa016f0"])
+
+    def test_turn_on_from_off_sends_power_then_mode_key_with_throttle(self) -> None:
+        coordinator, state = self._make_coordinator()
+        state.requested_hvac_mode = "off"
+
+        asyncio.run(
+            coordinator.async_apply_ac_state("d1", "s1", hvac_mode="cool", device_code="136")
+        )
+
+        self.assertEqual(
+            coordinator._events, ["throttle", "ffa0a1f0", "throttle", "ffa016f0"]
+        )
+        self.assertEqual(state.last_power_command, "ffa0a1f0")
+        self.assertEqual(state.exposed_hvac_mode, "cool")
+
+    def test_sub_type_1_mode_key_uses_a1(self) -> None:
+        coordinator, _ = self._make_coordinator(sub_type="1")
+
+        asyncio.run(
+            coordinator.async_apply_ac_state("d1", "s1", hvac_mode="cool", device_code="136")
+        )
+
+        self.assertEqual(self._sent(coordinator), ["ffa116f0"])
+
+    def test_fan_change_in_same_mode_keeps_status_packet(self) -> None:
+        coordinator, _ = self._make_coordinator()
+
+        asyncio.run(
+            coordinator.async_apply_ac_state(
+                "d1", "s1", hvac_mode="cool", fan_mode="low", device_code="136"
+            )
+        )
+
+        sent = self._sent(coordinator)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(len(sent[0]), self._STATUS_PACKET_HEX_LENGTH)
+
+    def test_mode_and_fan_change_sends_mode_key_then_status_packet(self) -> None:
+        coordinator, state = self._make_coordinator()
+
+        asyncio.run(
+            coordinator.async_apply_ac_state(
+                "d1", "s1", hvac_mode="heat", fan_mode="low", device_code="136"
+            )
+        )
+
+        self.assertEqual(coordinator._events[:3], ["throttle", "ffa017f0", "throttle"])
+        sent = self._sent(coordinator)
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(len(sent[1]), self._STATUS_PACKET_HEX_LENGTH)
+        assert state.command_status is not None
+        self.assertEqual(state.command_status.target_temperature, 26)
+
+    def test_other_hub_versions_keep_the_status_packet(self) -> None:
+        for version, subversion in ((5, 210624), (4, 210623), (None, None)):
+            with self.subTest(version=version, subversion=subversion):
+                coordinator, state = self._make_coordinator(
+                    version=version, subversion=subversion
+                )
+                state.requested_hvac_mode = "off"
+                asyncio.run(
+                    coordinator.async_apply_ac_state(
+                        "d1", "s1", hvac_mode="heat", device_code="136"
+                    )
+                )
+                sent = self._sent(coordinator)
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(len(sent[0]), self._STATUS_PACKET_HEX_LENGTH)
+                self.assertEqual(sent[0][:4], "ffa0")
+
+
 class ResolveHelperFlagMutexTests(unittest.TestCase):
     """Direct tests for the extracted helper-flag mutex contract."""
 
@@ -528,7 +711,7 @@ class ApplyClassicSensorStateTests(unittest.TestCase):
     @staticmethod
     def _device(temperature: float | None, humidity: float | None) -> AifaDevice:
         return AifaDevice(
-            id="8014",
+            id="7001",
             name="hub",
             mac=None,
             device_type="4",

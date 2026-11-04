@@ -163,7 +163,7 @@ async def test_reauth_flow_stores_new_tokens_and_drops_password(
 
 def test_tokens_from_entry_rebuilds_token_dataclass() -> None:
     """Stored token fields should round-trip back into AifaTokens."""
-    expires = datetime(2026, 4, 24, 12, 0, 0, tzinfo=UTC)
+    expires = datetime(2000, 4, 24, 12, 0, 0, tzinfo=UTC)
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={

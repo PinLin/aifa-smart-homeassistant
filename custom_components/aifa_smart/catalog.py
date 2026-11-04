@@ -37,7 +37,7 @@ class Catalog:
     show_display_mold_codes: frozenset[str]
     single_mode_codes: frozenset[str]
     dehumidifier_codes: frozenset[str]
-    # AC_OBSERVED_* are hand-maintained from hardware testing (not in Firebase).
+    # AC_OBSERVED_* are hand-maintained supplements (not in Firebase).
     # Always sourced from the bundled module, even after a live refresh.
     observed_extra_windspeed_codes: frozenset[str]
     observed_turbo_codes: frozenset[str]

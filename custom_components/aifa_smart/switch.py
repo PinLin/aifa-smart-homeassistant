@@ -22,7 +22,7 @@ class AifaAcFlagEntityDescription(SwitchEntityDescription):
 
 _AC_FLAG_SWITCHES: tuple[AifaAcFlagEntityDescription, ...] = (
     # Byte 10 feature flag bit positions (per ac.py build_status_command):
-    #   sleep         → 0x08   VERIFIED 2026-04-27 from AVD AIFA app capture
+    #   sleep         → 0x08   VERIFIED from an AIFA app capture
     #   power_saving  → 0x02   INFERRED — AVD AIFA app's Power Saving button
     #                          did not toggle a bit in any captured packet.
     #   turbo         → 0x04   INFERRED — bit position not verified against a

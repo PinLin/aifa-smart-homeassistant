@@ -82,6 +82,12 @@
     "button": {
       "force_refresh": {
         "name": "Refresh"
+      },
+      "temperature_up": {
+        "name": "Temperature up"
+      },
+      "temperature_down": {
+        "name": "Temperature down"
       }
     }
   },

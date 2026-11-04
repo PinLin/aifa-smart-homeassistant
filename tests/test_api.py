@@ -37,7 +37,7 @@ class ApiNormalizationTests(unittest.TestCase):
             {
                 "id": 42,
                 "deviceName": "Living Room",
-                "mac": "e8db84ee5bb2",
+                "mac": "02a1fac0a001",
                 "deviceType": "i-Ctrl Pro Plus",
                 "online": 1,
                 "temperature": "25.5",
@@ -51,7 +51,7 @@ class ApiNormalizationTests(unittest.TestCase):
         assert device is not None
         self.assertEqual(device.id, "42")
         self.assertEqual(device.name, "Living Room")
-        self.assertEqual(device.mac, "e8db84ee5bb2")
+        self.assertEqual(device.mac, "02a1fac0a001")
         self.assertEqual(device.device_type, "i-Ctrl Pro Plus")
         self.assertTrue(device.online)
         self.assertEqual(device.temperature, 25.5)
@@ -59,12 +59,26 @@ class ApiNormalizationTests(unittest.TestCase):
         self.assertEqual(device.firmware, "1.2.3")
         self.assertEqual(len(device.sub_devices), 2)
 
+    def test_parse_device_keeps_hub_version_and_subversion(self) -> None:
+        """Hub version/subversion drive the mode-key decision, so keep them as ints."""
+        cases = (
+            ({"version": 5, "subversion": 210623}, (5, 210623)),
+            ({"version": "5", "subversion": " 210623 "}, (5, 210623)),
+            ({}, (None, None)),
+            ({"version": "", "subversion": "abc"}, (None, None)),
+        )
+        for extra, expected in cases:
+            with self.subTest(extra=extra):
+                device = _parse_device({"id": 7001, **extra})
+                assert device is not None
+                self.assertEqual((device.version, device.subversion), expected)
+
     def test_parse_device_reads_nested_sensors_block(self) -> None:
         """Device rows should read temperature and humidity from the plural sensors block."""
         device = _parse_device(
             {
-                "id": 8014,
-                "deviceName": "i-Ctrl AC-5bb2",
+                "id": 7001,
+                "deviceName": "i-Ctrl AC-a001",
                 "sensors": {
                     "temperature": "26.4",
                     "humidity": "58",
@@ -87,13 +101,13 @@ class ApiNormalizationTests(unittest.TestCase):
                 "subType": 0,
                 "deviceCode": 136,
             },
-            8014,
+            7001,
         )
 
         self.assertIsNotNone(sub_device)
         assert sub_device is not None
         self.assertEqual(sub_device.id, "31867")
-        self.assertEqual(sub_device.device_id, "8014")
+        self.assertEqual(sub_device.device_id, "7001")
         self.assertEqual(sub_device.name, "冷氣")
         self.assertEqual(sub_device.type, "0")
         self.assertEqual(sub_device.sub_type, "0")
@@ -215,9 +229,9 @@ class ApiNormalizationTests(unittest.TestCase):
     def test_transfer_payload_uses_verified_mac_shape(self) -> None:
         """Classic i-Ctrl transfer calls should use the verified mac-based payload."""
         payload = _transfer_payload(
-            "e8db84ee5bb2",
+            "02a1fac0a001",
             command="ffa0a2f0",
-            device_id="8014",
+            device_id="7001",
             sub_device_id="31867",
             extra={"type": "status"},
         )
@@ -225,9 +239,9 @@ class ApiNormalizationTests(unittest.TestCase):
         self.assertEqual(
             payload,
             {
-                "mac": "e8db84ee5bb2",
+                "mac": "02a1fac0a001",
                 "command": "ffa0a2f0",
-                "deviceId": 8014,
+                "deviceId": 7001,
                 "subDeviceId": 31867,
                 "type": "status",
             },
@@ -298,7 +312,7 @@ class ApiNormalizationTests(unittest.TestCase):
         function = _parse_function(
             {
                 "id": 42316,
-                "deviceId": 8014,
+                "deviceId": 7001,
                 "name": "Auto 29",
                 "days": 127,
                 "notification": 2,
@@ -308,7 +322,7 @@ class ApiNormalizationTests(unittest.TestCase):
                 "commands": [
                     {
                         "id": 585196,
-                        "deviceId": 8014,
+                        "deviceId": 7001,
                         "subDeviceId": 31867,
                         "command": "ffa0060136280020804000000000f0",
                     }
@@ -319,7 +333,7 @@ class ApiNormalizationTests(unittest.TestCase):
         self.assertIsNotNone(function)
         assert function is not None
         self.assertEqual(function.id, "42316")
-        self.assertEqual(function.device_id, "8014")
+        self.assertEqual(function.device_id, "7001")
         self.assertEqual(function.name, "Auto 29")
         self.assertEqual(function.days, 127)
         self.assertEqual(function.notification, 2)
@@ -334,13 +348,13 @@ class ApiNormalizationTests(unittest.TestCase):
         function = _parse_function(
             {
                 "id": 42316,
-                "deviceId": 8014,
+                "deviceId": 7001,
                 "name": "Auto 29",
                 "time": {"start": 0, "length": 0},
                 "commands": [
                     {
                         "id": 585196,
-                        "deviceId": 8014,
+                        "deviceId": 7001,
                         "subDeviceId": 31867,
                         "command": "ffa0060136280020804000000000f0",
                     }
@@ -362,7 +376,7 @@ class ApiNormalizationTests(unittest.TestCase):
                 "commands": [
                     {
                         "id": 101,
-                        "deviceId": 8014,
+                        "deviceId": 7001,
                         "subDeviceId": 31867,
                         "command": "ffaa0011",
                         "delay": 500,
@@ -370,7 +384,7 @@ class ApiNormalizationTests(unittest.TestCase):
                     },
                     {
                         "id": 100,
-                        "deviceId": 8014,
+                        "deviceId": 7001,
                         "command": "ffaa0000",
                         "delay": 0,
                         "orderNo": 1,
@@ -431,12 +445,12 @@ class ApiClientBehaviorTests(unittest.IsolatedAsyncioTestCase):
         client._ensure_access_token = fake_ensure_access_token  # type: ignore[method-assign]
 
         with patch("custom_components.aifa_smart.api.asyncio.open_connection", fake_open_connection):
-            session = await client.async_open_classic_socket("e8db84ee5bb2")
+            session = await client.async_open_classic_socket("02a1fac0a001")
 
         self.assertEqual(session.initial_bytes, bytes.fromhex("fea00136000000000000000000f0"))
         self.assertEqual(len(written), 1)
         self.assertEqual(written[0][:4], bytes.fromhex("a1fad7c0"))
-        self.assertIn(b'"mac":"e8db84ee5bb2"', written[0])
+        self.assertIn(b'"mac":"02a1fac0a001"', written[0])
         self.assertIn(b'"token":"test-token"', written[0])
 
     async def test_transfer_packet_posts_verified_transfer_shape(self) -> None:
@@ -453,9 +467,9 @@ class ApiClientBehaviorTests(unittest.IsolatedAsyncioTestCase):
         client._authorized_request = fake_authorized_request  # type: ignore[method-assign]
 
         response = await client.async_transfer_packet(
-            "e8db84ee5bb2",
+            "02a1fac0a001",
             packet="ffa0a2f0",
-            device_id="8014",
+            device_id="7001",
             sub_device_id="31867",
         )
 
@@ -468,9 +482,9 @@ class ApiClientBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     DEVICE_TRANSFER_PATH,
                     {
                         "json": {
-                            "mac": "e8db84ee5bb2",
+                            "mac": "02a1fac0a001",
                             "packet": "ffa0a2f0",
-                            "deviceId": 8014,
+                            "deviceId": 7001,
                             "subDeviceId": 31867,
                         }
                     },
@@ -598,7 +612,7 @@ class ApiClientBehaviorTests(unittest.IsolatedAsyncioTestCase):
                         "commands": [
                             {
                                 "id": 70,
-                                "deviceId": 8014,
+                                "deviceId": 7001,
                                 "command": "ffaa0011",
                                 "orderNo": 1,
                             }

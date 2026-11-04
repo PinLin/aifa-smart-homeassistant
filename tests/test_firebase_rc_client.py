@@ -82,7 +82,7 @@ class FirebaseRcClientTests(unittest.IsolatedAsyncioTestCase):
         rc_payload = {
             "entries": {
                 "ac_available_modes": '{"1": ["cool", "heat"]}',
-                "ac_classic_temp_control": '{"codes": [16, 19]}',
+                "ac_classic_temp_control": '{"codes": [115, 116]}',
             },
             "templateVersion": 47,
         }

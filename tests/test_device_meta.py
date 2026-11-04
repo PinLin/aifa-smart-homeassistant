@@ -17,14 +17,14 @@ class DeviceMetaTests(unittest.TestCase):
 
     def test_parent_device_type_four_gets_human_label(self) -> None:
         """The current hub type should not render as a bare number."""
-        device = AifaDevice("8014", "i-Ctrl AC-5bb2", None, "4", True, None, None, None)
+        device = AifaDevice("7001", "i-Ctrl AC-a001", None, "4", True, None, None, None)
         self.assertEqual(device_model_label(device), "AIFA IR Hub")
 
     def test_sub_device_model_prefers_model_code_over_catalog_brand(self) -> None:
         """AC sub-device labels should avoid raw type noise and misleading catalog brands."""
         sub_device = AifaSubDevice(
             "31867",
-            "8014",
+            "7001",
             "冷氣",
             "0",
             "0",
@@ -43,7 +43,7 @@ class DeviceMetaTests(unittest.TestCase):
         """AC labels should not fall back to potentially misleading catalog brands."""
         sub_device = AifaSubDevice(
             "31867",
-            "8014",
+            "7001",
             "冷氣",
             "0",
             "0",

@@ -41,7 +41,7 @@ POWER_ON_COMMAND = "ffa0a1f0"
 POWER_OFF_COMMAND = "ffa0a2f0"
 
 _STATUS_PACKET_PREFIX = 0x06
-# Byte 2 (mode + temperature region), all values verified 2026-04-27 from
+# Byte 2 (mode + temperature region), all values verified from
 # AVD AIFA app v1.2.5 → /functions captures. Bit positions are device-code
 # agnostic per Dart-side reverse engineering of AirConditionerStatusOn.toBytes:
 #   cool >= 24 → 0x06   (verified: cool 24 default, cool 28)
@@ -69,14 +69,14 @@ _DEFAULT_PACKET_BYTE_12 = 0x00
 _DEFAULT_PACKET_BYTE_13 = 0x00
 
 _MODE_BYTE_BY_NAME: Final[dict[str, int]] = {
-    # All values verified 2026-04-27 from AVD AIFA app /functions captures.
+    # All values verified from AIFA app /functions captures.
     "auto": 0x10,      # verified: probe1 cmd 644455 ("Mode: Auto")
     "cool": 0x20,      # verified: cool 19/20/24/28
     "dry": 0x40,       # verified: probe1 cmd 644474 ("Mode: Dry")
     "fan_only": 0x80,  # verified: fanonlysample function
     "heat": 0x08,      # verified: heat 24 default
 }
-# Fan-byte mapping — partial verification 2026-04-27 from AVD AIFA app captures:
+# Fan-byte mapping — partial verification from AIFA app captures:
 #   0x01 = auto    (AIFA metadata "speed: 0") VERIFIED via "by by", probe1
 #   0x40 = medium  (AIFA metadata "speed: 2") VERIFIED via probe1 cmd 644454
 #   0x80 = high    (AIFA metadata "speed: 3") VERIFIED via probe1 default
@@ -100,7 +100,7 @@ _FAN_BYTE_BY_NAME: Final[dict[str, int]] = {
 # the AIFA app's local SQLite samples expose them. Until we get a real
 # 19888 sample, capabilities.extra_windspeed remains diagnostic-only and
 # fan_modes stays at the 4-speed default.
-# Swing-byte mapping — Direction-button cycle order VERIFIED 2026-04-27 by
+# Swing-byte mapping — Direction-button cycle order VERIFIED by
 # tapping the AVD AIFA app's Direction control 1..5 times and observing the
 # resulting bytes:
 #   default state → 0x01
@@ -124,6 +124,22 @@ _SWING_BYTE_BY_NAME: Final[dict[str, int]] = {
     "fixed_5": 0x20,
 }
 _MODE_NAME_BY_BYTE: Final[dict[int, str]] = {value: key for key, value in _MODE_BYTE_BY_NAME.items()}
+
+# i-Ctrl hubs on this firmware mis-read the mode byte of the 15-byte status
+# packet, so the i-Ctrl app sends a single mode key instead. The match is on
+# the hub's own version/subversion, not on the AC device code.
+MODE_KEY_HUB_VERSION: Final = 5
+MODE_KEY_HUB_SUBVERSION: Final = 210623
+# Mode key values as the app sends them.
+_MODE_KEY_BY_NAME: Final[dict[str, int]] = {
+    "auto": 0x15,
+    "cool": 0x16,
+    "heat": 0x17,
+    "dry": 0x18,
+    "fan_only": 0x19,
+}
+_TEMPERATURE_UP_KEY = 0x06
+_TEMPERATURE_DOWN_KEY = 0x07
 _FAN_NAME_BY_BYTE: Final[dict[int, str]] = {value: key for key, value in _FAN_BYTE_BY_NAME.items()}
 _SWING_NAME_BY_BYTE: Final[dict[int, str]] = {
     value: key for key, value in _SWING_BYTE_BY_NAME.items()
@@ -447,6 +463,35 @@ def build_power_on_command(*, device_code: str | None = None) -> str:
     return profile.power_on_command
 
 
+def build_classic_temperature_key_command(sub_type: int, *, up: bool) -> str:
+    """Build one +/- key press for ACs whose remote has no absolute setpoint.
+
+    Each packet is a single key press; many such ACs only show the current
+    setpoint on the first press and change it from the second.
+    """
+    return _build_single_key_command(
+        sub_type, _TEMPERATURE_UP_KEY if up else _TEMPERATURE_DOWN_KEY
+    )
+
+
+def hub_requires_mode_keys(version: int | None, subversion: int | None) -> bool:
+    """Return True when the hub must receive HVAC modes as single key presses."""
+    return version == MODE_KEY_HUB_VERSION and subversion == MODE_KEY_HUB_SUBVERSION
+
+
+def build_mode_key_command(mode: str, sub_type: int) -> str:
+    """Build one HVAC mode key press for hubs that need single mode keys."""
+    normalized_mode = normalize_ac_mode(mode)
+    key = _MODE_KEY_BY_NAME.get(normalized_mode)
+    if key is None:
+        raise ValueError(f"Unsupported AIFA AC mode key: {mode}")
+    return _build_single_key_command(sub_type, key)
+
+
+def _build_single_key_command(sub_type: int, key: int) -> str:
+    return bytes((0xFF, 0xA0 | (sub_type & 0x01), key, 0xF0)).hex()
+
+
 def build_power_off_command(*, device_code: str | None = None) -> str:
     """Return the verified short raw packet that turns an AC off."""
     profile = get_ac_profile(device_code) or SHARED_AIFA_AC_PROFILE
@@ -512,16 +557,16 @@ def build_status_command(
         raise ValueError(f"Unsupported AIFA AC swing mode: {swing_mode}")
 
     # Byte 10 feature flags:
-    #   sleep         → 0x08  VERIFIED 2026-04-27 via AVD AIFA app Sleep button
+    #   sleep         → 0x08  VERIFIED via the AIFA app Sleep button
     #                          (probe1 cmd 644452: ffa0060136240020010108000000f0)
-    #   power_saving  → 0x02  VERIFIED INEFFECTIVE for Daikin code 11 (ARC466A12)
-    #                          on 2026-04-29. AC ack'd packet (beep) but no ECO
+    #   power_saving  → 0x02  VERIFIED INEFFECTIVE for Daikin code 11 (ARC466A12).
+    #                          AC ack'd packet (beep) but no ECO
     #                          indicator and no fan/temp change. Daikin typically
     #                          encodes ECON as a separate one-shot IR code, not in
     #                          the main status packet. Bit position retained for
     #                          other AC families that may use byte 10 differently.
-    #   turbo         → 0x04  VERIFIED INEFFECTIVE for Daikin code 11 (ARC466A12)
-    #                          on 2026-04-29. Same pattern as PS — AC ack'd but
+    #   turbo         → 0x04  VERIFIED INEFFECTIVE for Daikin code 11 (ARC466A12).
+    #                          Same pattern as PS — AC ack'd but
     #                          no POWERFUL indicator and no fan change. Daikin
     #                          typically encodes POWERFUL as a separate one-shot
     #                          IR code. Bit position retained for other families.

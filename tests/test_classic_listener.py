@@ -1,7 +1,7 @@
 """Focused tests for classic_listener.ClassicSocketManager.async_send_packet.
 
-These tests exercise only the writer-registration / locking surface added in
-2026-04-27 to support TLS-direct command sending. The rest of the listener
+These tests exercise only the writer-registration / locking surface used for
+TLS-direct command sending. The rest of the listener
 (reader loop, reconnect, broadcast parsers) is already covered indirectly
 through coordinator tests.
 """
@@ -52,7 +52,7 @@ class ClassicSocketSendPacketTests(unittest.TestCase):
         manager = _build_manager()
 
         async def run() -> bool:
-            return await manager.async_send_packet("8014", "ffa0a1f0")
+            return await manager.async_send_packet("7001", "ffa0a1f0")
 
         self.assertFalse(asyncio.run(run()))
 
@@ -60,11 +60,11 @@ class ClassicSocketSendPacketTests(unittest.TestCase):
         """A writer that's mid-shutdown must not be written to — return False."""
         manager = _build_manager()
         closing_writer = _FakeWriter(closing=True)
-        manager._socket_writers["8014"] = closing_writer  # noqa: SLF001
-        manager._socket_write_locks["8014"] = asyncio.Lock()  # noqa: SLF001
+        manager._socket_writers["7001"] = closing_writer  # noqa: SLF001
+        manager._socket_write_locks["7001"] = asyncio.Lock()  # noqa: SLF001
 
         async def run() -> bool:
-            return await manager.async_send_packet("8014", "ffa0a1f0")
+            return await manager.async_send_packet("7001", "ffa0a1f0")
 
         self.assertFalse(asyncio.run(run()))
         self.assertEqual(closing_writer.writes, [])
@@ -73,11 +73,11 @@ class ClassicSocketSendPacketTests(unittest.TestCase):
         """With a live registered writer, packets get hex-decoded and drained."""
         manager = _build_manager()
         writer = _FakeWriter()
-        manager._socket_writers["8014"] = writer  # noqa: SLF001
-        manager._socket_write_locks["8014"] = asyncio.Lock()  # noqa: SLF001
+        manager._socket_writers["7001"] = writer  # noqa: SLF001
+        manager._socket_write_locks["7001"] = asyncio.Lock()  # noqa: SLF001
 
         async def run() -> bool:
-            return await manager.async_send_packet("8014", "ffa0a1f0")
+            return await manager.async_send_packet("7001", "ffa0a1f0")
 
         self.assertTrue(asyncio.run(run()))
         self.assertEqual(writer.writes, [bytes.fromhex("ffa0a1f0")])
@@ -87,11 +87,11 @@ class ClassicSocketSendPacketTests(unittest.TestCase):
         """Mixed-case + leading/trailing whitespace hex must be accepted."""
         manager = _build_manager()
         writer = _FakeWriter()
-        manager._socket_writers["8014"] = writer  # noqa: SLF001
-        manager._socket_write_locks["8014"] = asyncio.Lock()  # noqa: SLF001
+        manager._socket_writers["7001"] = writer  # noqa: SLF001
+        manager._socket_write_locks["7001"] = asyncio.Lock()  # noqa: SLF001
 
         async def run() -> bool:
-            return await manager.async_send_packet("8014", "  FFA0A1F0  ")
+            return await manager.async_send_packet("7001", "  FFA0A1F0  ")
 
         self.assertTrue(asyncio.run(run()))
         self.assertEqual(writer.writes[0], bytes.fromhex("ffa0a1f0"))
@@ -100,11 +100,11 @@ class ClassicSocketSendPacketTests(unittest.TestCase):
         """Non-hex input fails fast with False (caller should fall back)."""
         manager = _build_manager()
         writer = _FakeWriter()
-        manager._socket_writers["8014"] = writer  # noqa: SLF001
-        manager._socket_write_locks["8014"] = asyncio.Lock()  # noqa: SLF001
+        manager._socket_writers["7001"] = writer  # noqa: SLF001
+        manager._socket_write_locks["7001"] = asyncio.Lock()  # noqa: SLF001
 
         async def run() -> bool:
-            return await manager.async_send_packet("8014", "not-hex-zz")
+            return await manager.async_send_packet("7001", "not-hex-zz")
 
         self.assertFalse(asyncio.run(run()))
         self.assertEqual(writer.writes, [])
@@ -113,11 +113,11 @@ class ClassicSocketSendPacketTests(unittest.TestCase):
         """An empty hex string is rejected; otherwise we'd write zero bytes."""
         manager = _build_manager()
         writer = _FakeWriter()
-        manager._socket_writers["8014"] = writer  # noqa: SLF001
-        manager._socket_write_locks["8014"] = asyncio.Lock()  # noqa: SLF001
+        manager._socket_writers["7001"] = writer  # noqa: SLF001
+        manager._socket_write_locks["7001"] = asyncio.Lock()  # noqa: SLF001
 
         async def run() -> bool:
-            return await manager.async_send_packet("8014", "")
+            return await manager.async_send_packet("7001", "")
 
         self.assertFalse(asyncio.run(run()))
 
@@ -125,14 +125,14 @@ class ClassicSocketSendPacketTests(unittest.TestCase):
         """has_active_writer follows the per-device writer registration."""
         manager = _build_manager()
 
-        self.assertFalse(manager.has_active_writer("8014"))
+        self.assertFalse(manager.has_active_writer("7001"))
 
         live_writer = _FakeWriter()
-        manager._socket_writers["8014"] = live_writer  # noqa: SLF001
-        self.assertTrue(manager.has_active_writer("8014"))
+        manager._socket_writers["7001"] = live_writer  # noqa: SLF001
+        self.assertTrue(manager.has_active_writer("7001"))
 
         live_writer._closing = True  # noqa: SLF001
-        self.assertFalse(manager.has_active_writer("8014"))
+        self.assertFalse(manager.has_active_writer("7001"))
 
 
 if __name__ == "__main__":

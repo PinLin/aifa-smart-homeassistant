@@ -109,7 +109,7 @@ class AifaAcRuntimeState:
     def _main_fields_match(left: AifaAcStatus, right: AifaAcStatus) -> bool:
         """Return True when two statuses agree on the hub-shadowed fields.
 
-        Empirical (verified 2026-04-25 against AIFA i-Ctrl hub firmware):
+        Empirical (against AIFA i-Ctrl hub firmware):
         the AIFA hub only shadows mode and target_temperature in the classic
         socket observed packet. fan_mode, swing_mode, and helper flags stay at
         the hub's last-known default regardless of what the IR payload sent
@@ -155,7 +155,7 @@ class AifaAcRuntimeState:
         """Return the best available source for helper-flag exposure.
 
         The AIFA hub does not shadow turbo/sleep/power_saving from any
-        command path (verified 2026-04-25: sending sleep=True over both
+        command path (verified: sending sleep=True over both
         the classic TLS socket and the cloud's `/commands/raw` REST
         endpoint left the observed feature byte at 0x00). An observed mode=off
         packet implicitly means all flags are off (reliable), but for any

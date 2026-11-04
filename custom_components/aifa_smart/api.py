@@ -235,6 +235,8 @@ class AifaDevice:
     functions: list[AifaFunction] = field(default_factory=list)
     updated_at: datetime | None = None
     sensor_samples: dict[str, AifaSensorSample] = field(default_factory=dict)
+    version: int | None = None
+    subversion: int | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     def get_sub_device(self, sub_device_id: str) -> AifaSubDevice | None:
@@ -688,6 +690,8 @@ def _parse_device(raw: Mapping[str, Any]) -> AifaDevice | None:
         updated_at=_coerce_datetime(
             _pick(raw, "updatedAt", "updated_at", "timestamp", "timeStamp", "time")
         ),
+        version=_coerce_int(_pick(raw, "version")),
+        subversion=_coerce_int(_pick(raw, "subversion")),
         raw=dict(raw),
     )
     return device
@@ -1032,7 +1036,7 @@ class AifaSmartApiClient:
         into NAND-persistent storage and resumes broadcasting its BCD in
         the idle frame `fea00<HHLL>...f0`.
 
-        Verified empirically (2026-04-29 against firmware v4):
+        Verified empirically (against firmware v4):
         - Hub state survives full power cycle (NAND-backed).
         - Cloud rejects with 404 "Device not connected" when the hub is
           offline — set-code is NOT queued for later delivery.

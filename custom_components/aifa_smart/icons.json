@@ -23,6 +23,12 @@
     "button": {
       "force_refresh": {
         "default": "mdi:refresh"
+      },
+      "temperature_up": {
+        "default": "mdi:thermometer-plus"
+      },
+      "temperature_down": {
+        "default": "mdi:thermometer-minus"
       }
     },
     "switch": {

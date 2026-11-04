@@ -125,10 +125,12 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
         self._attr_swing_modes = list(get_supported_swing_modes(device_code))
 
         supported_features = (
-            ClimateEntityFeature.TARGET_TEMPERATURE
-            | ClimateEntityFeature.TURN_ON
-            | ClimateEntityFeature.TURN_OFF
+            ClimateEntityFeature.TURN_ON | ClimateEntityFeature.TURN_OFF
         )
+        # Classic-temperature ACs only take relative +/- key presses (button
+        # entities) and never report a setpoint, so there is none to show.
+        if not self._capabilities.classic_temp_control:
+            supported_features |= ClimateEntityFeature.TARGET_TEMPERATURE
         if self._attr_fan_modes:
             supported_features |= ClimateEntityFeature.FAN_MODE
         if self._attr_swing_modes:
@@ -184,8 +186,10 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
         return None if device is None else device.temperature
 
     @property
-    def target_temperature(self) -> float:
+    def target_temperature(self) -> float | None:
         """Return the best available AC setpoint."""
+        if self._capabilities.classic_temp_control:
+            return None
         return float(self.runtime.exposed_target_temperature)
 
     @property

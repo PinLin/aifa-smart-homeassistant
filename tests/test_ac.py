@@ -9,7 +9,9 @@ from custom_components.aifa_smart.ac import (
     SHARED_AIFA_AC_PROFILE,
     build_ac_query_packet,
     build_ac_query_single_type_packet,
+    build_classic_temperature_key_command,
     build_estimated_capabilities,
+    build_mode_key_command,
     build_power_off_command,
     build_power_on_command,
     build_query_anti_mold_packet,
@@ -24,6 +26,7 @@ from custom_components.aifa_smart.ac import (
     get_ac_profile,
     get_supported_fan_modes,
     get_supported_swing_modes,
+    hub_requires_mode_keys,
     is_supported_ac_device_code,
     is_supported_ac_sub_device,
     normalize_ac_mode,
@@ -39,7 +42,7 @@ class AifaAcPacketTests(unittest.TestCase):
         self.assertTrue(is_supported_ac_device_code("999"))
         self.assertFalse(is_supported_ac_device_code(None))
         # Empty ac_available_modes only means "no anti-mold"; the AC is still controllable.
-        self.assertTrue(is_supported_ac_device_code("16"))
+        self.assertTrue(is_supported_ac_device_code("115"))
 
     def test_ac_sub_device_detection_checks_type_and_device_code(self) -> None:
         """Climate entities should only attach to AC-like sub-devices."""
@@ -47,11 +50,11 @@ class AifaAcPacketTests(unittest.TestCase):
         self.assertTrue(is_supported_ac_sub_device("0", "999"))
         self.assertFalse(is_supported_ac_sub_device("1", "136"))
         self.assertFalse(is_supported_ac_sub_device("0", None))
-        self.assertTrue(is_supported_ac_sub_device("0", "16"))
+        self.assertTrue(is_supported_ac_sub_device("0", "115"))
 
     def test_empty_anti_mold_list_still_offers_every_mode(self) -> None:
-        """Code 16 (classic temp control) has no anti-mold modes but all five AC modes."""
-        capabilities = get_ac_capabilities("16")
+        """Code 115 (classic temp control) has no anti-mold modes but all five AC modes."""
+        capabilities = get_ac_capabilities("115")
         self.assertEqual(capabilities.available_modes, ("auto", "cool", "heat", "fan", "dry"))
         self.assertEqual(capabilities.anti_mold_modes, ())
         self.assertTrue(capabilities.classic_temp_control)
@@ -59,8 +62,7 @@ class AifaAcPacketTests(unittest.TestCase):
     def test_remote_config_capabilities_for_a_known_ac_code(self) -> None:
         """A known AC catalog entry should expose the full mode/fan/swing set.
 
-        Uses '136' as a representative AC code in the catalog. Per the
-        2026-04-28 BCD-device-aware encoder refactor, capability flags
+        Uses '136' as a representative AC code in the catalog. Capability flags
         (extra_windspeed, supports_turbo, etc.) are catalog-driven plus
         a small set of universal flags — they do NOT vary by device code
         in a 136-specific way.
@@ -276,7 +278,7 @@ class AifaAcPacketTests(unittest.TestCase):
     def test_build_helper_flag_samples(self) -> None:
         """Helper flags packed into byte 10.
 
-        sleep=0x08 verified 2026-04-27 from AVD AIFA app capture.
+        sleep=0x08 verified from an AIFA app capture.
         power_saving=0x02 and turbo=0x04 are still inferred (no AVD path
         could trigger them) but locked here to preserve integration behavior.
         """
@@ -336,7 +338,7 @@ class AifaAcEncoderRegressionTests(unittest.TestCase):
         self.assertEqual(build_power_off_command(), "ffa0a2f0")
 
     def test_cool_24_app_default_byte_match(self) -> None:
-        """Verified: function 'by by' [step 2] cool 24 default →
+        """App packet: cool 24 default →
         ffa0060136240020010100000000f0.
 
         Reached by encoder when caller passes fan=auto, swing=auto.
@@ -353,21 +355,21 @@ class AifaAcEncoderRegressionTests(unittest.TestCase):
         self.assertEqual(decoded.target_temperature, 24)
 
     def test_cool_19_cold_side_prefix(self) -> None:
-        """Verified: 'by by' [step 3] cool 19 → byte 2 = 0x07 (cool<24 prefix)."""
+        """App packet: cool 19 → byte 2 = 0x07 (cool<24 prefix)."""
         encoded = build_status_command(
             "cool", 19, device_code="136", fan_mode="auto", swing_mode="auto"
         )
         self.assertEqual(encoded, "ffa0070136190020010100000000f0")
 
     def test_cool_20_cold_side_prefix(self) -> None:
-        """Verified: 'by by' [step 4] cool 20 → byte 2 = 0x07."""
+        """App packet: cool 20 → byte 2 = 0x07."""
         encoded = build_status_command(
             "cool", 20, device_code="136", fan_mode="auto", swing_mode="auto"
         )
         self.assertEqual(encoded, "ffa0070136200020010100000000f0")
 
     def test_heat_24_app_default_byte_match(self) -> None:
-        """Verified: 'by by' [step 5] heat 24 default → byte 2 = 0x08."""
+        """App packet: heat 24 default → byte 2 = 0x08."""
         encoded = build_status_command(
             "heat", 24, device_code="136", fan_mode="auto", swing_mode="auto"
         )
@@ -380,7 +382,7 @@ class AifaAcEncoderRegressionTests(unittest.TestCase):
         self.assertEqual(decoded.target_temperature, 24)
 
     def test_fan_only_24_app_default_byte_match(self) -> None:
-        """Verified: function 'fanonlysample' → fan_only 24 with byte 2 = 0x08."""
+        """App packet: fan_only 24 with byte 2 = 0x08."""
         encoded = build_status_command(
             "fan", 24, device_code="136", fan_mode="auto", swing_mode="auto"
         )
@@ -393,11 +395,10 @@ class AifaAcEncoderRegressionTests(unittest.TestCase):
         self.assertEqual(decoded.target_temperature, 24)
 
     def test_cool_28_high_fan_swing_4_byte_match(self) -> None:
-        """Verified: function '自動29' bytes (despite the user-given name).
+        """App packet: cool 28, high fan, 4th swing position.
 
         byte 7 = 0x20 = cool, byte 8 = 0x80 = high, byte 9 = 0x40 = 4th cycle
-        position. The user named this 自動 but the bytes are NOT auto fan.
-        Function names are user labels and do not reflect byte semantics.
+        position. Function names are user labels and do not reflect byte semantics.
         """
         encoded = build_status_command(
             "cool", 28, device_code="136", fan_mode="high", swing_mode="fixed_4"
@@ -405,21 +406,21 @@ class AifaAcEncoderRegressionTests(unittest.TestCase):
         self.assertEqual(encoded, "ffa0060136280020804000000000f0")
 
     def test_dry_24_app_default_byte_match(self) -> None:
-        """Verified: probe1 cmd 644474 — Dry mode tap → byte 2=0x08, byte 7=0x40."""
+        """App packet: Dry mode tap → byte 2=0x08, byte 7=0x40."""
         encoded = build_status_command(
             "dry", 24, device_code="136", fan_mode="auto", swing_mode="auto"
         )
         self.assertEqual(encoded, "ffa0080136240040010100000000f0")
 
     def test_auto_24_app_default_byte_match(self) -> None:
-        """Verified: probe1 cmd 644455 RESPONSE — Auto mode → byte 2=0x08, byte 7=0x10."""
+        """App packet: Auto mode → byte 2=0x08, byte 7=0x10."""
         encoded = build_status_command(
             "auto", 24, device_code="136", fan_mode="auto", swing_mode="auto"
         )
         self.assertEqual(encoded, "ffa0080136240010010100000000f0")
 
     def test_cool_24_sleep_on_byte_match(self) -> None:
-        """Verified: probe1 cmd 644452 — Sleep button tapped → byte 10 = 0x08.
+        """App packet: Sleep button tapped → byte 10 = 0x08.
 
         Sleep also forces fan to auto (AVD AIFA app silently drops speed:0
         when Sleep is on). build_status_command callers are expected to pass
@@ -431,14 +432,14 @@ class AifaAcEncoderRegressionTests(unittest.TestCase):
         self.assertEqual(encoded, "ffa0060136240020010108000000f0")
 
     def test_fan_only_24_medium_byte_match(self) -> None:
-        """Verified: probe1 cmd 644454 RESPONSE — fan_only + speed:2 medium → byte 8=0x40."""
+        """App packet: fan_only + speed:2 medium → byte 8=0x40."""
         encoded = build_status_command(
             "fan", 24, device_code="136", fan_mode="medium", swing_mode="auto"
         )
         self.assertEqual(encoded, "ffa0080136240080400100000000f0")
 
     def test_swing_cycle_byte_matches(self) -> None:
-        """Verified: probe1 cmds 644485-644489 — Direction tap cycle.
+        """App packet: Direction tap cycle.
 
         Tapping AVD AIFA app's Direction button cycles through:
           default 0x01 → 0x04 → 0x08 → 0x80 → 0x40 → 0x20
@@ -593,7 +594,7 @@ class AifaAcDeviceCodeBcdTests(unittest.TestCase):
         )
 
         # Codes drawn from the AIFA cloud catalog: popular brands + known
-        # outliers from the cross-device matrix experiments 2026-04-28.
+        # outliers from the cross-device matrix experiments.
         for code in (1, 2, 7, 11, 25, 100, 134, 136, 170, 173, 999):
             with self.subTest(device_code=code):
                 cmd = build_status_command(
@@ -611,6 +612,48 @@ class AifaAcDeviceCodeBcdTests(unittest.TestCase):
                 self.assertEqual(decoded.target_temperature, 24)
                 self.assertEqual(decoded.fan_mode, "auto")
                 self.assertEqual(decoded.swing_mode, "auto")
+
+
+class ClassicTemperatureKeyCommandTests(unittest.TestCase):
+    def test_up_and_down_keys_for_sub_type_0(self) -> None:
+        self.assertEqual(build_classic_temperature_key_command(0, up=True), "ffa006f0")
+        self.assertEqual(build_classic_temperature_key_command(0, up=False), "ffa007f0")
+
+    def test_sub_type_1_uses_a1(self) -> None:
+        self.assertEqual(build_classic_temperature_key_command(1, up=True), "ffa106f0")
+
+
+class ModeKeyCommandTests(unittest.TestCase):
+    def test_mode_keys_for_sub_type_0(self) -> None:
+        expected = {
+            "auto": "ffa015f0",
+            "cool": "ffa016f0",
+            "heat": "ffa017f0",
+            "dry": "ffa018f0",
+            "fan_only": "ffa019f0",
+        }
+        for mode, command in expected.items():
+            with self.subTest(mode=mode):
+                self.assertEqual(build_mode_key_command(mode, 0), command)
+
+    def test_fan_alias_and_case_normalize(self) -> None:
+        self.assertEqual(build_mode_key_command("fan", 0), "ffa019f0")
+        self.assertEqual(build_mode_key_command("Cool", 0), "ffa016f0")
+
+    def test_sub_type_1_uses_a1(self) -> None:
+        self.assertEqual(build_mode_key_command("cool", 1), "ffa116f0")
+        self.assertEqual(build_mode_key_command("heat", 1), "ffa117f0")
+
+    def test_unknown_mode_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            build_mode_key_command("off", 0)
+
+    def test_hub_requires_mode_keys_only_for_exact_version_pair(self) -> None:
+        self.assertTrue(hub_requires_mode_keys(5, 210623))
+        self.assertFalse(hub_requires_mode_keys(5, 210624))
+        self.assertFalse(hub_requires_mode_keys(4, 210623))
+        self.assertFalse(hub_requires_mode_keys(5, None))
+        self.assertFalse(hub_requires_mode_keys(None, None))
 
 
 if __name__ == "__main__":
