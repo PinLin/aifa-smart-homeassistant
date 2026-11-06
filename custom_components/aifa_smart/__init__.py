@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -14,8 +15,12 @@ from .const import (
     CONF_TOKEN_TYPE,
     DOMAIN,
     MANUFACTURER,
+    TRANSPORT_CLOUD,
+    transport_from_options,
 )
 from .device_meta import device_model_label, sub_device_model_label
+
+_LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .api import AifaTokens
@@ -96,10 +101,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     catalog_unsub = await catalog.async_initialize(hass)
     entry.async_on_unload(catalog_unsub)
 
-    await coordinator.async_config_entry_first_refresh()
+    await async_first_refresh_or_cache(coordinator)
 
     entry.runtime_data = coordinator
-    entry.async_on_unload(coordinator.async_shutdown)
+    async_setup_options_reload(hass, entry)
     coordinator.async_sync_background_tasks()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     await _async_remove_obsolete_automation_entities(hass, entry.entry_id)
@@ -108,9 +113,62 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 
+async def async_first_refresh_or_cache(coordinator: AifaSmartCoordinator) -> None:
+    """Run the first refresh; LAN and auto modes may start from the device cache.
+
+    Auth failures are not ConfigEntryNotReady and still go to reauth.
+    """
+    from homeassistant.exceptions import ConfigEntryNotReady
+
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except ConfigEntryNotReady as err:
+        if coordinator.transport == TRANSPORT_CLOUD:
+            raise
+        if not await coordinator.async_start_from_cache():
+            raise
+        _LOGGER.warning(
+            "AIFA cloud unreachable (%s); starting from the cached device list, "
+            "local network control stays available",
+            err.__cause__ or err,
+        )
+
+
+def async_setup_options_reload(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload the entry when the transport option changes.
+
+    Token rotation also updates the entry, so the listener compares the
+    transport instead of reloading on every update.
+    """
+    from .config_flow import OPTIONS_FLOW_RELOADS_ENTRY
+
+    if OPTIONS_FLOW_RELOADS_ENTRY:
+        return
+    active_transport = transport_from_options(entry.options)
+
+    async def _async_options_updated(
+        hass: HomeAssistant, updated_entry: ConfigEntry
+    ) -> None:
+        if transport_from_options(updated_entry.options) != active_transport:
+            await hass.config_entries.async_reload(updated_entry.entry_id)
+
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
+    """Unload a config entry.
+
+    The device cache is kept: an options change reloads the entry and may
+    need it if the cloud is down at that moment.
+    """
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Drop the device cache along with the entry."""
+    from .device_cache import AifaDeviceCache
+
+    await AifaDeviceCache(hass, entry.entry_id).async_remove()
 
 
 _OBSOLETE_TIMER_IR_KEYS: tuple[str, ...] = (

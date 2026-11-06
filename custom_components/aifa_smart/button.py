@@ -167,6 +167,8 @@ class AifaMacroButton(CoordinatorEntity[AifaSmartCoordinator], ButtonEntity):
 class AifaClassicTemperatureKeyButton(AifaSubDeviceEntity, ButtonEntity):
     """One +/- press on an AC remote that has no absolute setpoint."""
 
+    _control_entity = True
+
     entity_description: AifaClassicTemperatureKeyDescription
 
     def __init__(

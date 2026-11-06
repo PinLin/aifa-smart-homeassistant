@@ -99,6 +99,102 @@ class AifaClassicSocketListenerSpec:
     device_type: str | None = None
 
 
+def build_hub_specs(
+    devices: dict[str, AifaDevice], *, require_online: bool
+) -> dict[str, AifaClassicSocketListenerSpec]:
+    """Describe the hubs with at least one supported AC target."""
+    specs: dict[str, AifaClassicSocketListenerSpec] = {}
+    for device in devices.values():
+        if not device.mac or (require_online and not device.online):
+            continue
+        targets = tuple(
+            sorted(
+                (
+                    AifaClassicSocketTarget(
+                        sub_device_id=sub_device.id,
+                        sub_type=_ac_socket_sub_type(sub_device),
+                        device_code=sub_device.device_code,
+                    )
+                    for sub_device in device.sub_devices
+                    if is_supported_ac_sub_device(sub_device.type, sub_device.device_code)
+                ),
+                key=lambda item: (item.sub_type, item.sub_device_id),
+            )
+        )
+        if not targets:
+            continue
+        specs[device.id] = AifaClassicSocketListenerSpec(
+            device_id=device.id,
+            mac=device.mac,
+            targets=targets,
+            device_type=device.device_type,
+        )
+    return specs
+
+
+@dataclass(slots=True)
+class ClassicStreamBuffers:
+    """Per-connection parser buffers for the classic hub byte stream."""
+
+    status: bytes = b""
+    wake: bytes = b""
+    notify: bytes = b""
+    sensor: bytes = b""
+
+
+async def process_classic_stream_chunk(
+    chunk: bytes,
+    buffers: ClassicStreamBuffers,
+    *,
+    device_type: str | None,
+    reply_wake: Callable[[], Awaitable[None]],
+    on_status: Callable[[int, AifaAcStatus], bool],
+    on_sensor: Callable[[AifaClassicSensorState], bool],
+    on_notify: Callable[[], None],
+) -> bool:
+    """Parse one chunk of the hub byte stream shared by the cloud and LAN links.
+
+    Mutates `buffers` in place and returns True when any callback reported a
+    state change.
+    """
+    buffers.status += chunk
+    buffers.wake += chunk
+    buffers.notify += chunk
+    buffers.sensor += chunk
+    updated = False
+
+    wake_packets, buffers.wake = extract_classic_wake_packets(buffers.wake)
+    if wake_packets:
+        await reply_wake()
+
+    status_packets, buffers.status = extract_classic_status_packets(buffers.status)
+    for raw_packet in status_packets:
+        decoded = decode_observed_status_packet(raw_packet)
+        if decoded is None:
+            continue
+        sub_type, observed = decoded
+        updated = on_status(sub_type, observed) or updated
+
+    sensor_packets, buffers.sensor = extract_classic_sensor_packets(buffers.sensor)
+    for packet in sensor_packets:
+        decoded_sensor = decode_classic_sensor_packet(packet, device_type=device_type)
+        if decoded_sensor is None:
+            continue
+        updated = on_sensor(decoded_sensor) or updated
+
+    notify_packets, buffers.notify = extract_classic_notify_packets(buffers.notify)
+    if notify_packets:
+        on_notify()
+
+    # Trimming from the front can lose an in-progress packet at the boundary,
+    # but each extractor re-syncs on the next prefix match.
+    buffers.status = _trim_socket_buffer(buffers.status)
+    buffers.wake = _trim_socket_buffer(buffers.wake)
+    buffers.notify = _trim_socket_buffer(buffers.notify)
+    buffers.sensor = _trim_socket_buffer(buffers.sensor)
+    return updated
+
+
 # Callback signatures. Manager calls back into the coordinator for any state
 # mutation so this module owns I/O and lifecycle only.
 ApplyObservedStatusFn = Callable[
@@ -237,33 +333,7 @@ class ClassicSocketManager:
         self, devices: dict[str, AifaDevice]
     ) -> dict[str, AifaClassicSocketListenerSpec]:
         """Describe which hubs should keep a long-lived classic socket open."""
-        specs: dict[str, AifaClassicSocketListenerSpec] = {}
-        for device in devices.values():
-            if not device.online or not device.mac:
-                continue
-            targets = tuple(
-                sorted(
-                    (
-                        AifaClassicSocketTarget(
-                            sub_device_id=sub_device.id,
-                            sub_type=_ac_socket_sub_type(sub_device),
-                            device_code=sub_device.device_code,
-                        )
-                        for sub_device in device.sub_devices
-                        if is_supported_ac_sub_device(sub_device.type, sub_device.device_code)
-                    ),
-                    key=lambda item: (item.sub_type, item.sub_device_id),
-                )
-            )
-            if not targets:
-                continue
-            specs[device.id] = AifaClassicSocketListenerSpec(
-                device_id=device.id,
-                mac=device.mac,
-                targets=targets,
-                device_type=device.device_type,
-            )
-        return specs
+        return build_hub_specs(devices, require_online=True)
 
     def _ensure_background_sync(self) -> None:
         """Start the background classic poller once Home Assistant is fully running."""
@@ -406,26 +476,12 @@ class ClassicSocketManager:
         write_lock = asyncio.Lock()
         self._socket_writers[spec.device_id] = writer
         self._socket_write_locks[spec.device_id] = write_lock
-        status_buffer = b""
-        wake_buffer = b""
-        notify_buffer = b""
-        sensor_buffer = b""
+        buffers = ClassicStreamBuffers()
         try:
             if socket_session.initial_bytes:
-                updated = await self._async_process_chunk(
-                    spec,
-                    socket_session.initial_bytes,
-                    writer,
-                    status_buffer=status_buffer,
-                    wake_buffer=wake_buffer,
-                    notify_buffer=notify_buffer,
-                    sensor_buffer=sensor_buffer,
-                )
-                status_buffer = updated[0]
-                wake_buffer = updated[1]
-                notify_buffer = updated[2]
-                sensor_buffer = updated[3]
-                if updated[4]:
+                if await self._async_process_chunk(
+                    spec, socket_session.initial_bytes, writer, buffers
+                ):
                     self._on_data_changed()
 
             await self._async_send_query(spec, writer)
@@ -442,20 +498,7 @@ class ClassicSocketManager:
                     continue
                 if not chunk:
                     break
-                updated = await self._async_process_chunk(
-                    spec,
-                    chunk,
-                    writer,
-                    status_buffer=status_buffer,
-                    wake_buffer=wake_buffer,
-                    notify_buffer=notify_buffer,
-                    sensor_buffer=sensor_buffer,
-                )
-                status_buffer = updated[0]
-                wake_buffer = updated[1]
-                notify_buffer = updated[2]
-                sensor_buffer = updated[3]
-                if updated[4]:
+                if await self._async_process_chunk(spec, chunk, writer, buffers):
                     self._on_data_changed()
         finally:
             # Drop registration before closing so external send attempts
@@ -496,61 +539,31 @@ class ClassicSocketManager:
         spec: AifaClassicSocketListenerSpec,
         chunk: bytes,
         writer: asyncio.StreamWriter,
-        *,
-        status_buffer: bytes,
-        wake_buffer: bytes,
-        notify_buffer: bytes,
-        sensor_buffer: bytes,
-    ) -> tuple[bytes, bytes, bytes, bytes, bool]:
+        buffers: ClassicStreamBuffers,
+    ) -> bool:
         """Parse one classic socket chunk and apply any decoded updates."""
-        status_buffer += chunk
-        wake_buffer += chunk
-        notify_buffer += chunk
-        sensor_buffer += chunk
-        updated = False
 
-        wake_packets, wake_buffer = extract_classic_wake_packets(wake_buffer)
-        if wake_packets:
+        async def reply_wake() -> None:
             lock = self._socket_write_locks.get(spec.device_id)
             if lock is None:
                 writer.write(bytes.fromhex(CLASSIC_WAKE_REPLY_PACKET))
                 await writer.drain()
-            else:
-                async with lock:
-                    writer.write(bytes.fromhex(CLASSIC_WAKE_REPLY_PACKET))
-                    await writer.drain()
+                return
+            async with lock:
+                writer.write(bytes.fromhex(CLASSIC_WAKE_REPLY_PACKET))
+                await writer.drain()
 
-        status_packets, status_buffer = extract_classic_status_packets(status_buffer)
-        for raw_packet in status_packets:
-            decoded = decode_observed_status_packet(raw_packet)
-            if decoded is None:
-                continue
-            sub_type, observed = decoded
-            updated = self._on_observed_status(spec, sub_type, observed) or updated
-
-        sensor_packets, sensor_buffer = extract_classic_sensor_packets(sensor_buffer)
-        for packet in sensor_packets:
-            decoded_sensor = decode_classic_sensor_packet(
-                packet, device_type=spec.device_type
-            )
-            if decoded_sensor is None:
-                continue
-            updated = self._on_sensor_state(spec.device_id, decoded_sensor) or updated
-
-        notify_packets, notify_buffer = extract_classic_notify_packets(notify_buffer)
-        if notify_packets:
-            self._schedule_notify_probe(spec.device_id)
-
-        # Cap each buffer so a malformed/uninterpretable byte stream cannot
-        # accumulate forever on a long-lived connection. Trimming from the
-        # front loses an in-progress packet at the boundary, but the parser
-        # naturally re-syncs on the next prefix match.
-        status_buffer = _trim_socket_buffer(status_buffer)
-        wake_buffer = _trim_socket_buffer(wake_buffer)
-        notify_buffer = _trim_socket_buffer(notify_buffer)
-        sensor_buffer = _trim_socket_buffer(sensor_buffer)
-
-        return status_buffer, wake_buffer, notify_buffer, sensor_buffer, updated
+        return await process_classic_stream_chunk(
+            chunk,
+            buffers,
+            device_type=spec.device_type,
+            reply_wake=reply_wake,
+            on_status=lambda sub_type, observed: self._on_observed_status(
+                spec, sub_type, observed
+            ),
+            on_sensor=lambda sensor: self._on_sensor_state(spec.device_id, sensor),
+            on_notify=lambda: self._schedule_notify_probe(spec.device_id),
+        )
 
     # ----- Notify probe -----
 

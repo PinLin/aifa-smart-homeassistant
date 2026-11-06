@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import (
     TimestampDataUpdateCoordinator,
@@ -52,7 +53,18 @@ from .classic_listener import (
     ClassicSocketManager,
     _ac_socket_sub_type,
 )
-from .const import DOMAIN, SCAN_INTERVAL
+from .const import (
+    DOMAIN,
+    LAN_AUTO_SUPPRESS_SECONDS,
+    LAN_CONNECT_TIMEOUT,
+    SCAN_INTERVAL,
+    TRANSPORT_AUTO,
+    TRANSPORT_CLOUD,
+    TRANSPORT_LAN,
+    transport_from_options,
+)
+from .device_cache import AifaDeviceCache
+from .lan import LanSendResult, LanTransportManager
 from .runtime import AifaAcRuntimeState, resolve_helper_flag_mutex
 
 _LOGGER = logging.getLogger(__name__)
@@ -69,7 +81,22 @@ _AC_SEND_MIN_INTERVAL_SECONDS = 1.0
 # refresh repair issue (catalog.py); this one fires on cloud poll failures
 # (UpdateFailed / ConfigEntryAuthFailed) regardless of catalog state.
 _FAILURES_BEFORE_ISSUE = 10
+# The cloud writer can look alive for minutes after a WAN drop, so the LAN
+# modes cap the optional cloud probe well below the 6 s default.
+_LAN_MODE_CLOUD_QUERY_TIMEOUT = 2.0
 ISSUE_POLLING_FAILING = "polling_failing"
+
+
+def _has_status_stream(coordinator: object, device_id: str) -> bool:
+    """Either stream pushes status packets into the runtime state.
+
+    Kept module-level so the wait loop also works on lightweight test doubles
+    that only carry a cloud listener.
+    """
+    if coordinator._classic_listener.has_active_listener(device_id):  # type: ignore[attr-defined]
+        return True
+    lan_manager = getattr(coordinator, "_lan_manager", None)
+    return lan_manager is not None and lan_manager.is_connected(device_id)
 
 
 @dataclass(slots=True)
@@ -83,6 +110,12 @@ class AifaAccountData:
 
 class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
     """Coordinate AIFA Smart data refreshes."""
+
+    _transport: str = TRANSPORT_CLOUD
+    _lan_manager: LanTransportManager | None = None
+    _device_cache: AifaDeviceCache | None = None
+    # True from an offline start until the first successful cloud refresh.
+    running_on_cache: bool = False
 
     def __init__(
         self,
@@ -105,9 +138,11 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         self._ac_apply_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._ac_last_send_at: dict[tuple[str, str | None], float] = {}
         self._consecutive_failures = 0
+        # The base class registers async_shutdown on the entry's unload.
         super().__init__(
             hass,
             logger=_LOGGER,
+            config_entry=entry,
             name=f"{DOMAIN}_{entry.entry_id}",
             update_interval=timedelta(seconds=SCAN_INTERVAL),
         )
@@ -120,10 +155,81 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
             on_data_changed=self.async_update_listeners,
             on_notify_full_refresh=self.async_request_refresh,
         )
+        self._transport = transport_from_options(entry.options)
+        self._lan_failed_at: dict[str, float] = {}
+        self._transport_counters: dict[str, int | str | None] = {
+            "sent_lan": 0,
+            "sent_cloud": 0,
+            "auto_fallbacks": 0,
+            "lan_write_failures": 0,
+            "last_transport": None,
+        }
+        if self._transport != TRANSPORT_CLOUD:
+            self._lan_manager = LanTransportManager(
+                hass=hass,
+                on_observed_status=self._apply_classic_observed_status,
+                on_data_changed=self.async_update_listeners,
+                on_link_state_changed=self.async_update_listeners,
+            )
+            self._device_cache = AifaDeviceCache(hass, entry.entry_id)
+
+    @property
+    def transport(self) -> str:
+        """Transport selected in the entry options."""
+        return self._transport
+
+    @property
+    def lan_manager(self) -> LanTransportManager | None:
+        """LAN transport manager, present only for the lan and auto modes."""
+        return self._lan_manager
+
+    def transport_diagnostics(self) -> dict[str, object]:
+        """Transport state for diagnostics; carries no MAC or credential."""
+        lan = self._lan_manager
+        listener = self._classic_listener
+        return {
+            "mode": self._transport,
+            "running_on_cache": self.running_on_cache,
+            "broadcast_addresses": list(lan.broadcast_addresses) if lan is not None else [],
+            "lan": lan.snapshot() if lan is not None else {},
+            "cloud_listener": {
+                device_id: {
+                    "listening": listener.has_active_listener(device_id),
+                    "writer": listener.has_active_writer(device_id),
+                }
+                for device_id in listener.specs
+            },
+            "counters": dict(self._transport_counters),
+        }
+
+    def is_control_available(self, device_id: str) -> bool:
+        """Availability of entities that send commands to the hub.
+
+        Cloud mode keeps the poll-based rule. LAN mode follows the link with a
+        grace period so a reconnect does not flap entities. Auto mode is usable
+        while either path is.
+        """
+        if self._transport == TRANSPORT_CLOUD:
+            return self.last_update_success
+        lan_available = self._lan_manager is not None and self._lan_manager.is_available(
+            device_id
+        )
+        if self._transport == TRANSPORT_LAN:
+            return lan_available
+        return lan_available or self.last_update_success
+
+    def _lan_connected(self, device_id: str) -> bool:
+        return self._lan_manager is not None and self._lan_manager.is_connected(device_id)
+
+    def _has_status_stream(self, device_id: str) -> bool:
+        """Return True when a cloud listener or a LAN link pushes AC status."""
+        return _has_status_stream(self, device_id)
 
     async def async_shutdown(self) -> None:
         """Cancel background classic-socket and follow-up probe tasks."""
         await self._classic_listener.shutdown()
+        if self._lan_manager is not None:
+            await self._lan_manager.shutdown()
         tasks = [
             task
             for task in list(self._ac_follow_up_probe_tasks.values())
@@ -140,6 +246,8 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         if self.data is None:
             return
         self._classic_listener.sync_specs(self.data.devices)
+        if self._lan_manager is not None:
+            self._lan_manager.sync_specs(self.data.devices)
 
     def get_device(self, device_id: str) -> AifaDevice | None:
         """Return a single device by ID."""
@@ -172,32 +280,131 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
 
         responses: list[dict] = []
         for command in commands:
-            sent_via_tls = await self._classic_listener.async_send_packet(
-                command.device_id, command.command
-            )
-            if not sent_via_tls:
-                raise AifaSmartError(
-                    f"No active TLS connection for device {command.device_id}; "
-                    "cannot send command"
-                )
-
+            transport = await self._async_send_raw_command(command)
             response: dict = {
                 "deviceId": command.device_id,
                 "status": "success",
-                "transport": "classic_tls",
+                "transport": transport,
             }
             if command.sub_device_id is not None:
                 response["subDeviceId"] = command.sub_device_id
             responses.append(response)
         return responses
 
+    async def _async_send_raw_command(self, command: AifaFunctionCommand) -> str:
+        """Send one raw packet over the configured transport and name it."""
+        if self._transport == TRANSPORT_LAN:
+            return await self._async_send_raw_command_lan(command)
+        if self._transport == TRANSPORT_AUTO and self._lan_manager is not None:
+            return await self._async_send_raw_command_auto(command, self._lan_manager)
+        return await self._async_send_raw_command_cloud(command)
+
+    async def _async_send_raw_command_cloud(self, command: AifaFunctionCommand) -> str:
+        sent_via_tls = await self._classic_listener.async_send_packet(
+            command.device_id, command.command
+        )
+        if not sent_via_tls:
+            raise AifaSmartError(
+                f"No active TLS connection for device {command.device_id}; "
+                "cannot send command"
+            )
+        return "classic_tls"
+
+    async def _async_send_over_lan(self, command: AifaFunctionCommand) -> LanSendResult:
+        if self._lan_manager is None:
+            return LanSendResult.NOT_CONNECTED
+        result = await self._lan_manager.async_send_packet(
+            command.device_id, command.command, connect_timeout=LAN_CONNECT_TIMEOUT
+        )
+        if result is LanSendResult.SENT:
+            self._count_transport("sent_lan", last="lan")
+        elif result is LanSendResult.WRITE_FAILED:
+            self._count_transport("lan_write_failures")
+        return result
+
+    async def _async_send_raw_command_lan(self, command: AifaFunctionCommand) -> str:
+        """LAN only: never touch the cloud, even when the hub is unreachable."""
+        result = await self._async_send_over_lan(command)
+        if result is LanSendResult.SENT:
+            return "lan"
+        if result is LanSendResult.WRITE_FAILED:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="lan_write_failed",
+                translation_placeholders={"device_id": command.device_id},
+            )
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="lan_unavailable",
+            translation_placeholders={"device_id": command.device_id},
+        )
+
+    async def _async_send_raw_command_auto(
+        self, command: AifaFunctionCommand, lan_manager: LanTransportManager
+    ) -> str:
+        """Prefer LAN; use the cloud only when nothing was written locally.
+
+        A failed write may already have reached the hub, and relative keys
+        (temperature +/-, fan cycling) would step twice if resent, so
+        WRITE_FAILED never falls back.
+        """
+        device_id = command.device_id
+        failed_at = self._lan_failed_at.get(device_id)
+        suppressed = (
+            failed_at is not None
+            and time.monotonic() - failed_at < LAN_AUTO_SUPPRESS_SECONDS
+            and not lan_manager.is_connected(device_id)
+        )
+        if not suppressed:
+            result = await self._async_send_over_lan(command)
+            if result is LanSendResult.SENT:
+                self._lan_failed_at.pop(device_id, None)
+                return "lan"
+            self._lan_failed_at[device_id] = time.monotonic()
+            if result is LanSendResult.WRITE_FAILED:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="lan_write_failed",
+                    translation_placeholders={"device_id": device_id},
+                )
+            self._count_transport("auto_fallbacks")
+
+        if not await self._classic_listener.async_send_packet(device_id, command.command):
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="no_transport",
+                translation_placeholders={"device_id": device_id},
+            )
+        self._count_transport("sent_cloud", last="classic_tls")
+        return "classic_tls"
+
+    def _count_transport(self, key: str, *, last: str | None = None) -> None:
+        counters = self._transport_counters
+        counters[key] = int(counters[key] or 0) + 1
+        if last is not None:
+            counters["last_transport"] = last
+
     async def async_send_function_commands(
         self, commands: list[AifaFunctionCommand]
     ) -> list[dict]:
         """Send a prepared command sequence and refresh coordinator data."""
         responses = await self._async_dispatch_raw_commands(commands)
-        await self.async_request_refresh()
+        await self._async_refresh_after_send()
         return responses
+
+    async def _async_refresh_after_send(self) -> None:
+        """Refresh after a command without making LAN control wait on the cloud.
+
+        The debouncer runs the first refresh inline, so awaiting it would hold
+        the apply lock for the whole cloud round trip (30 s when unreachable).
+        """
+        if self._transport == TRANSPORT_CLOUD:
+            await self.async_request_refresh()
+            return
+        self.hass.async_create_background_task(
+            self.async_request_refresh(),
+            name=f"{DOMAIN}_refresh_after_send",
+        )
 
     def get_macro(self, macro_id: str) -> AifaMacro | None:
         """Look up a saved macro by id from the latest account snapshot."""
@@ -238,7 +445,7 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
             if index < last_index and command.delay and command.delay > 0:
                 await asyncio.sleep(command.delay / 1000)
 
-        await self.async_request_refresh()
+        await self._async_refresh_after_send()
         return responses
 
     def _prune_stale_runtime_state(self, devices: dict[str, AifaDevice]) -> None:
@@ -589,7 +796,40 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
             raise
         self._consecutive_failures = 0
         self._clear_polling_issue()
+        self.running_on_cache = False
+        await self._async_save_device_cache(result)
         return result
+
+    async def _async_save_device_cache(self, result: AifaAccountData) -> None:
+        if self._device_cache is None:
+            return
+        try:
+            await self._device_cache.async_save(result.devices, result.macros)
+        except Exception as err:  # noqa: BLE001 - a disk problem must not fail the poll
+            _LOGGER.warning("Unable to write the AIFA device cache: %s", err)
+
+    async def async_start_from_cache(self) -> bool:
+        """Seed data from the device cache after a failed first refresh.
+
+        last_update_success stays False, so cloud-bound entities remain
+        unavailable while LAN control works; polling keeps retrying the cloud.
+        """
+        if self._device_cache is None:
+            return False
+        cached = await self._device_cache.async_load()
+        if cached is None:
+            return False
+        devices, macros, saved_at = cached
+        for device in devices.values():
+            for sub_device in device.sub_devices:
+                self._async_refresh_runtime_state(device.id, sub_device)
+        self.data = AifaAccountData(
+            devices=devices,
+            macros=macros,
+            fetched_at=saved_at or dt_util.utcnow(),
+        )
+        self.running_on_cache = True
+        return True
 
     def _raise_polling_issue(self) -> None:
         """Surface a Repairs entry once sustained polling failure crosses the threshold."""
@@ -630,6 +870,8 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
                 enriched[device.id] = device
 
             self._classic_listener.sync_specs(enriched)
+            if self._lan_manager is not None:
+                self._lan_manager.sync_specs(enriched)
             self._prune_stale_runtime_state(enriched)
             return AifaAccountData(
                 devices=enriched,
@@ -769,13 +1011,18 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         if (
             device is None
             or sub_device is None
-            or not device.online
             or not device.mac
+            or not (device.online or self._lan_connected(device_id))
             or not is_supported_ac_sub_device(sub_device.type, sub_device.device_code)
         ):
             return False
 
-        if self._classic_listener.has_active_listener(device_id) and await self._async_wait_for_classic_socket_update(
+        if self._lan_manager is not None and self._lan_manager.is_connected(device_id):
+            # The hub may not push on its own over the LAN when the cloud
+            # socket is down, so ask; the reply lands via the status callback.
+            await self._lan_manager.async_request_status(device_id)
+
+        if self._has_status_stream(device_id) and await self._async_wait_for_classic_socket_update(
             device_id,
             sub_device_id,
             minimum_observed_revision=minimum_observed_revision,
@@ -786,10 +1033,27 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         ):
             return True
 
-        observed_by_sub_type = await self.client.async_query_classic_ac_statuses(
-            device.mac,
-            sub_types={_ac_socket_sub_type(sub_device)},
-        )
+        sub_types = {_ac_socket_sub_type(sub_device)}
+        if self._transport == TRANSPORT_CLOUD:
+            observed_by_sub_type = await self.client.async_query_classic_ac_statuses(
+                device.mac,
+                sub_types=sub_types,
+            )
+        else:
+            # The command may already have gone out over the LAN; a cloud
+            # outage or token refresh failure here must neither add the
+            # 6 s socket timeout nor turn that success into an error.
+            if not self._classic_listener.has_active_writer(device_id):
+                return False
+            try:
+                observed_by_sub_type = await self.client.async_query_classic_ac_statuses(
+                    device.mac,
+                    sub_types=sub_types,
+                    timeout=_LAN_MODE_CLOUD_QUERY_TIMEOUT,
+                )
+            except (AifaSmartError, OSError) as err:
+                _LOGGER.debug("Cloud AC query for %s failed: %s", device_id, err)
+                return False
         observed = observed_by_sub_type.get(_ac_socket_sub_type(sub_device))
         if observed is None:
             return False
@@ -815,8 +1079,8 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         expected_swing_mode: str | None = None,
         timeout: float = 2.5,
     ) -> bool:
-        """Wait briefly for the long-lived classic socket listener to push a fresh state."""
-        if not self._classic_listener.has_active_listener(device_id):
+        """Wait briefly for the cloud listener or LAN link to push a fresh state."""
+        if not _has_status_stream(self, device_id):
             return False
 
         state = self.get_ac_runtime_state(device_id, sub_device_id)

@@ -98,6 +98,7 @@ async def async_setup_entry(
 class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntity):
     """Climate control surface backed by AIFA raw packets and best-available state."""
 
+    _control_entity = True
     _attr_translation_key = "climate"
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_target_temperature_step = 1

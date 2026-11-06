@@ -6,9 +6,16 @@ from typing import Any
 
 import voluptuous as vol
 from homeassistant import config_entries
+from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.selector import (
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
 from .api import AifaSmartApiClient, AifaSmartAuthError, AifaSmartConnectionError, AifaTokens
+from .classic_listener import build_hub_specs
 from .const import (
     CONF_ACCESS_TOKEN,
     CONF_EMAIL,
@@ -16,10 +23,22 @@ from .const import (
     CONF_REFRESH_TOKEN,
     CONF_TOKEN_EXPIRES_AT,
     CONF_TOKEN_TYPE,
+    CONF_TRANSPORT,
     DOMAIN,
+    TRANSPORT_CLOUD,
+    TRANSPORTS,
+    transport_from_options,
 )
+from .lan import async_default_broadcast_addresses, async_search_hubs, normalize_mac
 
 _LOGGER = logging.getLogger(__name__)
+
+# Newer HA cores reload the entry after an options change and reject entries
+# that also carry an update listener; older cores need the listener.
+OPTIONS_FLOW_RELOADS_ENTRY = hasattr(config_entries, "OptionsFlowWithReload")
+_OptionsFlowBase: type[config_entries.OptionsFlow] = getattr(
+    config_entries, "OptionsFlowWithReload", config_entries.OptionsFlow
+)
 
 
 def _token_data_fields(tokens: AifaTokens | None) -> dict[str, Any]:
@@ -47,10 +66,100 @@ def _user_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
     )
 
 
+def _options_schema(transport: str) -> vol.Schema:
+    """Build the options schema with the current transport preselected."""
+    return vol.Schema(
+        {
+            vol.Required(CONF_TRANSPORT, default=transport): SelectSelector(
+                SelectSelectorConfig(
+                    options=list(TRANSPORTS),
+                    translation_key=CONF_TRANSPORT,
+                    mode=SelectSelectorMode.LIST,
+                )
+            ),
+        }
+    )
+
+
+class AifaSmartOptionsFlow(_OptionsFlowBase):
+    """Let the user pick how commands reach the hub."""
+
+    _warned_transport: str | None = None
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.FlowResult:
+        """Show or store the transport option.
+
+        LAN and auto first look for the hubs with a c0 search. When one is
+        missing the form comes back with a warning, and submitting the same
+        choice again saves it anyway.
+        """
+        transport = transport_from_options(self.config_entry.options)
+        errors: dict[str, str] = {}
+        placeholders: dict[str, str] = {}
+        if user_input is not None:
+            transport = transport_from_options(user_input)
+            if transport == TRANSPORT_CLOUD or transport == self._warned_transport:
+                return self._async_save(transport)
+            missing = await self._async_missing_hubs()
+            if missing is None:
+                return self._async_save(transport)
+            self._warned_transport = transport
+            if missing:
+                errors["base"] = "hub_not_found"
+                placeholders["hubs"] = ", ".join(missing)
+            else:
+                errors["base"] = "no_hub_found"
+        return self.async_show_form(
+            step_id="init",
+            data_schema=_options_schema(transport),
+            errors=errors,
+            description_placeholders=placeholders,
+        )
+
+    def _async_save(self, transport: str) -> config_entries.FlowResult:
+        return self.async_create_entry(
+            data={**self.config_entry.options, CONF_TRANSPORT: transport}
+        )
+
+    async def _async_missing_hubs(self) -> list[str] | None:
+        """Return None when every hub answered, else the names that did not.
+
+        An empty list means no hub list was available and nothing answered.
+        """
+        coordinator = getattr(self.config_entry, "runtime_data", None)
+        data = getattr(coordinator, "data", None)
+        known: dict[str, str] = {}
+        if data is not None:
+            for device_id, spec in build_hub_specs(data.devices, require_online=False).items():
+                known[normalize_mac(spec.mac)] = data.devices[device_id].name
+        try:
+            replies = await async_search_hubs(
+                await async_default_broadcast_addresses(self.hass)
+            )
+        except OSError as err:
+            _LOGGER.debug("AIFA LAN search from the options flow failed: %s", err)
+            replies = {}
+        found = {normalize_mac(mac) for mac in replies}
+        if known:
+            missing = [name for mac, name in known.items() if mac not in found]
+            return missing or None
+        return None if found else []
+
+
 class AifaSmartConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for AIFA Smart."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> AifaSmartOptionsFlow:
+        """Return the options flow handler."""
+        return AifaSmartOptionsFlow()
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None

@@ -232,6 +232,8 @@ class AifaSubDeviceEntity(StateBroadcastDedupMixin, CoordinatorEntity["AifaSmart
     """Base class for entities attached to one AIFA sub-device."""
 
     _attr_has_entity_name = True
+    # Entities that send commands follow the transport; readings stay cloud-bound.
+    _control_entity = False
 
     def __init__(
         self,
@@ -263,11 +265,11 @@ class AifaSubDeviceEntity(StateBroadcastDedupMixin, CoordinatorEntity["AifaSmart
 
     @property
     def available(self) -> bool:
-        return (
-            self.coordinator.last_update_success
-            and self.device is not None
-            and self.sub_device is not None
-        )
+        if self._control_entity:
+            reachable = self.coordinator.is_control_available(self._device_id)
+        else:
+            reachable = self.coordinator.last_update_success
+        return reachable and self.device is not None and self.sub_device is not None
 
     @property
     def device_info(self) -> DeviceInfo | None:

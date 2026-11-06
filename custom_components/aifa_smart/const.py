@@ -35,6 +35,18 @@ CONF_REFRESH_TOKEN = "refresh_token"
 CONF_TOKEN_TYPE = "token_type"
 CONF_TOKEN_EXPIRES_AT = "token_expires_at"
 
+CONF_TRANSPORT = "transport"
+TRANSPORT_CLOUD = "cloud"
+TRANSPORT_LAN = "lan"
+TRANSPORT_AUTO = "auto"
+TRANSPORTS = (TRANSPORT_CLOUD, TRANSPORT_LAN, TRANSPORT_AUTO)
+DEFAULT_TRANSPORT = TRANSPORT_CLOUD
+
+# The AIFA app also gives the LAN connect-back 3 s before using the cloud.
+LAN_CONNECT_TIMEOUT = 3.0
+LAN_AUTO_SUPPRESS_SECONDS = 60
+LAN_UNAVAILABLE_GRACE_SECONDS = 60
+
 # Hub pushes SENSOR{...} every 60s via TLS 8751 broadcast. AC observed state and
 # sensor packets both arrive on the long-lived classic listener, so the
 # REST poll is mainly a structural-data refresher (devices, functions,
@@ -46,3 +58,9 @@ ATTR_DEVICE_TYPE = "device_type"
 ATTR_SUB_DEVICE_COUNT = "sub_device_count"
 ATTR_LAST_UPDATE = "last_update"
 ATTR_RAW_DEVICE = "raw_device"
+
+
+def transport_from_options(options: object) -> str:
+    """Return the configured transport, falling back to the cloud default."""
+    value = options.get(CONF_TRANSPORT) if hasattr(options, "get") else None
+    return value if value in TRANSPORTS else DEFAULT_TRANSPORT

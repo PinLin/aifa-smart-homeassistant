@@ -1,0 +1,142 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect AIFA Smart",
+        "description": "Sign in with your AIFA Smart account.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate AIFA Smart",
+        "description": "The stored tokens for {email} have expired. Enter the password to obtain a new session.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to reach the AIFA Smart API.",
+      "invalid_auth": "Authentication failed.",
+      "unknown": "Unexpected error."
+    },
+    "abort": {
+      "already_configured": "This AIFA Smart account is already configured.",
+      "reauth_successful": "AIFA Smart re-authentication succeeded."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "AIFA Smart options",
+        "description": "Choose how commands reach the AIFA hub. Local network talks to the hub directly without the AIFA cloud; Automatic tries the local network first and uses the cloud when the hub cannot be reached locally.",
+        "data": {
+          "transport": "Transport"
+        },
+        "data_description": {
+          "transport": "Local network and Automatic need Home Assistant and the hub on the same network."
+        }
+      }
+    },
+    "error": {
+      "hub_not_found": "These AIFA hubs did not answer a local network search: {hubs}. Local network control may not reach them. Submit again to save anyway.",
+      "no_hub_found": "No AIFA hub answered a local network search. Local network control may not work. Submit again to save anyway."
+    }
+  },
+  "selector": {
+    "transport": {
+      "options": {
+        "cloud": "Cloud",
+        "lan": "Local network",
+        "auto": "Automatic (local network, fall back to cloud)"
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "temperature": {
+        "name": "Temperature"
+      },
+      "humidity": {
+        "name": "Humidity"
+      },
+      "firmware": {
+        "name": "Firmware"
+      },
+      "macro_count": {
+        "name": "Macro Count"
+      },
+      "sub_device_code": {
+        "name": "Device Code"
+      },
+      "sub_device_code_source": {
+        "name": "Code Source",
+        "state": {
+          "catalog": "Catalog",
+          "cloud": "Cloud"
+        }
+      },
+      "sub_device_brand": {
+        "name": "Catalog Brand"
+      },
+      "sub_device_function_count": {
+        "name": "Function Count"
+      }
+    },
+    "binary_sensor": {
+      "online": {
+        "name": "Device Connection Status"
+      }
+    },
+    "climate": {
+      "climate": {
+        "name": "Climate"
+      }
+    },
+    "switch": {
+      "turbo": {
+        "name": "Turbo"
+      },
+      "sleep": {
+        "name": "Sleep"
+      },
+      "power_saving": {
+        "name": "Power Saving"
+      }
+    },
+    "button": {
+      "force_refresh": {
+        "name": "Refresh"
+      },
+      "temperature_up": {
+        "name": "Temperature up"
+      },
+      "temperature_down": {
+        "name": "Temperature down"
+      }
+    }
+  },
+  "issues": {
+    "catalog_refresh_failing": {
+      "title": "AIFA catalog refresh is failing",
+      "description": "The integration could not refresh AC capability metadata from AIFA's Firebase Remote Config ({kind}). Control commands still work, but new AC models added by AIFA won't appear correctly until the integration is updated. Detail: {detail}"
+    },
+    "polling_failing": {
+      "title": "AIFA Smart API unreachable",
+      "description": "Sustained polling failures for entry {entry_id}. Check that Home Assistant can reach the AIFA Smart cloud API, then review the integration log for details. The notification clears automatically once polling succeeds again."
+    }
+  },
+  "exceptions": {
+    "lan_unavailable": {
+      "message": "Cannot reach AIFA hub {device_id} on the local network. The command was not sent."
+    },
+    "lan_write_failed": {
+      "message": "Sending to AIFA hub {device_id} over the local network failed partway. The command may or may not have reached the air conditioner, so it was not retried."
+    },
+    "no_transport": {
+      "message": "AIFA hub {device_id} is unreachable on both the local network and the cloud. The command was not sent."
+    }
+  }
+}

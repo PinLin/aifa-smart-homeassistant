@@ -93,6 +93,7 @@ async def async_setup_entry(
 class AifaAcFlagSwitch(AifaSubDeviceEntity, SwitchEntity):
     """Switch entity for a single AIFA AC boolean helper flag."""
 
+    _control_entity = True
     _attr_entity_category = None
     _state_attrs = ("is_on", "assumed_state", "extra_state_attributes", "available")
 

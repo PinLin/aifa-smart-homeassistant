@@ -27,6 +27,33 @@
       "reauth_successful": "AIFA Smart 重新驗證成功。"
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "AIFA Smart 選項",
+        "description": "選擇指令送到 AIFA 主機的方式。區網會直接連到主機，不經過 AIFA 雲端；自動會先試區網，區網連不上時改走雲端。",
+        "data": {
+          "transport": "傳輸方式"
+        },
+        "data_description": {
+          "transport": "區網與自動模式需要 Home Assistant 和主機在同一個網路。"
+        }
+      }
+    },
+    "error": {
+      "hub_not_found": "以下 AIFA 主機沒有回應區網搜尋：{hubs}。區網控制可能連不到這些主機。再送出一次即可照樣儲存。",
+      "no_hub_found": "區網搜尋沒有找到任何 AIFA 主機，區網控制可能無法運作。再送出一次即可照樣儲存。"
+    }
+  },
+  "selector": {
+    "transport": {
+      "options": {
+        "cloud": "雲端",
+        "lan": "區網",
+        "auto": "自動（優先區網，失敗改走雲端）"
+      }
+    }
+  },
   "entity": {
     "sensor": {
       "temperature": {
@@ -99,6 +126,17 @@
     "polling_failing": {
       "title": "無法連線至 AIFA Smart API",
       "description": "整合條目 {entry_id} 的資料更新已連續失敗。請確認 Home Assistant 可以連到 AIFA Smart 雲端，並查看整合的紀錄取得詳細錯誤。連線恢復後，這則通知會自動消失。"
+    }
+  },
+  "exceptions": {
+    "lan_unavailable": {
+      "message": "無法經由區網連到 AIFA 主機 {device_id}，指令沒有送出。"
+    },
+    "lan_write_failed": {
+      "message": "經由區網傳送到 AIFA 主機 {device_id} 時中途失敗，指令可能已經送到冷氣，所以不會重送。"
+    },
+    "no_transport": {
+      "message": "區網和雲端都連不到 AIFA 主機 {device_id}，指令沒有送出。"
     }
   }
 }
