@@ -83,6 +83,15 @@
       },
       "sub_device_function_count": {
         "name": "功能數量"
+      },
+      "ac_fan_speed": {
+        "name": "目前風速",
+        "state": {
+          "auto": "自動",
+          "low": "1 段",
+          "medium": "2 段",
+          "high": "3 段"
+        }
       }
     },
     "binary_sensor": {
@@ -95,17 +104,6 @@
         "name": "冷氣"
       }
     },
-    "switch": {
-      "turbo": {
-        "name": "強力運轉"
-      },
-      "sleep": {
-        "name": "舒眠"
-      },
-      "power_saving": {
-        "name": "省電"
-      }
-    },
     "button": {
       "force_refresh": {
         "name": "重新整理"
@@ -115,6 +113,51 @@
       },
       "temperature_down": {
         "name": "溫度 −"
+      },
+      "ac_timer": {
+        "name": "定時"
+      },
+      "ac_swing": {
+        "name": "風向"
+      },
+      "ac_fan_speed": {
+        "name": "風速"
+      },
+      "ac_power_saving": {
+        "name": "節電"
+      },
+      "ac_sleep": {
+        "name": "舒眠"
+      },
+      "ac_turbo": {
+        "name": "強冷"
+      },
+      "ac_quiet": {
+        "name": "靜音"
+      },
+      "ac_extra_wind_speed": {
+        "name": "風速調節"
+      },
+      "ac_display": {
+        "name": "機體顯示"
+      },
+      "ac_mold": {
+        "name": "乾燥防霉"
+      },
+      "ac_wind_speed_high": {
+        "name": "風量 +"
+      },
+      "ac_wind_speed_low": {
+        "name": "風量 −"
+      },
+      "ac_mode": {
+        "name": "模式"
+      },
+      "ac_anti_mold_on": {
+        "name": "智慧防霉開"
+      },
+      "ac_anti_mold_off": {
+        "name": "智慧防霉關"
       }
     }
   },
@@ -137,6 +180,27 @@
     },
     "no_transport": {
       "message": "區網和雲端都連不到 AIFA 主機 {device_id}，指令沒有送出。"
+    },
+    "hub_no_response": {
+      "message": "AIFA 主機 {device_id} 在指令送出後沒有回報任何狀態，指令可能沒有送達。已重設連線，請再試一次。"
+    },
+    "ac_state_mismatch": {
+      "message": "指令送出後，AIFA 主機 {device_id} 回報的冷氣狀態是 {reported}，與預期的 {expected} 不符。和 i-Ctrl Pro App 一樣，指令不會重送。"
+    },
+    "ac_key_requires_power_on": {
+      "message": "冷氣關機中，這個按鍵要開機後才能使用，與 i-Ctrl Pro 相同。"
+    },
+    "ac_fan_speed_unchanged": {
+      "message": "送出風速鍵後，AIFA 主機 {device_id} 回報的風速沒有改變。風速鍵每按一次會切到下一段，所以沒有重送。"
+    },
+    "ac_mode_not_offered": {
+      "message": "i-Ctrl Pro 沒有提供這台冷氣的 {mode} 模式鍵。"
+    },
+    "ac_temperature_unavailable": {
+      "message": "只有在冷氣開機、模式為冷氣或暖氣，或除濕且有回報設定溫度時才能調整溫度，與 i-Ctrl Pro 相同。"
+    },
+    "ac_anti_mold_mode_unsupported": {
+      "message": "智慧防霉不支援冷氣目前的模式，與 i-Ctrl Pro 相同。"
     }
   }
 }

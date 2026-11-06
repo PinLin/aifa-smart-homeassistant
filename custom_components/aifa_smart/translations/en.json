@@ -83,6 +83,15 @@
       },
       "sub_device_function_count": {
         "name": "Function Count"
+      },
+      "ac_fan_speed": {
+        "name": "Current fan speed",
+        "state": {
+          "auto": "Auto",
+          "low": "Speed 1",
+          "medium": "Speed 2",
+          "high": "Speed 3"
+        }
       }
     },
     "binary_sensor": {
@@ -95,17 +104,6 @@
         "name": "Climate"
       }
     },
-    "switch": {
-      "turbo": {
-        "name": "Turbo"
-      },
-      "sleep": {
-        "name": "Sleep"
-      },
-      "power_saving": {
-        "name": "Power Saving"
-      }
-    },
     "button": {
       "force_refresh": {
         "name": "Refresh"
@@ -115,6 +113,51 @@
       },
       "temperature_down": {
         "name": "Temperature down"
+      },
+      "ac_timer": {
+        "name": "Timer"
+      },
+      "ac_swing": {
+        "name": "Direction"
+      },
+      "ac_fan_speed": {
+        "name": "Speed"
+      },
+      "ac_power_saving": {
+        "name": "Power saving"
+      },
+      "ac_sleep": {
+        "name": "Sleep"
+      },
+      "ac_turbo": {
+        "name": "Turbo"
+      },
+      "ac_quiet": {
+        "name": "Quiet"
+      },
+      "ac_extra_wind_speed": {
+        "name": "Wind speed adjustment"
+      },
+      "ac_display": {
+        "name": "Display"
+      },
+      "ac_mold": {
+        "name": "Mold prevention"
+      },
+      "ac_wind_speed_high": {
+        "name": "Wind speed +"
+      },
+      "ac_wind_speed_low": {
+        "name": "Wind speed −"
+      },
+      "ac_mode": {
+        "name": "Mode"
+      },
+      "ac_anti_mold_on": {
+        "name": "Anti mold on"
+      },
+      "ac_anti_mold_off": {
+        "name": "Anti mold off"
       }
     }
   },
@@ -137,6 +180,27 @@
     },
     "no_transport": {
       "message": "AIFA hub {device_id} is unreachable on both the local network and the cloud. The command was not sent."
+    },
+    "hub_no_response": {
+      "message": "AIFA hub {device_id} did not report any status after the command, so it may not have been received. The connection was reset; try again."
+    },
+    "ac_state_mismatch": {
+      "message": "AIFA hub {device_id} reports the air conditioner as {reported} instead of {expected} after the command. Like the i-Ctrl Pro app, the command was not resent."
+    },
+    "ac_key_requires_power_on": {
+      "message": "This key only works while the air conditioner is on, the same as in i-Ctrl Pro."
+    },
+    "ac_fan_speed_unchanged": {
+      "message": "AIFA hub {device_id} still reports the same fan speed after the speed key. The key was not resent, because each press steps to the next speed."
+    },
+    "ac_mode_not_offered": {
+      "message": "i-Ctrl Pro has no {mode} button for this air conditioner."
+    },
+    "ac_temperature_unavailable": {
+      "message": "The setpoint can only be changed while the air conditioner is on in cool, heat, or dry with a reported setpoint, the same as in i-Ctrl Pro."
+    },
+    "ac_anti_mold_mode_unsupported": {
+      "message": "Anti mold does not support the current mode of this air conditioner, the same as in i-Ctrl Pro."
     }
   }
 }

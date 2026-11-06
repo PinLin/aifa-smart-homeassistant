@@ -27,7 +27,8 @@ AIFA_AC_ESTIMATED_CAPABILITIES: Final[tuple[str, ...]] = (
     "power_saving",
     "sleep",
 )
-AIFA_AC_MIN_TEMP = 17
+# Range of the app's setpoint slider.
+AIFA_AC_MIN_TEMP = 16
 AIFA_AC_MAX_TEMP = 30
 AIFA_AC_DEFAULT_TARGET_TEMP = 24
 AIFA_AC_DEFAULT_TIMER_IR_VALUE = 0
@@ -41,17 +42,6 @@ POWER_ON_COMMAND = "ffa0a1f0"
 POWER_OFF_COMMAND = "ffa0a2f0"
 
 _STATUS_PACKET_PREFIX = 0x06
-# Byte 2 (mode + temperature region), all values verified from
-# AVD AIFA app v1.2.5 → /functions captures. Bit positions are device-code
-# agnostic per Dart-side reverse engineering of AirConditionerStatusOn.toBytes:
-#   cool >= 24 → 0x06   (verified: cool 24 default, cool 28)
-#   cool <  24 → 0x07   (verified: cool 19, cool 20)
-#   heat       → 0x08   (verified: heat 24 default)
-#   fan_only   → 0x08   (verified: fanonlysample function)
-#   auto       → 0x08   (verified: probe1 cmd 644455 RESPONSE)
-#   dry        → 0x08   (verified: probe1 cmd 644474)
-_VALID_STATUS_PACKET_PREFIXES: Final[frozenset[int]] = frozenset({0x06, 0x07, 0x08})
-_STATUS_PACKET_LENGTH = 15
 _OBSERVED_STATUS_PACKET_LENGTH = 14
 _SUPPORTED_SUB_DEVICE_TYPE = "0"
 _DEFAULT_AVAILABLE_MODES: Final[tuple[str, ...]] = ("auto", "cool", "heat", "fan", "dry")
@@ -68,52 +58,22 @@ _DEFAULT_SWING_MODES: Final[tuple[str, ...]] = (
 _DEFAULT_PACKET_BYTE_12 = 0x00
 _DEFAULT_PACKET_BYTE_13 = 0x00
 
+# Byte tables of i-Ctrl Pro's AirConditionerStatusOn.toBytes / fromBytes.
 _MODE_BYTE_BY_NAME: Final[dict[str, int]] = {
-    # All values verified from AIFA app /functions captures.
-    "auto": 0x10,      # verified: probe1 cmd 644455 ("Mode: Auto")
-    "cool": 0x20,      # verified: cool 19/20/24/28
-    "dry": 0x40,       # verified: probe1 cmd 644474 ("Mode: Dry")
-    "fan_only": 0x80,  # verified: fanonlysample function
-    "heat": 0x08,      # verified: heat 24 default
+    "auto": 0x10,
+    "cool": 0x20,
+    "dry": 0x40,
+    "fan_only": 0x80,
+    "heat": 0x08,
 }
-# Fan-byte mapping — partial verification from AIFA app captures:
-#   0x01 = auto    (AIFA metadata "speed: 0") VERIFIED via "by by", probe1
-#   0x40 = medium  (AIFA metadata "speed: 2") VERIFIED via probe1 cmd 644454
-#   0x80 = high    (AIFA metadata "speed: 3") VERIFIED via probe1 default
-#   0x20 = low     (AIFA metadata "speed: 1") INFERRED — could not capture
-#                  via AVD because the app's Speed control needs a working
-#                  hub TCP connection (TCP 8751) which the AVD can't reach
-#                  due to QEMU NAT. The 0x20 slot is the only remaining
-#                  single-bit value consistent with the verified 0x01/0x40/0x80
-#                  pattern, and matches what the integration has used in
-#                  production. Re-verify by physical-phone capture if reports
-#                  of incorrect "low" behavior surface.
+# App speed 0..3.
 _FAN_BYTE_BY_NAME: Final[dict[str, int]] = {
     "auto": 0x01,
     "low": 0x20,
     "medium": 0x40,
     "high": 0x80,
 }
-# AC_EXTRA_WINDSPEED_CODES (e.g. 19888) reportedly support 5 fan speeds
-# (auto/low/mid_low/medium/mid_high/high) but the byte values for mid_low
-# and mid_high are unknown — neither the reverse-engineered Dart enum nor
-# the AIFA app's local SQLite samples expose them. Until we get a real
-# 19888 sample, capabilities.extra_windspeed remains diagnostic-only and
-# fan_modes stays at the 4-speed default.
-# Swing-byte mapping — Direction-button cycle order VERIFIED by
-# tapping the AVD AIFA app's Direction control 1..5 times and observing the
-# resulting bytes:
-#   default state → 0x01
-#   after  1 tap  → 0x04
-#   after  2 taps → 0x08
-#   after  3 taps → 0x80
-#   after  4 taps → 0x40
-#   after  5 taps → 0x20
-# Cycle ORDER is verified. Whether 0x01 is best labelled "auto" vs "default
-# fixed pose" is INFERRED from the AIFA app naming convention (the integration
-# uses "auto"). 0x00 ("off") was NEVER observed in any captured sample —
-# kept here for HA UI completeness only and likely never emitted by the
-# real device. Re-verify if any user reports unexpected swing behavior.
+# App direction off, auto, one..five.
 _SWING_BYTE_BY_NAME: Final[dict[str, int]] = {
     "off": 0x00,
     "auto": 0x01,
@@ -123,7 +83,6 @@ _SWING_BYTE_BY_NAME: Final[dict[str, int]] = {
     "fixed_4": 0x40,
     "fixed_5": 0x20,
 }
-_MODE_NAME_BY_BYTE: Final[dict[int, str]] = {value: key for key, value in _MODE_BYTE_BY_NAME.items()}
 
 # i-Ctrl hubs on this firmware mis-read the mode byte of the 15-byte status
 # packet, so the i-Ctrl app sends a single mode key instead. The match is on
@@ -140,12 +99,59 @@ _MODE_KEY_BY_NAME: Final[dict[str, int]] = {
 }
 _TEMPERATURE_UP_KEY = 0x06
 _TEMPERATURE_DOWN_KEY = 0x07
-_FAN_NAME_BY_BYTE: Final[dict[int, str]] = {value: key for key, value in _FAN_BYTE_BY_NAME.items()}
-_SWING_NAME_BY_BYTE: Final[dict[int, str]] = {
-    value: key for key, value in _SWING_BYTE_BY_NAME.items()
+# i-Ctrl Pro shows the +/- keys instead of the setpoint slider only on these
+# hub versions (subversion is not checked).
+CLASSIC_TEMP_KEY_HUB_VERSIONS: Final[frozenset[int]] = frozenset({0, 5, 10})
+# Hard-coded in i-Ctrl Pro rather than read from Remote Config.
+WIND_SPEED_PLUS_MINUS_CODES: Final[frozenset[str]] = frozenset({"19866"})
+# Hub DTO types (ProPlus, AcPlus) whose page carries the anti-mold block.
+ANTI_MOLD_HUB_TYPES: Final[frozenset[str]] = frozenset({"6", "8"})
+
+FAN_SPEED_KEY = 0x05
+# i-Ctrl Pro's key callback turns these two into its anti-mold packet.
+_ANTI_MOLD_ON_KEY = 0x99
+_ANTI_MOLD_OFF_KEY = 0x98
+# keyPress byte of the 15-byte packet the app sends from its mode buttons and
+# setpoint slider.
+STATUS_KEY_PRESS_MODE = 0x08
+STATUS_KEY_PRESS_TEMPERATURE_UP = 0x06
+STATUS_KEY_PRESS_TEMPERATURE_DOWN = 0x07
+
+
+@dataclass(frozen=True, slots=True)
+class AifaAcKey:
+    """One key of the i-Ctrl Pro AC page that sends `ff a0|slot KK f0`."""
+
+    key: str
+    code: int
+    # The app greys the key itself out while the AC status is off.
+    requires_on: bool
+    # Keys in the bottom sheet, whose "^" button is greyed out while the AC
+    # is off unless the code is single-mode.
+    in_bottom_sheet: bool = True
+
+
+AC_KEYS: Final[dict[str, AifaAcKey]] = {
+    key.key: key
+    for key in (
+        AifaAcKey("timer", 0x10, requires_on=True),
+        AifaAcKey("swing", 0x02, requires_on=True),
+        AifaAcKey("fan_speed", FAN_SPEED_KEY, requires_on=True),
+        AifaAcKey("power_saving", 0x0E, requires_on=False),
+        AifaAcKey("sleep", 0x23, requires_on=True),
+        AifaAcKey("turbo", 0x22, requires_on=True),
+        AifaAcKey("quiet", 0x2A, requires_on=False),
+        AifaAcKey("extra_wind_speed", 0x28, requires_on=False),
+        AifaAcKey("display", 0x27, requires_on=False),
+        AifaAcKey("mold", 0x26, requires_on=False),
+        AifaAcKey("wind_speed_high", 0x38, requires_on=False),
+        AifaAcKey("wind_speed_low", 0x36, requires_on=False),
+        # The single-mode remote has one mode key that cycles through modes.
+        AifaAcKey("mode", 0x08, requires_on=False, in_bottom_sheet=False),
+        AifaAcKey("anti_mold_on", _ANTI_MOLD_ON_KEY, requires_on=True, in_bottom_sheet=False),
+        AifaAcKey("anti_mold_off", _ANTI_MOLD_OFF_KEY, requires_on=True, in_bottom_sheet=False),
+    )
 }
-
-
 @dataclass(frozen=True, slots=True)
 class AifaAcCapabilities:
     """Capability matrix for a single AIFA air-conditioner device code."""
@@ -180,6 +186,8 @@ class AifaAcStatus:
     power_saving: bool
     packet_byte_12: int
     packet_byte_13: int
+    # b7 as the app shows it even when mode is off, where fan_mode stays None.
+    reported_fan_mode: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,13 +257,7 @@ def get_ac_capabilities(device_code: str | None) -> AifaAcCapabilities:
     supports_extra_windspeed = normalized_code in (
         cat.extra_windspeed_codes | cat.observed_extra_windspeed_codes
     )
-    # Turbo is exposed for every AC sub-device. The per-device IR encoder
-    # is now BCD-device-aware (byte 4 = device_code BCD low byte), so the
-    # earlier "we only know 136 supports turbo" heuristic is obsolete —
-    # the byte-10 0x04 feature bit is a uniform on-the-wire signal to the
-    # hub, and per-device IR translation is the hub's job. The switch
-    # entity remains entity_registry_enabled_default=False so users opt-in
-    # after confirming their AC actually responds to turbo.
+    # Diagnostics only: which keys exist follows visible_ac_keys, as in the app.
     supports_turbo = True
 
     return AifaAcCapabilities(
@@ -318,6 +320,14 @@ def get_ac_profile(device_code: str | None) -> AifaAcProfile | None:
     return SHARED_AIFA_AC_PROFILE if is_supported_ac_device_code(device_code) else None
 
 
+def hub_reports_ac_state(device_code: str | None) -> bool:
+    """Return False for 5-digit cloud codes, whose state the hub never echoes."""
+    try:
+        return int(str(device_code).strip()) < 10000
+    except (TypeError, ValueError):
+        return True
+
+
 def is_supported_ac_device_code(device_code: str | None) -> bool:
     """Return True when a device-code can use the shared AC packet family."""
     return _normalize_device_code(device_code) is not None
@@ -328,6 +338,18 @@ def is_supported_ac_sub_device(sub_device_type: str | None, device_code: str | N
     return (sub_device_type or "").strip() == _SUPPORTED_SUB_DEVICE_TYPE and is_supported_ac_device_code(
         device_code
     )
+
+
+def app_mode_buttons(device_code: str | None) -> tuple[str, ...]:
+    """Modes the app offers as buttons; single-mode remotes only have the mode key."""
+    capabilities = get_ac_capabilities(device_code)
+    if capabilities.single_mode:
+        return ()
+    if capabilities.dehumidifier:
+        return tuple(
+            mode for mode in capabilities.available_modes if mode not in ("cool", "heat", "auto")
+        )
+    return capabilities.available_modes
 
 
 def get_supported_ac_modes(device_code: str | None) -> tuple[str, ...]:
@@ -435,14 +457,6 @@ def _bcd_encode_device_code(device_code: int) -> tuple[int, int]:
     return (int(high_str, 16), int(low_str, 16))
 
 
-def _resolve_packet_prefix(normalized_mode: str, temperature: int) -> int:
-    """Select byte 2 (mode + temperature region) per verified app samples."""
-    if normalized_mode == "cool":
-        return 0x06 if temperature >= 24 else 0x07
-    # All non-cool modes verified to use 0x08 (heat / fan_only / auto / dry).
-    return 0x08
-
-
 def clamp_timer_ir_value(value: int | None) -> int:
     """Clamp a timer IR byte into the packet family's known BCD-safe range."""
     if value is None:
@@ -474,6 +488,71 @@ def build_classic_temperature_key_command(sub_type: int, *, up: bool) -> str:
     )
 
 
+def build_ac_key_command(key: AifaAcKey, sub_type: int) -> str:
+    """Build one i-Ctrl Pro AC page key press."""
+    if key.code in (_ANTI_MOLD_ON_KEY, _ANTI_MOLD_OFF_KEY):
+        return bytes(
+            (
+                0xA1,
+                0xFA,
+                0xAC,
+                0xA0 | (sub_type & 0x01),
+                0x01 if key.code == _ANTI_MOLD_ON_KEY else 0x00,
+                0xF0,
+            )
+        ).hex()
+    return _build_single_key_command(sub_type, key.code)
+
+
+def ac_key_requires_power_on(key: AifaAcKey, device_code: str | None) -> bool:
+    """Return True when the app cannot press this key while the AC is off."""
+    return key.requires_on or (
+        key.in_bottom_sheet and not get_ac_capabilities(device_code).single_mode
+    )
+
+
+def is_anti_mold_key(key: AifaAcKey) -> bool:
+    return key.code in (_ANTI_MOLD_ON_KEY, _ANTI_MOLD_OFF_KEY)
+
+
+def shows_classic_temperature_keys(
+    hub_version: int | None, device_code: str | None
+) -> bool:
+    """Return True when the app shows +/- keys instead of the setpoint slider."""
+    return (
+        hub_version in CLASSIC_TEMP_KEY_HUB_VERSIONS
+        and get_ac_capabilities(device_code).classic_temp_control
+    )
+
+
+def visible_ac_keys(
+    device_code: str | None, hub_type: str | None = None
+) -> tuple[AifaAcKey, ...]:
+    """Return the AC page keys i-Ctrl Pro shows for a device code and hub type."""
+    capabilities = get_ac_capabilities(device_code)
+    single = capabilities.single_mode
+    # Remote Config only: the app has no equivalent of the observed-codes list.
+    extra_windspeed = capabilities.device_code in catalog.get_active().extra_windspeed_codes
+    visible = {
+        "timer": not single,
+        "swing": not single,
+        "fan_speed": not single,
+        "power_saving": True,
+        "sleep": not single,
+        "turbo": not single,
+        "mode": single,
+        "anti_mold_on": hub_type in ANTI_MOLD_HUB_TYPES,
+        "anti_mold_off": hub_type in ANTI_MOLD_HUB_TYPES,
+        "quiet": extra_windspeed,
+        "extra_wind_speed": extra_windspeed,
+        "display": capabilities.show_display_mold or single,
+        "mold": capabilities.show_display_mold,
+        "wind_speed_high": capabilities.device_code in WIND_SPEED_PLUS_MINUS_CODES,
+        "wind_speed_low": capabilities.device_code in WIND_SPEED_PLUS_MINUS_CODES,
+    }
+    return tuple(key for name, key in AC_KEYS.items() if visible[name])
+
+
 def hub_requires_mode_keys(version: int | None, subversion: int | None) -> bool:
     """Return True when the hub must receive HVAC modes as single key presses."""
     return version == MODE_KEY_HUB_VERSION and subversion == MODE_KEY_HUB_SUBVERSION
@@ -498,126 +577,63 @@ def build_power_off_command(*, device_code: str | None = None) -> str:
     return profile.power_off_command
 
 
-def build_ac_query_packet() -> str:
-    """Return the classic controller packet that queries active AC state."""
-    return CLASSIC_AC_QUERY_PACKET
+_FLAG_BYTE_POWER_SAVING = 0x01
+_FLAG_BYTE_TURBO = 0x04
+_FLAG_BYTE_SLEEP = 0x08
 
 
-def build_ac_query_single_type_packet(ac_sub_type: int) -> str:
-    """Return the classic controller packet that queries one AC subtype."""
-    normalized_sub_type = int(ac_sub_type)
-    if normalized_sub_type not in {0, 1}:
-        raise ValueError(f"Unsupported AIFA AC subtype: {ac_sub_type}")
-    return f"fff3f2a{normalized_sub_type:x}f0"
+def _to_bcd(value: int) -> int:
+    """Encode like the app: decimal digits parsed back as a hex byte."""
+    return int(str(value), 16) & 0xFF
 
 
-def build_query_anti_mold_packet(ac_sub_type: int) -> str:
-    """Return the classic controller packet that queries anti-mold status."""
-    normalized_sub_type = int(ac_sub_type)
-    if normalized_sub_type not in {0, 1}:
-        raise ValueError(f"Unsupported AIFA AC subtype: {ac_sub_type}")
-    return f"a1faaca{normalized_sub_type:x}f0"
-
-
-def build_status_command(
-    mode: str,
-    target_temperature: int,
+def build_app_status_command(
+    status: AifaAcStatus,
     *,
-    device_code: str | None = None,
-    timer_ir_value: int | None = AIFA_AC_DEFAULT_TIMER_IR_VALUE,
-    fan_mode: str = AIFA_AC_DEFAULT_FAN_MODE,
-    swing_mode: str = AIFA_AC_DEFAULT_SWING_MODE,
-    turbo: bool = False,
-    sleep: bool = False,
-    power_saving: bool = False,
-    packet_byte_12: int = _DEFAULT_PACKET_BYTE_12,
-    packet_byte_13: int = _DEFAULT_PACKET_BYTE_13,
+    key_press: int,
+    sub_type: int,
+    device_code: str | None,
 ) -> str:
-    """Build a raw AC status command for the shared packet profile."""
-    profile = get_ac_profile(device_code) or SHARED_AIFA_AC_PROFILE
-    normalized_mode = normalize_ac_mode(mode)
-    normalized_fan_mode = fan_mode.strip().lower().replace("full_speed", "high")
-    normalized_swing_mode = swing_mode.strip().lower()
-    temperature = clamp_target_temperature(target_temperature, device_code=device_code)
+    """Build the 15-byte packet i-Ctrl Pro's `AirConditionerStatusOn.toBytes` sends.
 
-    # Verified from the app-saved cloud function "fanonlysample" on sub-device 31867:
-    # fan_only function-editor default swing renders as byte 9 = 0x01 (auto in
-    # the integration's swing map), not the shared fixed_5 default (0x20).
-    if (
-        normalized_mode == "fan_only"
-        and normalized_swing_mode == profile.default_swing_mode
-    ):
-        normalized_swing_mode = "auto"
-
-    if normalized_mode not in profile.mode_byte_by_name:
-        raise ValueError(f"Unsupported AIFA AC mode: {mode}")
-    if normalized_fan_mode not in profile.fan_byte_by_name:
-        raise ValueError(f"Unsupported AIFA AC fan mode: {fan_mode}")
-    if normalized_swing_mode not in profile.swing_byte_by_name:
-        raise ValueError(f"Unsupported AIFA AC swing mode: {swing_mode}")
-
-    # Byte 10 feature flags:
-    #   sleep         → 0x08  VERIFIED via the AIFA app Sleep button
-    #                          (probe1 cmd 644452: ffa0060136240020010108000000f0)
-    #   power_saving  → 0x02  VERIFIED INEFFECTIVE for Daikin code 11 (ARC466A12).
-    #                          AC ack'd packet (beep) but no ECO
-    #                          indicator and no fan/temp change. Daikin typically
-    #                          encodes ECON as a separate one-shot IR code, not in
-    #                          the main status packet. Bit position retained for
-    #                          other AC families that may use byte 10 differently.
-    #   turbo         → 0x04  VERIFIED INEFFECTIVE for Daikin code 11 (ARC466A12).
-    #                          Same pattern as PS — AC ack'd but
-    #                          no POWERFUL indicator and no fan change. Daikin
-    #                          typically encodes POWERFUL as a separate one-shot
-    #                          IR code. Bit position retained for other families.
-    #                          Users opt-in to the turbo entity from the entity
-    #                          registry and validate against their physical AC.
-    feature_byte = 0x00
-    if power_saving:
-        feature_byte = 0x02
-    elif turbo:
-        feature_byte = 0x04
-    elif sleep:
-        feature_byte = 0x08
-
-    packet_prefix = _resolve_packet_prefix(normalized_mode, temperature)
-    # Bytes 3-4 are BCD of device_code padded to 4 digits — mirrors the
-    # Dart-side AirConditionerStatusOn.toBytes() encoder. We refuse to
-    # silently default to a hardcoded device family — a None / unparseable
-    # device_code is a real bug the caller must fix, not something the
-    # encoder should paper over.
+    The app copies its last reported On status and changes only the pressed
+    field, so every other byte repeats what the hub reported.
+    """
+    if status.mode == "off":
+        raise ValueError("The app never sends a 15-byte packet for an off status")
     if device_code is None:
-        raise ValueError(
-            "device_code is required to build a status command; "
-            "got None"
-        )
+        raise ValueError("device_code is required to build a status command")
     try:
         bcd_high, bcd_low = _bcd_encode_device_code(int(device_code))
     except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"device_code={device_code!r} cannot be BCD-encoded: {exc}"
-        ) from exc
-
-    packet = bytes(
+        raise ValueError(f"device_code={device_code!r} cannot be BCD-encoded: {exc}") from exc
+    if status.power_saving:
+        flags = _FLAG_BYTE_POWER_SAVING
+    elif status.turbo:
+        flags = _FLAG_BYTE_TURBO
+    elif status.sleep:
+        flags = _FLAG_BYTE_SLEEP
+    else:
+        flags = 0x00
+    return bytes(
         [
             0xFF,
-            0xA0,
-            packet_prefix,
+            0xA0 | (sub_type & 0x01),
+            key_press,
             bcd_high,
             bcd_low,
-            encode_temperature_bcd(temperature, device_code=device_code),
-            encode_timer_ir_bcd(timer_ir_value),
-            profile.mode_byte_by_name[normalized_mode],
-            profile.fan_byte_by_name[normalized_fan_mode],
-            profile.swing_byte_by_name[normalized_swing_mode],
-            feature_byte,
-            packet_byte_12 & 0xFF,
-            packet_byte_13 & 0xFF,
+            _to_bcd(status.target_temperature or 0),
+            _to_bcd(status.timer_ir_value),
+            _MODE_BYTE_BY_NAME[normalize_ac_mode(status.mode)],
+            _FAN_BYTE_BY_NAME.get(status.fan_mode or "", 0x00),
+            _SWING_BYTE_BY_NAME.get(status.swing_mode or "", 0x00),
+            flags,
+            0x00,
+            0x00,
             0x00,
             0xF0,
         ]
-    )
-    return packet.hex()
+    ).hex()
 
 
 def _decode_bcd_byte(value: int) -> int | None:
@@ -626,6 +642,26 @@ def _decode_bcd_byte(value: int) -> int | None:
     if any(char < "0" or char > "9" for char in text):
         return None
     return int(text)
+
+
+FAN_SPEED_OPTIONS: Final[tuple[str, ...]] = ("auto", "low", "medium", "high")
+
+
+def decode_fan_speed_byte(value: int) -> str:
+    """Decode b7 the way i-Ctrl Pro's `_speedFromByte` does.
+
+    Bits are tested in this order and 0x10 is never read, so the hub's
+    reports 0x11 / 0x90 / 0x50 / 0x30 are auto / 3 / 2 / 1.
+    """
+    if value & 0x01:
+        return "auto"
+    if value & 0x20:
+        return "low"
+    if value & 0x40:
+        return "medium"
+    if value & 0x80:
+        return "high"
+    return "auto"
 
 
 def decode_observed_status_packet(
@@ -657,6 +693,14 @@ def decode_observed_status_packet(
     else:
         observed_device_code = str((decoded_device_code * 100) + (_decode_bcd_byte(packet_bytes[3]) or 0))
 
+    # i-Ctrl Pro parses b4/b5 with int.parse, so a non-decimal nibble makes
+    # it drop the whole packet.
+    timer_ir_value = _decode_bcd_byte(packet_bytes[5])
+    if timer_ir_value is None:
+        return None
+
+    observed_fan_mode = decode_fan_speed_byte(packet_bytes[7])
+
     if packet_bytes[4] == 0x00 and packet_bytes[6] == 0x00:
         return (
             sub_type,
@@ -664,7 +708,7 @@ def decode_observed_status_packet(
                 device_code=observed_device_code,
                 mode="off",
                 target_temperature=None,
-                timer_ir_value=0,
+                timer_ir_value=timer_ir_value,
                 fan_mode=None,
                 swing_mode=None,
                 turbo=False,
@@ -672,6 +716,7 @@ def decode_observed_status_packet(
                 power_saving=False,
                 packet_byte_12=packet_bytes[12],
                 packet_byte_13=0,
+                reported_fan_mode=observed_fan_mode,
             ),
         )
 
@@ -687,31 +732,14 @@ def decode_observed_status_packet(
     elif mode_byte & 0x80:
         mode = "fan_only"
     else:
-        mode = None
+        mode = "auto"
 
     target_temperature = _decode_bcd_byte(packet_bytes[4])
-    # The hub reports 0x00 when it has no setpoint for the mode, including cool.
-    if target_temperature is not None and not (
-        AIFA_AC_MIN_TEMP <= target_temperature <= AIFA_AC_MAX_TEMP
-    ):
-        target_temperature = None
-
-    if mode is None:
+    if target_temperature is None:
         return None
-
-    # Fan / swing bit positions mirror _FAN_BYTE_BY_NAME / _SWING_BYTE_BY_NAME.
-    # See those constants for verification status.
-    fan_byte = packet_bytes[7]
-    if fan_byte & 0x01:
-        observed_fan_mode = "auto"
-    elif fan_byte & 0x20:
-        observed_fan_mode = "low"
-    elif fan_byte & 0x40:
-        observed_fan_mode = "medium"
-    elif fan_byte & 0x80:
-        observed_fan_mode = "high"
-    else:
-        observed_fan_mode = None
+    # The hub reports 0x00 when it has no setpoint for the mode, including cool.
+    if not AIFA_AC_MIN_TEMP <= target_temperature <= AIFA_AC_MAX_TEMP:
+        target_temperature = None
 
     swing_byte = packet_bytes[8]
     if swing_byte == 0x00:
@@ -729,7 +757,7 @@ def decode_observed_status_packet(
     elif swing_byte & 0x20:
         observed_swing_mode = "fixed_5"
     else:
-        observed_swing_mode = None
+        observed_swing_mode = "off"
 
     return (
         sub_type,
@@ -737,68 +765,14 @@ def decode_observed_status_packet(
             device_code=observed_device_code,
             mode=mode,
             target_temperature=target_temperature,
-            timer_ir_value=0,
+            timer_ir_value=timer_ir_value,
             fan_mode=observed_fan_mode,
             swing_mode=observed_swing_mode,
-            # Bit positions match the command-packet encoder per Tier 1
-            # verified-byte work: sleep=0x08, PS=0x02, turbo=0x04. Earlier
-            # this decoder used stale masks (0x10/0x01) which is why hub-side
-            # state changes (e.g., user toggling Sleep in the AIFA app) never
-            # propagated back to HA's entity state.
             turbo=bool(packet_bytes[9] & 0x04),
             sleep=bool(packet_bytes[9] & 0x08),
-            power_saving=bool(packet_bytes[9] & 0x02),
+            power_saving=bool(packet_bytes[9] & 0x01),
             packet_byte_12=packet_bytes[10],
             packet_byte_13=packet_bytes[11],
+            reported_fan_mode=observed_fan_mode,
         ),
-    )
-
-
-def decode_status_command(command: str, *, device_code: str | None = None) -> AifaAcStatus | None:
-    """Decode a shared AIFA AC status packet when possible."""
-    try:
-        packet = bytes.fromhex(command)
-    except ValueError:
-        return None
-
-    if (
-        len(packet) != _STATUS_PACKET_LENGTH
-        or packet[0] != 0xFF
-        or packet[1] != 0xA0
-        or packet[2] not in _VALID_STATUS_PACKET_PREFIXES
-        or not _is_bcd_byte(packet[3])
-        or not _is_bcd_byte(packet[4])
-        or packet[-1] != 0xF0
-    ):
-        return None
-
-    temp_byte = packet[5]
-    target_temperature = ((temp_byte >> 4) * 10) + (temp_byte & 0x0F)
-    if target_temperature < AIFA_AC_MIN_TEMP or target_temperature > AIFA_AC_MAX_TEMP:
-        return None
-    timer_ir_value = _decode_bcd_byte(packet[6])
-    if timer_ir_value is None:
-        return None
-
-    mode = _MODE_NAME_BY_BYTE.get(packet[7])
-    fan_mode = _FAN_NAME_BY_BYTE.get(packet[8])
-    swing_mode = _SWING_NAME_BY_BYTE.get(packet[9])
-    if mode is None or fan_mode is None or swing_mode is None:
-        return None
-
-    feature_byte = packet[10]
-    return AifaAcStatus(
-        device_code=_normalize_device_code(device_code),
-        mode=mode,
-        target_temperature=target_temperature,
-        timer_ir_value=timer_ir_value,
-        fan_mode=fan_mode,
-        swing_mode=swing_mode,
-        # Bit positions kept in lockstep with build_status_command:
-        #   sleep=0x08 verified, power_saving=0x02 inferred, turbo=0x04 inferred.
-        turbo=bool(feature_byte & 0x04),
-        sleep=bool(feature_byte & 0x08),
-        power_saving=bool(feature_byte & 0x02),
-        packet_byte_12=packet[11],
-        packet_byte_13=packet[12],
     )

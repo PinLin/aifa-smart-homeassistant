@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 import ssl
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -11,14 +12,6 @@ from typing import Any, Callable, Mapping
 
 import aiohttp
 
-from .ac import (
-    AifaAcStatus,
-    CLASSIC_WAKE_REPLY_PACKET,
-    build_ac_query_packet,
-    build_ac_query_single_type_packet,
-    build_query_anti_mold_packet,
-    decode_observed_status_packet,
-)
 from .const import (
     API_BASE_URL,
     CLASSIC_SOCKET_HOST,
@@ -34,6 +27,12 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_KEEPALIVE_IDLE = 60
+_KEEPALIVE_INTERVAL = 10
+_KEEPALIVE_COUNT = 3
+# Unacknowledged writes bypass keepalive; without this a vanished peer would
+# keep accepting "sent" commands until the kernel retransmit limit (~15 min).
+_USER_TIMEOUT_MS = 20000
 _CLASSIC_SOCKET_HANDSHAKE_PREFIX = bytes.fromhex("a1fad7c0")
 _CLASSIC_WAKE_UP_PREFIX = bytes.fromhex("f1ee")
 _CLASSIC_NOTIFY_PREFIX = bytes.fromhex("faf5")
@@ -634,24 +633,6 @@ _extract_classic_notify_packets = extract_classic_notify_packets
 _extract_classic_sensor_packets = extract_classic_sensor_packets
 
 
-def build_classic_ac_query_steps(sub_types: set[int] | None) -> list[tuple[str, float]]:
-    """Build the app-like classic AC query sequence for one or more sub-types."""
-    normalized_sub_types: list[int] = []
-    for item in sub_types or set():
-        value = int(item)
-        if value in {0, 1} and value not in normalized_sub_types:
-            normalized_sub_types.append(value)
-
-    query_steps: list[tuple[str, float]] = []
-    if normalized_sub_types:
-        for item in normalized_sub_types:
-            query_steps.append((build_ac_query_single_type_packet(item), 0.30))
-            query_steps.append((build_query_anti_mold_packet(item), 0.60))
-    else:
-        query_steps.append((build_ac_query_packet(), 0.30))
-    return query_steps
-
-
 def _parse_device(raw: Mapping[str, Any]) -> AifaDevice | None:
     """Normalize a device row."""
     sensor_block = _maybe_mapping(
@@ -914,6 +895,32 @@ def _parse_macro(raw: Mapping[str, Any]) -> AifaMacro | None:
     )
 
 
+def enable_tcp_keepalive(sock: socket.socket | None) -> None:
+    """Detect half-open links, e.g. when the hub loses power or the WAN drops.
+
+    The probes stop at the TCP peer (the cloud relay for the TLS socket), so
+    they never reach the hub as packets it has to handle.
+    """
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        idle_opt = getattr(socket, "TCP_KEEPIDLE", None) or getattr(
+            socket, "TCP_KEEPALIVE", None
+        )
+        if idle_opt is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, idle_opt, _KEEPALIVE_IDLE)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KEEPALIVE_INTERVAL)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KEEPALIVE_COUNT)
+        if hasattr(socket, "TCP_USER_TIMEOUT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, _USER_TIMEOUT_MS)
+    except OSError as err:
+        _LOGGER.debug("Unable to enable TCP keepalive on an AIFA socket: %s", err)
+
+
+
 class AifaSmartApiClient:
     """Client for the AIFA Smart cloud API."""
 
@@ -1131,134 +1138,6 @@ class AifaSmartApiClient:
             except OSError:
                 pass
             raise
-
-    async def async_query_classic_ac_statuses(
-        self,
-        mac: str,
-        *,
-        sub_types: set[int] | None = None,
-        timeout: float = 6.0,
-    ) -> dict[int, AifaAcStatus]:
-        """Query observed AC controller state through the private classic socket.
-
-        Current behavior mirrors the app more closely than the earlier generic probe:
-        - for known AC sub-types we send ``acQuerySingleType(subType)``
-        - then, after a short gap, ``queryAntiMold(subType)``
-        - if the controller sends a wake-up frame, we reply with ``ccdd``
-        """
-        query_steps = build_classic_ac_query_steps(sub_types)
-        normalized_sub_types = {
-            int(item) for item in (sub_types or set()) if int(item) in {0, 1}
-        }
-
-        observed: dict[int, AifaAcStatus] = {}
-        writer: asyncio.StreamWriter | None = None
-        status_buffer = b""
-        wake_buffer = b""
-
-        try:
-            socket_session = await self.async_open_classic_socket(mac, timeout=timeout)
-            reader = socket_session.reader
-            writer = socket_session.writer
-            status_buffer += socket_session.initial_bytes
-            wake_buffer += socket_session.initial_bytes
-
-            loop = asyncio.get_running_loop()
-            per_packet_window = max(1.0, min(2.0, timeout / max(1, len(query_steps) + 1)))
-
-            async def _drain_for(window_seconds: float) -> None:
-                nonlocal status_buffer, wake_buffer
-                deadline = loop.time() + window_seconds
-                while loop.time() < deadline:
-                    try:
-                        chunk = await asyncio.wait_for(
-                            reader.read(4096),
-                            timeout=min(0.45, max(0.05, deadline - loop.time())),
-                        )
-                    except asyncio.TimeoutError:
-                        continue
-                    if not chunk:
-                        break
-
-                    status_buffer += chunk
-                    wake_buffer += chunk
-
-                    wake_packets, wake_buffer = extract_classic_wake_packets(wake_buffer)
-                    if wake_packets:
-                        _LOGGER.debug(
-                            "Classic socket wake-up packet(s) received for %s: %s",
-                            mac,
-                            [packet.hex() for packet in wake_packets],
-                        )
-                        writer.write(bytes.fromhex(CLASSIC_WAKE_REPLY_PACKET))
-                        await writer.drain()
-
-                    packets, status_buffer = extract_classic_status_packets(status_buffer)
-                    for raw_packet in packets:
-                        decoded = decode_observed_status_packet(raw_packet)
-                        if decoded is None:
-                            continue
-                        sub_type, status = decoded
-                        observed[sub_type] = status
-
-                    if normalized_sub_types and all(
-                        sub_type in observed for sub_type in normalized_sub_types
-                    ):
-                        break
-
-            for packet, settle_seconds in query_steps:
-                writer.write(bytes.fromhex(packet))
-                await writer.drain()
-                await _drain_for(min(per_packet_window, settle_seconds))
-                if normalized_sub_types and all(
-                    sub_type in observed for sub_type in normalized_sub_types
-                ):
-                    return observed
-
-            final_deadline = loop.time() + 1.0
-            while loop.time() < final_deadline:
-                try:
-                    chunk = await asyncio.wait_for(
-                        reader.read(4096),
-                        timeout=min(0.5, max(0.05, final_deadline - loop.time())),
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                if not chunk:
-                    break
-
-                status_buffer += chunk
-                wake_buffer += chunk
-
-                wake_packets, wake_buffer = extract_classic_wake_packets(wake_buffer)
-                if wake_packets:
-                    _LOGGER.debug(
-                        "Classic socket wake-up packet(s) received for %s: %s",
-                        mac,
-                        [packet.hex() for packet in wake_packets],
-                    )
-                    writer.write(bytes.fromhex(CLASSIC_WAKE_REPLY_PACKET))
-                    await writer.drain()
-
-                packets, status_buffer = extract_classic_status_packets(status_buffer)
-                for raw_packet in packets:
-                    decoded = decode_observed_status_packet(raw_packet)
-                    if decoded is None:
-                        continue
-                    sub_type, status = decoded
-                    observed[sub_type] = status
-
-            return observed
-        except (asyncio.TimeoutError, OSError) as err:
-            _LOGGER.debug("Classic socket query failed for %s: %s", mac, err)
-            return {}
-        finally:
-            if writer is not None:
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except OSError:
-                    pass
 
     async def _authorized_request(
         self, method: str, path: str, **kwargs: Any

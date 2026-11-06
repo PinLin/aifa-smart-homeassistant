@@ -294,9 +294,6 @@ def _patches(*, devices_error: Exception | None = None):
             "async_get_sub_device_device_codes",
             AsyncMock(return_value=AifaDeviceCodeCatalog()),
         ),
-        patch.object(
-            AifaSmartApiClient, "async_query_classic_ac_statuses", AsyncMock(return_value={})
-        ),
         patch(
             "custom_components.aifa_smart.classic_listener.ClassicSocketManager.sync_specs",
             lambda self, devices: None,

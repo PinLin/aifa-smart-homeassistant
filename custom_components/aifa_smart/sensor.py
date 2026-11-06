@@ -12,8 +12,14 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .ac import AC_KEYS, FAN_SPEED_OPTIONS, is_supported_ac_sub_device, visible_ac_keys
 from .coordinator import AifaSmartCoordinator
-from .entity import AifaAccountEntity, AifaDeviceEntity, AifaSubDeviceEntity
+from .entity import (
+    AifaAccountEntity,
+    AifaDeviceEntity,
+    AifaSubDeviceEntity,
+    async_remove_stale_sub_device_entities,
+)
 
 
 async def async_setup_entry(
@@ -44,6 +50,19 @@ async def async_setup_entry(
                     AifaSubDeviceFunctionCountSensor(coordinator, device.id, sub_device.id),
                 ]
             )
+            # Shown with the fan key, the only way to change the speed.
+            if is_supported_ac_sub_device(
+                sub_device.type, sub_device.device_code
+            ) and AC_KEYS["fan_speed"] in visible_ac_keys(sub_device.device_code):
+                entities.append(AifaAcFanSpeedSensor(coordinator, device.id, sub_device.id))
+    async_remove_stale_sub_device_entities(
+        hass,
+        entry,
+        coordinator.data.devices,
+        "sensor",
+        ("fan_speed",),
+        {entity.unique_id for entity in entities if entity.unique_id is not None},
+    )
     async_add_entities(entities)
 
 
@@ -252,3 +271,30 @@ class AifaSubDeviceFunctionCountSensor(_AifaBaseSubDeviceSensor):
     def native_value(self) -> int | None:
         sub_device = self.sub_device
         return None if sub_device is None else len(sub_device.functions)
+
+
+class AifaAcFanSpeedSensor(AifaSubDeviceEntity, SensorEntity):
+    """Fan speed from the hub's last status report (b7)."""
+
+    # Reports arrive over the command transport, so follow its availability.
+    _control_entity = True
+    _attr_translation_key = "ac_fan_speed"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = list(FAN_SPEED_OPTIONS)
+    _state_attrs = ("native_value", "available")
+
+    def __init__(
+        self, coordinator: AifaSmartCoordinator, device_id: str, sub_device_id: str
+    ) -> None:
+        super().__init__(
+            coordinator, device_id, sub_device_id, "fan_speed", platform="sensor"
+        )
+
+    @property
+    def native_value(self) -> str | None:
+        sub_device = self.sub_device
+        return self.coordinator.get_ac_runtime_state(
+            self._device_id,
+            self._sub_device_id,
+            device_code=None if sub_device is None else sub_device.device_code,
+        ).last_reported_fan_mode

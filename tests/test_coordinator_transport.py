@@ -88,7 +88,8 @@ def _make_coordinator(
     }
     lan = _FakeLan(lan_results or [])
     coordinator._lan_manager = lan if with_lan else None  # type: ignore[attr-defined]
-    coordinator._ac_follow_up_probe_tasks = {}  # type: ignore[attr-defined]
+    coordinator._ac_pending_release_tasks = {}  # type: ignore[attr-defined]
+    coordinator._ac_apply_locks = {}  # type: ignore[attr-defined]
     return coordinator, lan, cloud_sent
 
 
@@ -97,7 +98,10 @@ def _command(device_id: str = "d1", packet: str = "ffa016f0") -> AifaFunctionCom
 
 
 def _dispatch(coordinator, *commands: AifaFunctionCommand) -> list[dict]:
-    return asyncio.run(coordinator._async_dispatch_raw_commands(list(commands)))  # noqa: SLF001
+    async def send_all() -> list[dict]:
+        return [await coordinator._async_send_unconfirmed(command) for command in commands]  # noqa: SLF001
+
+    return asyncio.run(send_all())
 
 
 class LanOnlyDispatchTests(unittest.TestCase):

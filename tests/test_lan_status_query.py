@@ -7,7 +7,6 @@ the empty slot 1.
 from __future__ import annotations
 
 import asyncio
-import types
 import unittest
 
 import pytest
@@ -206,56 +205,6 @@ class SlotIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(updated)
         state = self.coordinator.get_ac_runtime_state("7001", "ac-1")
         self.assertIsNone(state.observed_status)
-
-
-class ProbeUsesLanQueryTests(unittest.IsolatedAsyncioTestCase):
-    """After a LAN send, the probe gets its answer from a LAN query."""
-
-    async def asyncSetUp(self) -> None:
-        self.hub = await QueryingFakeHub().start()
-        coordinator = AifaSmartCoordinator.__new__(AifaSmartCoordinator)
-        coordinator.data = AifaAccountData(  # type: ignore[attr-defined]
-            devices={"7001": _device(online=False)}, macros=[], fetched_at=None,  # type: ignore[arg-type]
-        )
-        coordinator._ac_runtime_states = {}  # type: ignore[attr-defined]
-        coordinator._transport = "lan"  # type: ignore[attr-defined]
-        coordinator.async_update_listeners = lambda: None  # type: ignore[method-assign]
-        self.cloud_queries = 0
-
-        async def cloud_query(*args, **kwargs):
-            self.cloud_queries += 1
-            raise AssertionError("cloud must not be queried")
-
-        coordinator.client = types.SimpleNamespace(  # type: ignore[assignment]
-            async_query_classic_ac_statuses=cloud_query
-        )
-        coordinator._classic_listener = types.SimpleNamespace(  # type: ignore[attr-defined]
-            has_active_listener=lambda device_id: False,
-            has_active_writer=lambda device_id: False,
-        )
-        self.harness = _Harness(
-            self.hub, on_status=coordinator._apply_classic_observed_status  # noqa: SLF001
-        )
-        coordinator._lan_manager = self.harness.manager  # type: ignore[attr-defined]
-        self.coordinator = coordinator
-
-    async def asyncTearDown(self) -> None:
-        await self.harness.manager.shutdown()
-        await self.hub.stop()
-
-    async def test_probe_observes_state_from_lan_reply(self) -> None:
-        manager = self.harness.manager
-        manager.sync_specs(self.coordinator.data.devices)
-        await _wait_until(lambda: manager.is_connected("7001"))
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        observed = await self.coordinator._async_probe_ac_observed_state(  # noqa: SLF001
-            "7001", "ac-1", minimum_observed_revision=0, expected_mode="cool"
-        )
-        self.assertTrue(observed)
-        self.assertLess(loop.time() - started, 1.0)
-        self.assertEqual(self.hub.queries, 1)
-        self.assertEqual(self.cloud_queries, 0)
 
 
 if __name__ == "__main__":

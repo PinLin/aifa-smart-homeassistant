@@ -12,33 +12,28 @@ from homeassistant.components.climate.const import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from .ac import (
     AIFA_AC_MAX_TEMP,
     AIFA_AC_MIN_TEMP,
+    app_mode_buttons,
     get_ac_capabilities,
     get_default_mode,
-    get_supported_fan_modes,
-    get_supported_swing_modes,
     is_supported_ac_sub_device,
+    shows_classic_temperature_keys,
 )
+from .const import DOMAIN
 from .coordinator import AifaSmartCoordinator
 from .entity import AifaSubDeviceEntity
 
-_ATTR_FAN_MODE = "fan_mode"
 _ATTR_HVAC_MODE = "hvac_mode"
-_ATTR_SWING_MODE = "swing_mode"
 _ATTR_LAST_ACTIVE_HVAC_MODE = "aifa_last_active_hvac_mode"
 _ATTR_REQUESTED_HVAC_MODE = "aifa_requested_hvac_mode"
 _ATTR_REQUESTED_TARGET_TEMPERATURE = "aifa_requested_target_temperature"
-_ATTR_REQUESTED_FAN_MODE = "aifa_requested_fan_mode"
-_ATTR_REQUESTED_SWING_MODE = "aifa_requested_swing_mode"
-_ATTR_REQUESTED_TURBO = "aifa_requested_turbo"
-_ATTR_REQUESTED_SLEEP = "aifa_requested_sleep"
-_ATTR_REQUESTED_POWER_SAVING = "aifa_requested_power_saving"
+_ATTR_POWER_OFF_HELD = "aifa_power_off_held"
 _CATALOG_TO_HVAC: Final[dict[str, HVACMode]] = {
     "auto": HVACMode.AUTO,
     "cool": HVACMode.COOL,
@@ -66,7 +61,9 @@ _HVAC_ACTION_BY_MODE: Final[dict[HVACMode, HVACAction]] = {
 def _supported_hvac_modes(device_code: str | None) -> list[HVACMode]:
     """Convert catalog mode names into Home Assistant HVAC modes."""
     hvac_modes: list[HVACMode] = [HVACMode.OFF]
-    for mode in get_ac_capabilities(device_code).available_modes:
+    # A single-mode AC has no mode buttons but still reports one of these.
+    modes = app_mode_buttons(device_code) or get_ac_capabilities(device_code).available_modes
+    for mode in modes:
         hvac_mode = _CATALOG_TO_HVAC.get(mode)
         if hvac_mode is not None:
             hvac_modes.append(hvac_mode)
@@ -99,6 +96,8 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
     """Climate control surface backed by AIFA raw packets and best-available state."""
 
     _control_entity = True
+    # A hub report only proves the hub fired the IR code, not that the AC got it.
+    _attr_assumed_state = True
     _attr_translation_key = "climate"
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_target_temperature_step = 1
@@ -119,23 +118,23 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
         device_code = None if sub_device is None else sub_device.device_code
         self._capabilities = get_ac_capabilities(device_code)
         self._active_hvac_modes = [
-            mode for mode in _supported_hvac_modes(device_code) if mode != HVACMode.OFF
+            _CATALOG_TO_HVAC[mode] for mode in app_mode_buttons(device_code)
         ]
         self._attr_hvac_modes = _supported_hvac_modes(device_code)
-        self._attr_fan_modes = list(get_supported_fan_modes(device_code))
-        self._attr_swing_modes = list(get_supported_swing_modes(device_code))
 
+        # i-Ctrl Pro has no fan or swing selection, only cycle keys (button
+        # entities), so the climate entity offers neither.
         supported_features = (
             ClimateEntityFeature.TURN_ON | ClimateEntityFeature.TURN_OFF
         )
-        # Classic-temperature ACs only take relative +/- key presses (button
-        # entities) and never report a setpoint, so there is none to show.
-        if not self._capabilities.classic_temp_control:
+        hub = coordinator.get_device(device_id)
+        # Where the app shows +/- keys instead of the slider, the AC takes only
+        # relative key presses and never reports a setpoint.
+        self._classic_temperature_keys = shows_classic_temperature_keys(
+            None if hub is None else hub.version, device_code
+        )
+        if not self._classic_temperature_keys:
             supported_features |= ClimateEntityFeature.TARGET_TEMPERATURE
-        if self._attr_fan_modes:
-            supported_features |= ClimateEntityFeature.FAN_MODE
-        if self._attr_swing_modes:
-            supported_features |= ClimateEntityFeature.SWING_MODE
         self._attr_supported_features = supported_features
 
         self.coordinator.get_ac_runtime_state(
@@ -154,27 +153,6 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
         )
 
     @property
-    def assumed_state(self) -> bool:
-        """Return True while Home Assistant is still showing requested fallback state.
-
-        For 5-digit cloud codes (Plus protocol) the hub never echoes
-        `acCommand` broadcasts, so any observed_status this entity exposes
-        is stale Classic-mode residue from before the user switched. Force
-        assumed=True in that case so HA UI consistently shows the '?' badge
-        and users don't trust stale temp/mode readings.
-        """
-        if self.runtime.is_assumed:
-            return True
-        code = self.device_code
-        if code is not None:
-            try:
-                if int(code) >= 10000:
-                    return True
-            except (TypeError, ValueError):
-                pass
-        return False
-
-    @property
     def device_code(self) -> str | None:
         """Return the sub-device packet profile key."""
         sub_device = self.sub_device
@@ -189,9 +167,18 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
     @property
     def target_temperature(self) -> float | None:
         """Return the best available AC setpoint."""
-        if self._capabilities.classic_temp_control:
+        if self._classic_temperature_keys:
             return None
         return float(self.runtime.exposed_target_temperature)
+
+    @property
+    def hvac_modes(self) -> list[HVACMode]:
+        """List only modes that can be selected, plus the one being shown."""
+        if self._active_hvac_modes:
+            return self._attr_hvac_modes
+        # Single-mode: no mode buttons, so only off and the reported mode.
+        mode = self.hvac_mode
+        return [HVACMode.OFF] if mode == HVACMode.OFF else [HVACMode.OFF, mode]
 
     @property
     def hvac_mode(self) -> HVACMode:
@@ -210,16 +197,6 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
         return _HVAC_ACTION_BY_MODE.get(mode, HVACAction.IDLE)
 
     @property
-    def fan_mode(self) -> str | None:
-        """Return the best available fan mode."""
-        return self.runtime.exposed_fan_mode
-
-    @property
-    def swing_mode(self) -> str | None:
-        """Return the best available swing mode."""
-        return self.runtime.exposed_swing_mode
-
-    @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return diagnostic metadata for the current packet profile."""
         attributes = dict(super().extra_state_attributes)
@@ -231,21 +208,12 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
         observed_fields = ["hvac_mode"]
         if runtime.observed_status is not None and runtime.observed_status.target_temperature is not None:
             observed_fields.append("target_temperature")
-        if runtime.observed_status is not None and runtime.observed_status.fan_mode is not None:
-            observed_fields.append("fan_mode")
-        if runtime.observed_status is not None and runtime.observed_status.swing_mode is not None:
-            observed_fields.append("swing_mode")
-        if runtime.observed_status is not None and runtime.observed_status.turbo:
-            observed_fields.append("turbo")
-        if runtime.observed_status is not None and runtime.observed_status.sleep:
-            observed_fields.append("sleep")
-        if runtime.observed_status is not None and runtime.observed_status.power_saving:
-            observed_fields.append("power_saving")
         attributes.update(
             {
-                "assumed_state": runtime.is_assumed,
+                # HA's own assumed_state attribute is always true here; this
+                # says whether the shown state came from the hub's report.
+                "aifa_state_assumed": runtime.is_assumed,
                 "aifa_state_source": runtime.effective_state_source,
-                "aifa_helper_flags_state_source": runtime.effective_helper_flags_state_source,
                 "aifa_observed_state_available": runtime.observed_status is not None,
                 "aifa_command_state_available": runtime.command_status is not None,
                 "aifa_command_state_pending": runtime.command_status_pending,
@@ -253,9 +221,6 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
                 "aifa_observed_fields": observed_fields,
                 "last_status_command": runtime.last_status_command,
                 "last_power_command": runtime.last_power_command,
-                "turbo_enabled": runtime.exposed_turbo,
-                "sleep_enabled": runtime.exposed_sleep,
-                "power_saving_enabled": runtime.exposed_power_saving,
                 "aifa_available_modes": list(self._capabilities.available_modes),
                 "aifa_anti_mold_modes": list(self._capabilities.anti_mold_modes),
                 "aifa_supports_sleep": self._capabilities.supports_sleep,
@@ -263,11 +228,7 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
                 "aifa_supports_turbo": self._capabilities.supports_turbo,
                 _ATTR_REQUESTED_HVAC_MODE: runtime.requested_hvac_mode,
                 _ATTR_REQUESTED_TARGET_TEMPERATURE: runtime.requested_target_temperature,
-                _ATTR_REQUESTED_FAN_MODE: runtime.requested_fan_mode,
-                _ATTR_REQUESTED_SWING_MODE: runtime.requested_swing_mode,
-                _ATTR_REQUESTED_TURBO: runtime.requested_turbo,
-                _ATTR_REQUESTED_SLEEP: runtime.requested_sleep,
-                _ATTR_REQUESTED_POWER_SAVING: runtime.requested_power_saving,
+                _ATTR_POWER_OFF_HELD: runtime.power_off_held,
                 _ATTR_LAST_ACTIVE_HVAC_MODE: runtime.last_active_hvac_mode,
             }
         )
@@ -282,50 +243,27 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
             return
 
         runtime = self.runtime
-        requested_mode = last_state.attributes.get(_ATTR_REQUESTED_HVAC_MODE)
         supported_mode_values = {mode.value for mode in self._attr_hvac_modes}
-        if requested_mode in supported_mode_values:
-            runtime.requested_hvac_mode = requested_mode
 
         requested_target = last_state.attributes.get(_ATTR_REQUESTED_TARGET_TEMPERATURE)
         if requested_target is not None:
             runtime.requested_target_temperature = int(float(requested_target))
 
-        requested_fan_mode = last_state.attributes.get(_ATTR_REQUESTED_FAN_MODE)
-        if requested_fan_mode in self._attr_fan_modes:
-            runtime.requested_fan_mode = requested_fan_mode
-
-        requested_swing_mode = last_state.attributes.get(_ATTR_REQUESTED_SWING_MODE)
-        if requested_swing_mode in self._attr_swing_modes:
-            runtime.requested_swing_mode = requested_swing_mode
-
-        requested_turbo = last_state.attributes.get(_ATTR_REQUESTED_TURBO)
-        if isinstance(requested_turbo, bool):
-            runtime.requested_turbo = requested_turbo
-
-        requested_sleep = last_state.attributes.get(_ATTR_REQUESTED_SLEEP)
-        if isinstance(requested_sleep, bool):
-            runtime.requested_sleep = requested_sleep
-
-        requested_power_saving = last_state.attributes.get(_ATTR_REQUESTED_POWER_SAVING)
-        if isinstance(requested_power_saving, bool):
-            runtime.requested_power_saving = requested_power_saving
+        # The hub still reports the mode it had before the power off, so the
+        # first report after a restart must not turn the AC back on.
+        if last_state.attributes.get(_ATTR_POWER_OFF_HELD) is True:
+            runtime.hold_power_off(None)
 
         restored_last_active = last_state.attributes.get(_ATTR_LAST_ACTIVE_HVAC_MODE)
         if restored_last_active in supported_mode_values and restored_last_active != HVACMode.OFF.value:
             runtime.last_active_hvac_mode = restored_last_active
 
     async def async_turn_on(self) -> None:
-        """Turn the AC on using the last requested target state."""
-        runtime = self.runtime
-        requested_mode = runtime.requested_hvac_mode
-        mode = requested_mode if requested_mode != "off" else runtime.last_active_hvac_mode
-        if mode is None or mode == "off":
-            mode = get_default_mode(self.device_code)
+        """Send the power key only, like the app's On button."""
         await self.coordinator.async_apply_ac_state(
             self._device_id,
             self._sub_device_id,
-            hvac_mode=mode,
+            hvac_mode="on",
             device_code=self.device_code,
         )
 
@@ -343,8 +281,15 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
         if hvac_mode == HVACMode.OFF:
             await self.async_turn_off()
             return
+        if not self._active_hvac_modes and hvac_mode == self.hvac_mode:
+            return
         if hvac_mode not in self._active_hvac_modes:
-            raise HomeAssistantError(f"Unsupported AIFA HVAC mode: {hvac_mode}")
+            # Single-mode ACs only have the cycling mode key (a button entity).
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="ac_mode_not_offered",
+                translation_placeholders={"mode": hvac_mode},
+            )
         await self.coordinator.async_apply_ac_state(
             self._device_id,
             self._sub_device_id,
@@ -353,58 +298,19 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
         )
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        """Set a target temperature."""
+        """Set a target temperature in the mode the AC is showing."""
         if ATTR_TEMPERATURE not in kwargs:
             raise HomeAssistantError("AIFA climate requires target temperature")
 
         requested_mode = kwargs.get(_ATTR_HVAC_MODE)
-        if isinstance(requested_mode, HVACMode):
-            target_mode = requested_mode
-        elif isinstance(requested_mode, str):
-            target_mode = HVACMode(requested_mode)
-        else:
-            current_mode = self.hvac_mode
-            target_mode = current_mode if current_mode != HVACMode.OFF else _default_active_hvac_mode(
-                self.device_code
-            )
-
-        if target_mode == HVACMode.OFF:
-            raise HomeAssistantError("Set a non-off HVAC mode before sending temperature")
+        if requested_mode is not None and HVACMode(requested_mode) != self.hvac_mode:
+            await self.async_set_hvac_mode(HVACMode(requested_mode))
+        if requested_mode == HVACMode.OFF:
+            return
 
         await self.coordinator.async_apply_ac_state(
             self._device_id,
             self._sub_device_id,
-            hvac_mode=_HVAC_TO_PACKET_MODE[target_mode],
             target_temperature=int(float(kwargs[ATTR_TEMPERATURE])),
-            device_code=self.device_code,
-        )
-
-    async def async_set_fan_mode(self, fan_mode: str) -> None:
-        """Set the AC fan mode."""
-        if fan_mode not in self._attr_fan_modes:
-            raise HomeAssistantError(f"Unsupported AIFA fan mode: {fan_mode}")
-
-        await self.coordinator.async_apply_ac_state(
-            self._device_id,
-            self._sub_device_id,
-            hvac_mode=self.runtime.requested_hvac_mode
-            if self.runtime.requested_hvac_mode != "off"
-            else get_default_mode(self.device_code),
-            fan_mode=fan_mode,
-            device_code=self.device_code,
-        )
-
-    async def async_set_swing_mode(self, swing_mode: str) -> None:
-        """Set the AC swing mode."""
-        if swing_mode not in self._attr_swing_modes:
-            raise HomeAssistantError(f"Unsupported AIFA swing mode: {swing_mode}")
-
-        await self.coordinator.async_apply_ac_state(
-            self._device_id,
-            self._sub_device_id,
-            hvac_mode=self.runtime.requested_hvac_mode
-            if self.runtime.requested_hvac_mode != "off"
-            else get_default_mode(self.device_code),
-            swing_mode=swing_mode,
             device_code=self.device_code,
         )

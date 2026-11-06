@@ -424,6 +424,7 @@ class CoordinatorOverFakeHubTests(unittest.IsolatedAsyncioTestCase):
             async_send_packet=cloud_send
         )
         coordinator._transport = "lan"  # type: ignore[attr-defined]
+        coordinator._ac_apply_locks = {}  # type: ignore[attr-defined]
         coordinator._lan_manager = self.harness.manager  # type: ignore[attr-defined]
         coordinator._lan_failed_at = {}  # type: ignore[attr-defined]
         coordinator._transport_counters = {  # type: ignore[attr-defined]
@@ -448,10 +449,8 @@ class CoordinatorOverFakeHubTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_lan_mode_sends_exact_bytes_to_hub(self) -> None:
         self.harness.manager.sync_specs(self.coordinator.data.devices)
-        responses = await self.coordinator._async_dispatch_raw_commands(  # noqa: SLF001
-            [self._command()]
-        )
-        self.assertEqual(responses[0]["transport"], "lan")
+        response = await self.coordinator._async_send_unconfirmed(self._command())  # noqa: SLF001
+        self.assertEqual(response["transport"], "lan")
         await _wait_until(lambda: bytes(self.hub.received) == bytes.fromhex("ffa019f0"))
         self.assertEqual(self.cloud_sent, [])
 
@@ -462,9 +461,7 @@ class CoordinatorOverFakeHubTests(unittest.IsolatedAsyncioTestCase):
         self.harness.manager.sync_specs(self.coordinator.data.devices)
         with patch("custom_components.aifa_smart.coordinator.LAN_CONNECT_TIMEOUT", 0.3):
             with self.assertRaises(HomeAssistantError) as ctx:
-                await self.coordinator._async_dispatch_raw_commands(  # noqa: SLF001
-                    [self._command()]
-                )
+                await self.coordinator._async_send_unconfirmed(self._command())  # noqa: SLF001
         self.assertEqual(ctx.exception.translation_key, "lan_unavailable")
         self.assertEqual(self.cloud_sent, [])
         self.assertEqual(bytes(self.hub.received), b"")

@@ -9,26 +9,27 @@ in addition to its REST surface. The hub pushes:
 - Notify frames (signal that something else has just changed)
 
 This module owns the lifecycle of those connections — one task per hub, with
-exponential-backoff reconnect, four streaming parser buffers (capped to bound
-long-lived memory growth), and a 3 s self-query loop that drives observed
-state when the hub doesn't push spontaneously. State mutations are delegated
-back to the coordinator via callbacks so this module stays free of any
-runtime-state coupling.
+exponential-backoff reconnect and four streaming parser buffers (capped to
+bound long-lived memory growth). Like i-Ctrl Pro, it queries the hub once per
+connection and otherwise relies on what the hub pushes: a hub busy answering
+queries has been seen to drop a key press that arrives at the same time.
+State mutations are delegated back to the coordinator via callbacks so this
+module stays free of any runtime-state coupling.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, callback
-from homeassistant.helpers.event import async_track_time_interval
 
 from .ac import (
+    CLASSIC_AC_QUERY_PACKET,
     CLASSIC_WAKE_REPLY_PACKET,
     AifaAcStatus,
     decode_observed_status_packet,
@@ -39,8 +40,8 @@ from .api import (
     AifaDevice,
     AifaSmartApiClient,
     AifaSubDevice,
-    build_classic_ac_query_steps,
     decode_classic_sensor_packet,
+    enable_tcp_keepalive,
     extract_classic_notify_packets,
     extract_classic_sensor_packets,
     extract_classic_status_packets,
@@ -59,6 +60,25 @@ _LOGGER = logging.getLogger(__name__)
 # TLS connection.
 _CLASSIC_SOCKET_BUFFER_MAX = 65536
 _CLASSIC_SOCKET_BUFFER_TRIM = 32768
+# The AIFA app waits this long after the relay's handshake ack before it
+# reports the link connected and starts writing (shared with its LAN path).
+CLASSIC_CONNECT_WRITE_DELAY = 0.5
+# A link that drops sooner than this keeps growing the backoff, so a relay
+# that closes right after the handshake cannot draw a query every second.
+_MIN_HEALTHY_SECONDS = 10.0
+# i-Ctrl Pro's command queue holds the next write for the previous packet's
+# delay: 600 ms after a key, 300 ms after a query, a 15-byte packet or
+# SetCode. A hub answering a query can drop a key arriving with it.
+KEY_QUEUE_DELAY = 0.6
+QUERY_QUEUE_DELAY = 0.3
+_QUERY_LIKE_LENGTHS = frozenset({6, 15})
+
+
+def queue_delay(packet: bytes) -> float:
+    """How long the next write waits after `packet`; other codes wait like a key."""
+    if packet == bytes.fromhex(CLASSIC_AC_QUERY_PACKET) or len(packet) in _QUERY_LIKE_LENGTHS:
+        return QUERY_QUEUE_DELAY
+    return KEY_QUEUE_DELAY
 
 
 def _ac_socket_sub_type(sub_device: AifaSubDevice) -> int:
@@ -217,6 +237,7 @@ class ClassicSocketManager:
         on_sensor_state: ApplySensorStateFn,
         on_data_changed: NotifyDataChangedFn,
         on_notify_full_refresh: NotifyFullRefreshFn,
+        connect_write_delay: float = CLASSIC_CONNECT_WRITE_DELAY,
     ) -> None:
         self._hass = hass
         self._client = client
@@ -224,19 +245,17 @@ class ClassicSocketManager:
         self._on_sensor_state = on_sensor_state
         self._on_data_changed = on_data_changed
         self._on_notify_full_refresh = on_notify_full_refresh
+        self._connect_write_delay = connect_write_delay
         self._specs: dict[str, AifaClassicSocketListenerSpec] = {}
         self._listener_tasks: dict[str, asyncio.Task[None]] = {}
-        self._notify_probe_tasks: dict[str, asyncio.Task[None]] = {}
-        self._sync_unsub: CALLBACK_TYPE | None = None
         self._start_unsub: CALLBACK_TYPE | None = None
-        self._bootstrap_task: asyncio.Task[None] | None = None
-        self._sync_lock = asyncio.Lock()
         # Per-device TLS writers + per-device write locks. The reader loop in
         # `_async_consume` registers its writer here so external callers can
         # send command packets through the same long-lived TLS connection that
         # AIFA app itself uses (handshake + raw bytes, no HTTPS overhead).
         self._socket_writers: dict[str, asyncio.StreamWriter] = {}
         self._socket_write_locks: dict[str, asyncio.Lock] = {}
+        self._socket_writable_at: dict[str, float] = {}
 
     # ----- Public API -----
 
@@ -284,12 +303,44 @@ class ClassicSocketManager:
             return False
 
         async with lock:
+            await self._async_wait_writable(device_id)
+            if self._socket_writers.get(device_id) is not writer or writer.is_closing():
+                return False
             writer.write(data)
+            self._hold_next_write(device_id, data)
             await writer.drain()
         return True
 
+    def _hold_next_write(self, device_id: str, data: bytes) -> None:
+        self._socket_writable_at[device_id] = (
+            asyncio.get_running_loop().time() + queue_delay(data)
+        )
+
+    async def _async_wait_writable(self, device_id: str) -> None:
+        """Hold a write until the hub listens to the current socket and the
+        queue delay of the previous write has passed.
+
+        Callers wait while holding the write lock so writes keep their order.
+        """
+        writable_at = self._socket_writable_at.get(device_id)
+        if writable_at is not None:
+            delay = writable_at - asyncio.get_running_loop().time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+    def drop_connection(self, device_id: str) -> None:
+        """Abort the long-lived socket of a hub so the listener reconnects.
+
+        TCP keepalive notices a half-open socket only after a few minutes;
+        a command that drew no reply is reason enough to reconnect now.
+        """
+        writer = self._socket_writers.pop(device_id, None)
+        self._socket_write_locks.pop(device_id, None)
+        if writer is not None and not writer.is_closing():
+            writer.transport.abort()
+
     def sync_specs(self, devices: dict[str, AifaDevice]) -> None:
-        """Refresh the desired set of hubs covered by background classic polling."""
+        """Refresh the desired set of hubs that keep a classic socket open."""
         previous_specs = self._specs
         self._specs = self._build_specs(devices)
         for device_id, previous in previous_specs.items():
@@ -297,31 +348,20 @@ class ClassicSocketManager:
             if current != previous:
                 self._cancel_listener_task(device_id)
         if self._specs:
-            self._ensure_background_sync()
             self._ensure_listener_tasks()
         else:
-            self._stop_background_sync()
+            self._stop_listeners()
 
     async def shutdown(self) -> None:
-        """Cancel background sync, listener tasks, and notify-probe tasks."""
-        self._stop_background_sync()
+        """Cancel the startup hook and every listener task."""
+        self._stop_listeners()
         self._specs.clear()
-        tasks: list[asyncio.Task[None]] = []
-        tasks.extend(
+        tasks = [
             task
             for task in list(self._listener_tasks.values())
             if task is not None and not task.done()
-        )
+        ]
         self._listener_tasks.clear()
-        tasks.extend(
-            task
-            for task in list(self._notify_probe_tasks.values())
-            if task is not None and not task.done()
-        )
-        self._notify_probe_tasks.clear()
-        if self._bootstrap_task is not None and not self._bootstrap_task.done():
-            tasks.append(self._bootstrap_task)
-        self._bootstrap_task = None
         for task in tasks:
             task.cancel()
         if tasks:
@@ -335,91 +375,28 @@ class ClassicSocketManager:
         """Describe which hubs should keep a long-lived classic socket open."""
         return build_hub_specs(devices, require_online=True)
 
-    def _ensure_background_sync(self) -> None:
-        """Start the background classic poller once Home Assistant is fully running."""
-        if self._sync_unsub is not None or self._start_unsub is not None:
-            return
-        if self._hass.is_running:
-            self._start_background_sync()
-            return
-        self._start_unsub = self._hass.bus.async_listen_once(
-            EVENT_HOMEASSISTANT_STARTED,
-            self._async_handle_home_assistant_started,
-        )
-
     @callback
-    def _start_background_sync(self) -> None:
-        """Register periodic classic polling once HA startup has completed."""
-        if self._sync_unsub is not None or not self._specs:
-            return
-        self._sync_unsub = async_track_time_interval(
-            self._hass,
-            self._async_periodic_sync,
-            timedelta(seconds=3),
-        )
-        self._bootstrap_task = self._hass.async_create_background_task(
-            self._async_periodic_sync(None),
-            name=f"{DOMAIN}_classic_socket_bootstrap",
-        )
-        self._ensure_listener_tasks()
-
-    @callback
-    def _stop_background_sync(self) -> None:
-        """Stop periodic classic polling and clear startup hooks."""
+    def _stop_listeners(self) -> None:
+        """Cancel the startup hook and every listener task."""
         if self._start_unsub is not None:
             self._start_unsub()
             self._start_unsub = None
-        if self._sync_unsub is not None:
-            self._sync_unsub()
-            self._sync_unsub = None
-        task = self._bootstrap_task
-        self._bootstrap_task = None
-        if task is not None and not task.done():
-            task.cancel()
         for device_id in tuple(self._listener_tasks):
             self._cancel_listener_task(device_id)
-        for device_id in tuple(self._notify_probe_tasks):
-            probe_task = self._notify_probe_tasks.pop(device_id)
-            if not probe_task.done():
-                probe_task.cancel()
 
     async def _async_handle_home_assistant_started(self, _: Event) -> None:
-        """Start periodic classic polling after HA has fully finished startup."""
+        """Open the listeners once Home Assistant has finished starting."""
         self._start_unsub = None
-        self._start_background_sync()
-
-    async def _async_periodic_sync(self, _: datetime | None) -> None:
-        """Poll the private classic AC query path for external state changes."""
-        if not self._specs:
-            return
-        if self._sync_lock.locked():
-            return
-
-        async with self._sync_lock:
-            updated = False
-            for spec in tuple(self._specs.values()):
-                try:
-                    observed_by_sub_type = await self._client.async_query_classic_ac_statuses(
-                        spec.mac,
-                        sub_types={target.sub_type for target in spec.targets},
-                        timeout=3.0,
-                    )
-                except Exception as err:  # pragma: no cover - runtime network guard
-                    _LOGGER.debug(
-                        "Classic socket periodic sync failed for %s: %s",
-                        spec.device_id,
-                        err,
-                    )
-                    continue
-                for sub_type, observed in observed_by_sub_type.items():
-                    updated = self._on_observed_status(spec, sub_type, observed) or updated
-
-            if updated:
-                self._on_data_changed()
+        self._ensure_listener_tasks()
 
     def _ensure_listener_tasks(self) -> None:
         """Ensure one long-lived classic socket listener exists per supported hub."""
         if not self._hass.is_running:
+            if self._start_unsub is None:
+                self._start_unsub = self._hass.bus.async_listen_once(
+                    EVENT_HOMEASSISTANT_STARTED,
+                    self._async_handle_home_assistant_started,
+                )
             return
         for device_id in tuple(self._listener_tasks):
             if device_id not in self._specs:
@@ -448,9 +425,9 @@ class ClassicSocketManager:
         try:
             while device_id in self._specs:
                 spec = self._specs[device_id]
+                started = asyncio.get_running_loop().time()
                 try:
                     await self._async_consume(spec)
-                    backoff_seconds = 1.0
                 except asyncio.CancelledError:
                     raise
                 except Exception as err:  # pragma: no cover - runtime network guard
@@ -459,6 +436,8 @@ class ClassicSocketManager:
                         device_id,
                         err,
                     )
+                if asyncio.get_running_loop().time() - started >= _MIN_HEALTHY_SECONDS:
+                    backoff_seconds = 1.0
                 await asyncio.sleep(backoff_seconds)
                 backoff_seconds = min(backoff_seconds * 2, 15.0)
         finally:
@@ -469,11 +448,17 @@ class ClassicSocketManager:
         socket_session = await self._client.async_open_classic_socket(spec.mac, timeout=6.0)
         reader = socket_session.reader
         writer = socket_session.writer
+        # Nothing is written after the connect query, so only keepalive can
+        # tell a half-open link (e.g. a WAN drop without RST) from a quiet one.
+        enable_tcp_keepalive(writer.get_extra_info("socket"))
         # Register writer + per-device lock so external callers (coordinator)
         # can send command packets through this same TLS connection. The lock
-        # serializes writes between the reader loop's own self-query / wake-
+        # serializes writes between the reader loop's own connect query / wake
         # reply traffic and externally-initiated control commands.
         write_lock = asyncio.Lock()
+        self._socket_writable_at[spec.device_id] = (
+            asyncio.get_running_loop().time() + self._connect_write_delay
+        )
         self._socket_writers[spec.device_id] = writer
         self._socket_write_locks[spec.device_id] = write_lock
         buffers = ClassicStreamBuffers()
@@ -484,18 +469,13 @@ class ClassicSocketManager:
                 ):
                     self._on_data_changed()
 
-            await self._async_send_query(spec, writer)
-            loop = asyncio.get_running_loop()
-            next_query_at = loop.time() + 3.0
+            # i-Ctrl Pro asks once per connection; every later report is pushed.
+            await self._async_write(
+                spec.device_id, writer, CLASSIC_AC_QUERY_PACKET, queued=True
+            )
 
             while spec.device_id in self._specs:
-                timeout = max(0.1, next_query_at - loop.time())
-                try:
-                    chunk = await asyncio.wait_for(reader.read(4096), timeout=timeout)
-                except asyncio.TimeoutError:
-                    await self._async_send_query(spec, writer)
-                    next_query_at = loop.time() + 3.0
-                    continue
+                chunk = await reader.read(4096)
                 if not chunk:
                     break
                 if await self._async_process_chunk(spec, chunk, writer, buffers):
@@ -507,31 +487,33 @@ class ClassicSocketManager:
             if current_writer is writer:
                 self._socket_writers.pop(spec.device_id, None)
                 self._socket_write_locks.pop(spec.device_id, None)
+                self._socket_writable_at.pop(spec.device_id, None)
             writer.close()
             try:
                 await writer.wait_closed()
             except OSError:
                 pass
 
-    async def _async_send_query(
+    async def _async_write(
         self,
-        spec: AifaClassicSocketListenerSpec,
+        device_id: str,
         writer: asyncio.StreamWriter,
+        packet_hex: str,
+        *,
+        queued: bool = False,
     ) -> None:
-        """Send the app-like AC query sequence over an existing listener socket."""
-        lock = self._socket_write_locks.get(spec.device_id)
-        if lock is None:
-            for packet, _ in build_classic_ac_query_steps(
-                {target.sub_type for target in spec.targets}
-            ):
-                writer.write(bytes.fromhex(packet))
-            await writer.drain()
-            return
-        async with lock:
-            for packet, _ in build_classic_ac_query_steps(
-                {target.sub_type for target in spec.targets}
-            ):
-                writer.write(bytes.fromhex(packet))
+        """Write one packet the listener itself owes the hub.
+
+        A wake reply answers the hub and does not hold the queue; the
+        connect query does, like any packet i-Ctrl Pro queues.
+        """
+        lock = self._socket_write_locks.get(device_id)
+        data = bytes.fromhex(packet_hex)
+        async with lock if lock is not None else contextlib.nullcontext():
+            await self._async_wait_writable(device_id)
+            writer.write(data)
+            if queued:
+                self._hold_next_write(device_id, data)
             await writer.drain()
 
     async def _async_process_chunk(
@@ -544,14 +526,7 @@ class ClassicSocketManager:
         """Parse one classic socket chunk and apply any decoded updates."""
 
         async def reply_wake() -> None:
-            lock = self._socket_write_locks.get(spec.device_id)
-            if lock is None:
-                writer.write(bytes.fromhex(CLASSIC_WAKE_REPLY_PACKET))
-                await writer.drain()
-                return
-            async with lock:
-                writer.write(bytes.fromhex(CLASSIC_WAKE_REPLY_PACKET))
-                await writer.drain()
+            await self._async_write(spec.device_id, writer, CLASSIC_WAKE_REPLY_PACKET)
 
         return await process_classic_stream_chunk(
             chunk,
@@ -562,56 +537,17 @@ class ClassicSocketManager:
                 spec, sub_type, observed
             ),
             on_sensor=lambda sensor: self._on_sensor_state(spec.device_id, sensor),
-            on_notify=lambda: self._schedule_notify_probe(spec.device_id),
+            on_notify=lambda: self._schedule_notify_refresh(spec.device_id),
         )
 
-    # ----- Notify probe -----
+    def _schedule_notify_refresh(self, device_id: str) -> None:
+        """Reload the account after a notify frame; the hub itself is not asked.
 
-    def _schedule_notify_probe(self, device_id: str) -> None:
-        """Debounce a one-off classic query after a short notify-only frame."""
-        task = self._notify_probe_tasks.get(device_id)
-        if task is not None and not task.done():
-            return
-        self._notify_probe_tasks[device_id] = self._hass.async_create_background_task(
-            self._async_run_notify_probe(device_id),
-            name=f"{DOMAIN}_classic_socket_notify_probe_{device_id}",
-        )
-
-    async def _async_run_notify_probe(self, device_id: str) -> None:
-        """Query observed AC state shortly after a notify-only frame.
-
-        Also schedules a full coordinator refresh: a notify frame can mean
-        macros/functions/devices were changed externally (e.g. AIFA app),
-        and the AC-state probe alone won't pick those up. Without this,
-        external changes only surface after the next 120s polling tick.
+        A notify frame can mean macros, functions or devices were changed
+        elsewhere (e.g. in the AIFA app), which the pushed AC status does not
+        carry. The coordinator's request debouncer coalesces bursts.
         """
-        try:
-            spec = self._specs.get(device_id)
-            if spec is None:
-                return
-            self._hass.async_create_background_task(
-                self._on_notify_full_refresh(),
-                name=f"{DOMAIN}_notify_full_refresh_{device_id}",
-            )
-            updated = False
-            for delay in (0.2, 0.75, 1.5, 3.0):
-                await asyncio.sleep(delay)
-                observed_by_sub_type = await self._client.async_query_classic_ac_statuses(
-                    spec.mac,
-                    sub_types={target.sub_type for target in spec.targets},
-                    timeout=2.5,
-                )
-                for sub_type, observed in observed_by_sub_type.items():
-                    updated = self._on_observed_status(spec, sub_type, observed) or updated
-                if updated:
-                    self._on_data_changed()
-        except asyncio.CancelledError:
-            raise
-        except Exception as err:  # pragma: no cover - runtime network guard
-            _LOGGER.debug(
-                "Classic socket notify probe failed for %s: %s",
-                device_id,
-                err,
-            )
-        finally:
-            self._notify_probe_tasks.pop(device_id, None)
+        self._hass.async_create_background_task(
+            self._on_notify_full_refresh(),
+            name=f"{DOMAIN}_notify_full_refresh_{device_id}",
+        )

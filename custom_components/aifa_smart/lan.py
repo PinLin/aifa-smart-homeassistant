@@ -11,7 +11,6 @@ import asyncio
 import errno
 import ipaddress
 import logging
-import socket
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -22,12 +21,18 @@ from typing import TYPE_CHECKING, Any
 from homeassistant.util import dt as dt_util
 
 from .ac import CLASSIC_WAKE_REPLY_PACKET, AifaAcStatus
-from .api import AifaClassicSensorState, AifaDevice, AifaSmartConnectionError
+from .api import (
+    AifaClassicSensorState,
+    AifaDevice,
+    AifaSmartConnectionError,
+    enable_tcp_keepalive,
+)
 from .classic_listener import (
     AifaClassicSocketListenerSpec,
     ClassicStreamBuffers,
     build_hub_specs,
     process_classic_stream_chunk,
+    queue_delay,
 )
 from .const import DOMAIN, LAN_UNAVAILABLE_GRACE_SECONDS
 
@@ -49,12 +54,6 @@ _CMD_INDEX = 16
 _MAC_SEPARATORS = str.maketrans("", "", ":-. \t")
 
 LAN_BACKOFF_SCHEDULE: tuple[float, ...] = (1, 2, 4, 8, 16, 32, 60)
-_KEEPALIVE_IDLE = 60
-_KEEPALIVE_INTERVAL = 10
-_KEEPALIVE_COUNT = 3
-# Unacknowledged writes bypass keepalive; without this a vanished hub would
-# keep accepting "sent" commands until the kernel retransmit limit (~15 min).
-_USER_TIMEOUT_MS = 20000
 # A link that drops sooner than this counts as a failure for the backoff.
 _MIN_HEALTHY_SECONDS = 10.0
 _SEARCH_TIMEOUT = 1.5
@@ -70,6 +69,9 @@ LAN_STATUS_QUERY_PACKET = "fff3f2f0"
 # takes ~90 s and misses links whose writes are still being buffered.
 LAN_IDLE_QUERY_SECONDS = 60.0
 LAN_QUERY_REPLY_TIMEOUT = 5.0
+# The hub drops whatever arrives in the first moments of a connection; the
+# AIFA app reports the link connected, and starts writing, 0.5 s in.
+LAN_CONNECT_WRITE_DELAY = 0.5
 
 
 def wire_mac(mac: str) -> str:
@@ -156,27 +158,6 @@ class _DatagramSender(asyncio.DatagramProtocol):
         _LOGGER.debug("AIFA LAN broadcast error: %s", exc)
 
 
-def _enable_keepalive(sock: socket.socket | None) -> None:
-    """Detect half-open links, e.g. when the hub loses power."""
-    if sock is None:
-        return
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        idle_opt = getattr(socket, "TCP_KEEPIDLE", None) or getattr(
-            socket, "TCP_KEEPALIVE", None
-        )
-        if idle_opt is not None:
-            sock.setsockopt(socket.IPPROTO_TCP, idle_opt, _KEEPALIVE_IDLE)
-        if hasattr(socket, "TCP_KEEPINTVL"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KEEPALIVE_INTERVAL)
-        if hasattr(socket, "TCP_KEEPCNT"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KEEPALIVE_COUNT)
-        if hasattr(socket, "TCP_USER_TIMEOUT"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, _USER_TIMEOUT_MS)
-    except OSError as err:
-        _LOGGER.debug("Unable to enable TCP keepalive on AIFA LAN link: %s", err)
-
-
 async def async_request_lan_connection(
     mac: str,
     broadcast_addrs: Iterable[str],
@@ -243,7 +224,7 @@ async def async_request_lan_connection(
                 )
             except asyncio.TimeoutError:
                 continue
-            _enable_keepalive(writer.get_extra_info("socket"))
+            enable_tcp_keepalive(writer.get_extra_info("socket"))
             returned = True
             return reader, writer, port
         raise LanConnectTimeout("AIFA hub did not connect back")
@@ -324,6 +305,7 @@ class LanHubLink:
     last_status_at: datetime | None = None
     last_tx_at: datetime | None = None
     last_connect_ms: int | None = None
+    writable_at: float | None = None
     consecutive_failures: int = 0
     reconnect_count: int = 0
     last_error: str | None = None
@@ -370,6 +352,7 @@ class LanTransportManager:
         query_reply_timeout: float = LAN_QUERY_REPLY_TIMEOUT,
         on_link_state_changed: Callable[[], None] | None = None,
         unavailable_grace: float = LAN_UNAVAILABLE_GRACE_SECONDS,
+        connect_write_delay: float = LAN_CONNECT_WRITE_DELAY,
     ) -> None:
         self._hass = hass
         self._on_observed_status = on_observed_status
@@ -388,6 +371,7 @@ class LanTransportManager:
         self._query_reply_timeout = query_reply_timeout
         self._on_link_state_changed = on_link_state_changed
         self._unavailable_grace = unavailable_grace
+        self._connect_write_delay = connect_write_delay
         self._links: dict[str, LanHubLink] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._discovered_macs: dict[str, str] = {}
@@ -481,12 +465,15 @@ class LanTransportManager:
             link.on_demand_failed_at = time.monotonic()
             return LanSendResult.NOT_CONNECTED
 
+        writer = link.writer
+        if writer is None:
+            return LanSendResult.NOT_CONNECTED
         async with link.write_lock:
-            writer = link.writer
-            if writer is None or writer.is_closing():
+            if not await self._async_wait_writable(link, writer):
                 return LanSendResult.NOT_CONNECTED
             try:
                 writer.write(data)
+                link.writable_at = time.monotonic() + queue_delay(data)
                 await writer.drain()
             except (OSError, RuntimeError) as err:
                 link.last_error = f"write_failed: {err!r}"
@@ -500,8 +487,8 @@ class LanTransportManager:
         if link is None or link.writer is None or link.writer.is_closing():
             return False
         writer = link.writer
-        sent_at = time.monotonic()
-        if not await self._async_write_query(link, writer):
+        sent_at = await self._async_write_query(link, writer)
+        if sent_at is None:
             return False
         # A half-open link still accepts writes, so a query that draws no
         # bytes at all closes the link instead of waiting for the idle check.
@@ -520,6 +507,18 @@ class LanTransportManager:
         link.last_error = "query_timeout"
         _LOGGER.debug("AIFA LAN link %s did not answer a status query", link.device_id)
         writer.close()
+
+    def drop_connection(self, device_id: str, reason: str) -> None:
+        """Abort the current link so the link loop reconnects after its backoff.
+
+        Abort rather than close: a half-open peer never acknowledges, and a
+        graceful close could keep the dead link registered while it drains.
+        """
+        link = self._links.get(device_id)
+        if link is None or link.writer is None or link.writer.is_closing():
+            return
+        link.last_error = reason
+        link.writer.transport.abort()
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
         """Diagnostics-friendly view of every link."""
@@ -671,6 +670,7 @@ class LanTransportManager:
                 link.last_connect_ms = int((time.monotonic() - started) * 1000)
                 failures_before = link.consecutive_failures
                 connected_since = time.monotonic()
+                link.writable_at = connected_since + self._connect_write_delay
                 link.consecutive_failures = 0
                 link.last_error = None
                 link.writer = writer
@@ -689,6 +689,7 @@ class LanTransportManager:
                 finally:
                     link.connected_event.clear()
                     link.writer = None
+                    link.writable_at = None
                     link.disconnected_at = time.monotonic()
                     writer.close()
                 if self._links.get(link.device_id) is not link:
@@ -706,21 +707,41 @@ class LanTransportManager:
                 link.writer = None
             link.connected_event.clear()
 
+    @staticmethod
+    async def _async_wait_writable(
+        link: LanHubLink, writer: asyncio.StreamWriter
+    ) -> bool:
+        """Hold a write until the hub listens and the queue delay of the
+        previous write has passed; False if the link went away.
+
+        Callers wait while holding the write lock so writes keep their order.
+        """
+        if link.writable_at is not None:
+            delay = link.writable_at - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+        return link.writer is writer and not writer.is_closing()
+
     async def _async_write_query(
         self, link: LanHubLink, writer: asyncio.StreamWriter
-    ) -> bool:
+    ) -> float | None:
+        """Send a status query; returns the monotonic time it went out."""
         async with link.write_lock:
-            if writer.is_closing():
-                return False
+            if not await self._async_wait_writable(link, writer):
+                return None
+            # Taken before the write: a reply may be read while drain waits.
+            sent_at = time.monotonic()
+            query = bytes.fromhex(LAN_STATUS_QUERY_PACKET)
             try:
-                writer.write(bytes.fromhex(LAN_STATUS_QUERY_PACKET))
+                writer.write(query)
+                link.writable_at = sent_at + queue_delay(query)
                 await writer.drain()
             except (OSError, RuntimeError) as err:
                 link.last_error = f"query_write_failed: {err!r}"
                 writer.close()
-                return False
+                return None
         link.last_tx_at = dt_util.utcnow()
-        return True
+        return sent_at
 
     async def _async_consume(
         self,
@@ -737,6 +758,8 @@ class LanTransportManager:
 
         async def reply_wake() -> None:
             async with link.write_lock:
+                if not await self._async_wait_writable(link, writer):
+                    return
                 writer.write(bytes.fromhex(CLASSIC_WAKE_REPLY_PACKET))
                 await writer.drain()
 
@@ -765,7 +788,7 @@ class LanTransportManager:
                         spec.device_id,
                     )
                     return
-                if not await self._async_write_query(link, writer):
+                if await self._async_write_query(link, writer) is None:
                     return
                 query_sent_at = loop.time()
                 continue

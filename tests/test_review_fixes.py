@@ -7,7 +7,7 @@ import unittest
 
 import pytest
 
-from custom_components.aifa_smart.api import AifaFunctionCommand
+from custom_components.aifa_smart.api import AifaMacro, AifaMacroCommand
 from custom_components.aifa_smart.const import TRANSPORT_CLOUD, TRANSPORT_LAN
 from custom_components.aifa_smart.coordinator import (
     AifaAccountData,
@@ -19,8 +19,7 @@ from custom_components.aifa_smart.device_cache import (
     serialize_account,
 )
 from custom_components.aifa_smart.lan import LanSendResult
-from tests.test_coordinator_probe_guard import _Client, _Lan, _Listener
-from tests.test_coordinator_probe_guard import _coordinator as _probe_coordinator
+from tests.hub_reports import report_soon
 from tests.test_lan_fake_hub import _device, _wait_until
 from tests.test_lan_status_query import QueryingFakeHub, _Harness
 
@@ -28,24 +27,50 @@ _CLOUD_HANG = 3.0
 
 
 class _SentLan:
+    def __init__(self, coordinator) -> None:
+        self.coordinator = coordinator
+
     def is_connected(self, device_id: str) -> bool:
         return True
 
     async def async_send_packet(self, device_id, packet_hex, *, connect_timeout):
+        report_soon(self.coordinator, device_id, "lan")
         return LanSendResult.SENT
+
+    async def async_request_status(self, device_id):
+        return True
 
 
 def _send_coordinator(transport: str):
     coordinator = AifaSmartCoordinator.__new__(AifaSmartCoordinator)
+    coordinator.data = AifaAccountData(  # type: ignore[attr-defined]
+        devices={},
+        macros=[
+            AifaMacro(
+                id="m",
+                name="Macro",
+                commands=[
+                    AifaMacroCommand(
+                        id="1", macro_id="m", device_id="7001", sub_device_id="ac-1",
+                        command="ffa016f0",
+                    )
+                ],
+            )
+        ],
+        fetched_at=None,  # type: ignore[arg-type]
+    )
     coordinator._transport = transport  # type: ignore[attr-defined]
-    coordinator._lan_manager = _SentLan()  # type: ignore[attr-defined]
+    coordinator._lan_manager = _SentLan(coordinator)  # type: ignore[attr-defined]
     coordinator._lan_failed_at = {}  # type: ignore[attr-defined]
+    coordinator._hub_report_waiters = {}  # type: ignore[attr-defined]
+    coordinator._ac_apply_locks = {}  # type: ignore[attr-defined]
     coordinator._transport_counters = {  # type: ignore[attr-defined]
         "sent_lan": 0, "sent_cloud": 0, "auto_fallbacks": 0,
         "lan_write_failures": 0, "last_transport": None,
     }
 
     async def cloud_send(device_id, packet_hex):
+        report_soon(coordinator, device_id, "cloud")
         return True
 
     coordinator._classic_listener = types.SimpleNamespace(  # type: ignore[attr-defined]
@@ -69,16 +94,12 @@ def _send_coordinator(transport: str):
     return coordinator, background
 
 
-def _command() -> AifaFunctionCommand:
-    return AifaFunctionCommand(id="1", device_id="7001", sub_device_id="ac-1", command="ffa016f0")
-
-
 class RefreshAfterSendTests(unittest.IsolatedAsyncioTestCase):
     async def test_lan_command_does_not_wait_for_the_cloud_refresh(self) -> None:
         coordinator, background = _send_coordinator(TRANSPORT_LAN)
         loop = asyncio.get_running_loop()
         started = loop.time()
-        responses = await coordinator.async_send_function_commands([_command()])
+        responses = await coordinator.async_execute_macro("m")
         self.assertLess(loop.time() - started, 0.5)
         self.assertEqual(responses[0]["transport"], "lan")
         self.assertEqual(len(background), 1)
@@ -93,39 +114,9 @@ class RefreshAfterSendTests(unittest.IsolatedAsyncioTestCase):
         coordinator.async_request_refresh = quick_refresh  # type: ignore[method-assign]
         loop = asyncio.get_running_loop()
         started = loop.time()
-        await coordinator.async_send_function_commands([_command()])
+        await coordinator.async_execute_macro("m")
         self.assertGreaterEqual(loop.time() - started, 0.2)
         self.assertEqual(background, [])
-
-
-class CloudFallbackTimeoutTests(unittest.TestCase):
-    def test_lan_mode_caps_the_cloud_query(self) -> None:
-        seen: list[float] = []
-
-        class _TimedClient(_Client):
-            async def async_query_classic_ac_statuses(self, mac, sub_types=None, timeout=6.0):
-                seen.append(timeout)
-                return {}
-
-        coordinator = _probe_coordinator(
-            TRANSPORT_LAN, listener=_Listener(writer=True), client=_TimedClient(), lan=_Lan(False)
-        )
-        asyncio.run(coordinator._async_probe_ac_observed_state("7001", "ac-1"))  # noqa: SLF001
-        self.assertEqual(seen, [2.0])
-
-    def test_cloud_mode_keeps_the_default_timeout(self) -> None:
-        seen: list[float] = []
-
-        class _TimedClient(_Client):
-            async def async_query_classic_ac_statuses(self, mac, sub_types=None, timeout=6.0):
-                seen.append(timeout)
-                return {}
-
-        coordinator = _probe_coordinator(
-            TRANSPORT_CLOUD, listener=_Listener(), client=_TimedClient()
-        )
-        asyncio.run(coordinator._async_probe_ac_observed_state("7001", "ac-1"))  # noqa: SLF001
-        self.assertEqual(seen, [6.0])
 
 
 @pytest.mark.usefixtures("socket_enabled")

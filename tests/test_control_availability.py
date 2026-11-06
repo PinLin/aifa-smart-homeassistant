@@ -10,7 +10,7 @@ import pytest
 
 from custom_components.aifa_smart import lan as lan_module
 from custom_components.aifa_smart.binary_sensor import AifaOnlineBinarySensor
-from custom_components.aifa_smart.button import AifaClassicTemperatureKeyButton
+from custom_components.aifa_smart.button import AifaAcKeyButton, AifaClassicTemperatureKeyButton
 from custom_components.aifa_smart.classic_listener import build_hub_specs
 from custom_components.aifa_smart.climate import AifaAirConditionerClimate
 from custom_components.aifa_smart.const import (
@@ -23,11 +23,11 @@ from custom_components.aifa_smart.coordinator import AifaSmartCoordinator
 from custom_components.aifa_smart.entity import AifaSubDeviceEntity
 from custom_components.aifa_smart.lan import LanHubLink, LanTransportManager
 from custom_components.aifa_smart.sensor import (
+    AifaAcFanSpeedSensor,
     AifaHumiditySensor,
     AifaSubDeviceCodeSensor,
     AifaTemperatureSensor,
 )
-from custom_components.aifa_smart.switch import AifaAcFlagSwitch
 from tests.test_lan_fake_hub import (
     _LOCALHOST,
     FakeHub,
@@ -179,7 +179,12 @@ class LinkStateNotificationTests(unittest.IsolatedAsyncioTestCase):
 
 class EntityWiringTests(unittest.TestCase):
     def test_only_command_entities_follow_the_transport(self) -> None:
-        for cls in (AifaAirConditionerClimate, AifaAcFlagSwitch, AifaClassicTemperatureKeyButton):
+        for cls in (
+            AifaAirConditionerClimate,
+            AifaAcKeyButton,
+            AifaClassicTemperatureKeyButton,
+            AifaAcFanSpeedSensor,
+        ):
             self.assertTrue(cls._control_entity, cls)  # noqa: SLF001
         self.assertFalse(AifaSubDeviceCodeSensor._control_entity)  # noqa: SLF001
 

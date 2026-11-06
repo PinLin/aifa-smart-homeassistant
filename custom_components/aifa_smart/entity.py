@@ -4,7 +4,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import (
     CONNECTION_NETWORK_MAC,
     DeviceInfo,
@@ -74,6 +75,40 @@ def entity_unique_id(device_id: str, attribute: str) -> str:
 def sub_device_entity_unique_id(device_id: str, sub_device_id: str, attribute: str) -> str:
     """Build a stable unique ID for a sub-device entity."""
     return entity_unique_id(f"{device_id}_{sub_device_id}", attribute)
+
+
+def async_remove_stale_sub_device_entities(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    devices: dict[str, AifaDevice],
+    domain: str,
+    attributes: tuple[str, ...],
+    keep: set[str],
+) -> None:
+    """Drop entities of these attributes that the app no longer shows.
+
+    Only sub-devices in the current data are touched, so a hub missing from
+    one snapshot keeps its entities.
+    """
+    prefixes = tuple(
+        f"{DOMAIN}_{device.id}_{sub_device.id}_"
+        for device in devices.values()
+        for sub_device in device.sub_devices
+    )
+    registry = er.async_get(hass)
+    for entity in er.async_entries_for_config_entry(registry, entry.entry_id):
+        unique_id = entity.unique_id or ""
+        if (
+            entity.domain == domain
+            and entity.platform == DOMAIN
+            and unique_id not in keep
+            and any(
+                unique_id == f"{prefix}{attribute}"
+                for prefix in prefixes
+                for attribute in attributes
+            )
+        ):
+            registry.async_remove(entity.entity_id)
 
 
 def device_entity_id(platform: str, device_id: str, attribute: str) -> str:

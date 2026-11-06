@@ -34,7 +34,6 @@ PLATFORMS = [
     "sensor",
     "binary_sensor",
     "climate",
-    "switch",
     "button",
 ]
 
@@ -108,7 +107,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator.async_sync_background_tasks()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     await _async_remove_obsolete_automation_entities(hass, entry.entry_id)
-    await _async_clear_legacy_disabled_helper_flags(hass, entry.entry_id)
+    await _async_remove_ac_flag_switches(hass, entry.entry_id)
     await _async_sync_device_registry(hass, coordinator)
     return True
 
@@ -220,30 +219,24 @@ async def _async_remove_obsolete_automation_entities(
             entity_registry.async_remove(entity.entity_id)
 
 
-async def _async_clear_legacy_disabled_helper_flags(
-    hass: HomeAssistant, entry_id: str
-) -> None:
-    """Re-enable sleep/turbo helpers that were shipped disabled in older releases.
+_AC_FLAG_SWITCH_KEYS: tuple[str, ...] = ("turbo", "sleep", "power_saving")
 
-    Earlier versions set ``entity_registry_enabled_default=False`` on the
-    sleep and turbo switches while the IR encoding was being verified. The
-    flags now ship enabled by default, but HA leaves the existing
-    ``disabled_by="integration"`` flag on already-registered entities — so
-    upgrades alone do not re-enable them. Clear that flag here, but only when
-    the integration itself was the disabler, so users who manually disabled
-    the entity keep their preference.
+
+async def _async_remove_ac_flag_switches(hass: HomeAssistant, entry_id: str) -> None:
+    """Drop the turbo/sleep/power_saving switches that AC key buttons replaced.
+
+    The switch platform no longer exists, so without this their registry
+    entries would stay behind as orphans.
     """
     from homeassistant.helpers import entity_registry as er
 
     entity_registry = er.async_get(hass)
     for entity in er.async_entries_for_config_entry(entity_registry, entry_id):
-        if entity.disabled_by != er.RegistryEntryDisabler.INTEGRATION:
+        if entity.domain != "switch" or entity.platform != DOMAIN:
             continue
         unique_id = entity.unique_id or ""
-        if unique_id.endswith("_sleep") or unique_id.endswith("_turbo"):
-            entity_registry.async_update_entity(
-                entity.entity_id, disabled_by=None
-            )
+        if any(unique_id.endswith(f"_{key}") for key in _AC_FLAG_SWITCH_KEYS):
+            entity_registry.async_remove(entity.entity_id)
 
 
 async def _async_sync_device_registry(

@@ -219,7 +219,7 @@ class ClassicManagerUsesSharedParserTests(unittest.TestCase):
             on_data_changed=lambda: None,
             on_notify_full_refresh=lambda: None,
         )
-        manager._schedule_notify_probe = notified.append  # type: ignore[method-assign]  # noqa: SLF001
+        manager._schedule_notify_refresh = notified.append  # type: ignore[method-assign]  # noqa: SLF001
         spec = AifaClassicSocketListenerSpec(device_id="7001", mac="M", targets=())
         writer = _FakeWriter()
         manager._socket_write_locks["7001"] = asyncio.Lock()  # noqa: SLF001
