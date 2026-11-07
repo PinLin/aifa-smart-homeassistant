@@ -361,9 +361,14 @@ class ClimateFollowsTheAppTests(unittest.IsolatedAsyncioTestCase):
         restored, _ = self._climate()
 
         async def last_state():
-            return types.SimpleNamespace(attributes=attributes)
+            return types.SimpleNamespace(state="off", attributes=attributes)
 
+        async def no_extra_data():
+            return None
+
+        # A state saved by a version without extra restore data.
         restored.async_get_last_state = last_state  # type: ignore[method-assign]
+        restored.async_get_last_extra_data = no_extra_data  # type: ignore[method-assign]
         restored.hass = None
         with patch.object(AifaSubDeviceEntity, "async_added_to_hass", AsyncMock()):
             await restored.async_added_to_hass()
@@ -376,23 +381,21 @@ class ClimateFollowsTheAppTests(unittest.IsolatedAsyncioTestCase):
         climate.runtime.apply_observed_status(status("heat"))
         self.assertEqual(climate.hvac_mode, HVACMode.HEAT)
 
-    async def test_restart_shows_off_until_the_first_report(self) -> None:
+    async def test_restart_shows_the_last_state_until_the_first_report(self) -> None:
         climate, _ = self._climate(device_code="136")
         climate.runtime.apply_observed_status(status("heat"))
-        attributes = climate.extra_state_attributes
-        self.assertEqual(attributes["aifa_requested_hvac_mode"], "heat")
+        extra = climate.extra_restore_state_data
 
         restored, _ = self._climate(device_code="136")
 
-        async def last_state():
-            return types.SimpleNamespace(attributes=attributes)
+        async def last_extra_data():
+            return extra
 
-        restored.async_get_last_state = last_state  # type: ignore[method-assign]
+        restored.async_get_last_extra_data = last_extra_data  # type: ignore[method-assign]
         restored.hass = None
         with patch.object(AifaSubDeviceEntity, "async_added_to_hass", AsyncMock()):
             await restored.async_added_to_hass()
-        self.assertEqual(restored.hvac_mode, HVACMode.OFF)
-        self.assertEqual(restored.runtime.requested_hvac_mode, "off")
+        self.assertEqual(restored.hvac_mode, HVACMode.HEAT)
         self.assertEqual(restored.runtime.last_active_hvac_mode, "heat")
         restored.runtime.apply_observed_status(status("dry"))
         self.assertEqual(restored.hvac_mode, HVACMode.DRY)

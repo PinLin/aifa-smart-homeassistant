@@ -17,7 +17,7 @@ import pytest
 from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.aifa_smart import coordinator as coordinator_module
-from custom_components.aifa_smart.api import AifaMacro, AifaMacroCommand, AifaSmartError
+from custom_components.aifa_smart.api import AifaMacro, AifaMacroCommand
 from custom_components.aifa_smart.classic_listener import build_hub_specs
 from custom_components.aifa_smart.coordinator import (
     AifaAccountData,
@@ -384,17 +384,41 @@ class LanConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.exposed_hvac_mode, "fan_only")
         self.assertEqual(state.requested_hvac_mode, "fan_only")
 
-    async def test_no_reply_raises_and_reconnects(self) -> None:
+    async def test_no_reply_raises_and_keeps_the_link(self) -> None:
         await self._connect()
+        # Short enough that the old query watchdog would have fired below.
+        self.manager._query_reply_timeout = 0.2  # noqa: SLF001
         self.hub.silence()
         with self.assertRaises(HomeAssistantError) as ctx:
             await self._apply(hvac_mode="heat")
         self.assertEqual(ctx.exception.translation_key, "hub_no_response")
         self.assertEqual(len(self.hub.commands), 1)
         self.assertEqual(self.hub.queries, 1)
-        self.assertEqual(self.manager.links["7001"].last_error, "command_unconfirmed")
-        await _wait_until(lambda: len(self.hub.connect_ports) == 2)
+        await asyncio.sleep(0.5)
+        self.assertTrue(self.manager.is_connected("7001"))
+        self.assertEqual(len(self.hub.connect_ports), 1)
+        self.assertEqual(self.hub.eof_count, 0)
+        self.assertIsNone(self.manager.links["7001"].last_error)
+        self.assertEqual(self.manager.links["7001"].reconnect_count, 0)
         self.assertFalse(self._state().command_status_pending)
+        self.assertEqual(self.cloud.sent, [])
+
+    async def test_next_command_after_no_reply_goes_out_on_the_same_link(self) -> None:
+        # Like the hub after a fan key in dry mode: deaf to queries for a
+        # while, then the next key is reported as usual.
+        await self._connect()
+        port = self.hub.connect_ports[0]
+        self.hub.silence()
+        with self.assertRaises(HomeAssistantError) as ctx:
+            await self._apply(hvac_mode="heat")
+        self.assertEqual(ctx.exception.translation_key, "hub_no_response")
+        self.hub.push = True
+        self.hub.answer_queries = True
+        await self._apply(hvac_mode="cool")
+        self.assertEqual(len(self.hub.commands), 2)
+        self.assertEqual(self._state().exposed_hvac_mode, "cool")
+        self.assertEqual(self.hub.connect_ports, [port])
+        self.assertEqual(self.hub.eof_count, 0)
         self.assertEqual(self.cloud.sent, [])
 
     async def test_relative_key_is_never_resent(self) -> None:
@@ -623,14 +647,20 @@ class CloudConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._state().exposed_hvac_mode, "fan_only")
         self.assertFalse(self._state().command_status_pending)
 
-    async def test_no_reply_raises_and_drops_the_cloud_socket(self) -> None:
+    async def test_no_reply_raises_and_keeps_the_cloud_socket(self) -> None:
         self.listener.push = False
         self.listener.answer_queries = False
         with self.assertRaises(HomeAssistantError) as ctx:
             await self._apply(hvac_mode="heat")
         self.assertEqual(ctx.exception.translation_key, "hub_no_response")
-        self.assertEqual(self.listener.dropped, ["7001"])
+        self.assertEqual(self.listener.dropped, [])
         self.assertEqual(len(self._commands()), 1)
+        self.listener.push = True
+        self.listener.answer_queries = True
+        await self._apply(hvac_mode="dry")
+        self.assertEqual(len(self._commands()), 2)
+        self.assertEqual(self._state().exposed_hvac_mode, "dry")
+        self.assertEqual(self.listener.dropped, [])
 
     async def test_report_from_no_connection_does_not_confirm(self) -> None:
         """A report not read from the command's connection proves nothing about it."""
@@ -706,8 +736,9 @@ class CloudConfirmationTests(unittest.IsolatedAsyncioTestCase):
             return False
 
         self.listener.async_send_packet = no_socket  # type: ignore[method-assign]
-        with self.assertRaises(AifaSmartError):
+        with self.assertRaises(HomeAssistantError) as ctx:
             await self.coordinator.async_execute_macro("m")
+        self.assertEqual(ctx.exception.translation_key, "cloud_unavailable")
         # The macro stops at the step that did not go out.
         self.assertEqual(self.listener.sent, ["aabb"])
 

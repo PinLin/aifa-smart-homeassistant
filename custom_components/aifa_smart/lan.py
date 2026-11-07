@@ -69,6 +69,11 @@ LAN_STATUS_QUERY_PACKET = "fff3f2f0"
 # takes ~90 s and misses links whose writes are still being buffered.
 LAN_IDLE_QUERY_SECONDS = 60.0
 LAN_QUERY_REPLY_TIMEOUT = 5.0
+# An unanswered idle query does not condemn a link that carried bytes this
+# recently, since the hub can ignore queries for 8 s or more. With the
+# defaults the idle query only goes out after 60 s of silence, so this only
+# matters if the idle and reply times ever add up to less than it.
+LAN_RECENT_RX_SECONDS = 30.0
 # The hub drops whatever arrives in the first moments of a connection; the
 # AIFA app reports the link connected, and starts writing, 0.5 s in.
 LAN_CONNECT_WRITE_DELAY = 0.5
@@ -153,9 +158,51 @@ class LanSendResult(StrEnum):
     WRITE_FAILED = "write_failed"
 
 
-class _DatagramSender(asyncio.DatagramProtocol):
+# A broadcast the OS refuses, e.g. ENOKEY on a VPN interface, fails again on
+# every connect attempt, so each address and errno is logged once.
+_reported_send_errors: set[tuple[str, int | None]] = set()
+
+
+class _TargetedSender(asyncio.DatagramProtocol):
+    """Ties an immediate sendto error to the address it was sent to."""
+
+    def __init__(self) -> None:
+        self.target: str | None = None
+        self.failed: set[str] = set()
+
     def error_received(self, exc: Exception) -> None:
-        _LOGGER.debug("AIFA LAN broadcast error: %s", exc)
+        if self.target is None:
+            _LOGGER.debug("AIFA LAN broadcast error: %s", exc)
+            return
+        self.failed.add(self.target)
+        key = (self.target, getattr(exc, "errno", None))
+        if key in _reported_send_errors:
+            return
+        _reported_send_errors.add(key)
+        _LOGGER.debug(
+            "AIFA LAN broadcast to %s failed: %s; skipping it for this attempt",
+            self.target,
+            exc,
+        )
+
+
+def _send_to_each(
+    transport: asyncio.DatagramTransport,
+    sender: _TargetedSender,
+    packet: bytes,
+    targets: Iterable[str],
+    port: int,
+) -> None:
+    for address in targets:
+        if address in sender.failed:
+            continue
+        # The selector transport reports an immediate failure from inside
+        # sendto, which is the only point where the address is known.
+        sender.target = address
+        try:
+            transport.sendto(packet, (address, port))
+        finally:
+            sender.target = None
 
 
 async def async_request_lan_connection(
@@ -194,14 +241,15 @@ async def async_request_lan_connection(
 
     server: asyncio.Server | None = None
     transport: asyncio.DatagramTransport | None = None
+    sender: _TargetedSender | None = None
     returned = False
     try:
         for _ in range(max(1, port_retries)):
             server = await asyncio.start_server(on_connect, host=bind_host, port=0)
             port = server.sockets[0].getsockname()[1]
             try:
-                transport, _protocol = await loop.create_datagram_endpoint(
-                    _DatagramSender,
+                transport, sender = await loop.create_datagram_endpoint(
+                    _TargetedSender,
                     local_addr=(bind_host, port),
                     allow_broadcast=True,
                 )
@@ -212,12 +260,11 @@ async def async_request_lan_connection(
                 _LOGGER.debug("AIFA LAN UDP port %s busy, picking another", port)
                 server.close()
                 server = None
-        if server is None or transport is None:
+        if server is None or transport is None or sender is None:
             raise LanConnectTimeout("No free TCP/UDP port pair for the LAN request")
 
         for _ in range(max(1, attempts)):
-            for address in targets:
-                transport.sendto(packet, (address, target_port))
+            _send_to_each(transport, sender, packet, targets, target_port)
             try:
                 reader, writer = await asyncio.wait_for(
                     asyncio.shield(accepted), timeout=interval
@@ -241,17 +288,15 @@ async def async_request_lan_connection(
             accepted.cancel()
 
 
-class _SearchProtocol(asyncio.DatagramProtocol):
+class _SearchProtocol(_TargetedSender):
     def __init__(self) -> None:
+        super().__init__()
         self.replies: dict[str, str] = {}
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         mac = parse_search_reply(data)
         if mac is not None:
             self.replies[mac] = addr[0]
-
-    def error_received(self, exc: Exception) -> None:
-        _LOGGER.debug("AIFA LAN search error: %s", exc)
 
 
 async def async_search_hubs(
@@ -274,8 +319,7 @@ async def async_search_hubs(
         )
     try:
         packet = build_search_packet()
-        for address in broadcast_addrs:
-            transport.sendto(packet, (address, target_port))
+        _send_to_each(transport, protocol, packet, broadcast_addrs, target_port)
         await asyncio.sleep(timeout)
         return dict(protocol.replies)
     finally:
@@ -350,6 +394,7 @@ class LanTransportManager:
         search_timeout: float = _SEARCH_TIMEOUT,
         idle_query_after: float = LAN_IDLE_QUERY_SECONDS,
         query_reply_timeout: float = LAN_QUERY_REPLY_TIMEOUT,
+        recent_rx_window: float = LAN_RECENT_RX_SECONDS,
         on_link_state_changed: Callable[[], None] | None = None,
         unavailable_grace: float = LAN_UNAVAILABLE_GRACE_SECONDS,
         connect_write_delay: float = LAN_CONNECT_WRITE_DELAY,
@@ -369,6 +414,7 @@ class LanTransportManager:
         self._search_timeout = search_timeout
         self._idle_query_after = idle_query_after
         self._query_reply_timeout = query_reply_timeout
+        self._recent_rx_window = recent_rx_window
         self._on_link_state_changed = on_link_state_changed
         self._unavailable_grace = unavailable_grace
         self._connect_write_delay = connect_write_delay
@@ -477,48 +523,25 @@ class LanTransportManager:
                 await writer.drain()
             except (OSError, RuntimeError) as err:
                 link.last_error = f"write_failed: {err!r}"
+                # Closing ends the read loop, which reconnects; a socket that
+                # failed a write is not trusted with the next one.
+                writer.close()
                 return LanSendResult.WRITE_FAILED
         link.last_tx_at = dt_util.utcnow()
         return LanSendResult.SENT
 
     async def async_request_status(self, device_id: str) -> bool:
-        """Ask a connected hub to push its AC status; replies arrive as packets."""
-        link = self._links.get(device_id)
-        if link is None or link.writer is None or link.writer.is_closing():
-            return False
-        writer = link.writer
-        sent_at = await self._async_write_query(link, writer)
-        if sent_at is None:
-            return False
-        # A half-open link still accepts writes, so a query that draws no
-        # bytes at all closes the link instead of waiting for the idle check.
-        asyncio.get_running_loop().call_later(
-            self._query_reply_timeout, self._check_query_reply, link, writer, sent_at
-        )
-        return True
+        """Ask a connected hub to push its AC status; replies arrive as packets.
 
-    def _check_query_reply(
-        self, link: LanHubLink, writer: asyncio.StreamWriter, sent_at: float
-    ) -> None:
-        if link.writer is not writer or writer.is_closing():
-            return
-        if link.last_rx_monotonic is not None and link.last_rx_monotonic >= sent_at:
-            return
-        link.last_error = "query_timeout"
-        _LOGGER.debug("AIFA LAN link %s did not answer a status query", link.device_id)
-        writer.close()
-
-    def drop_connection(self, device_id: str, reason: str) -> None:
-        """Abort the current link so the link loop reconnects after its backoff.
-
-        Abort rather than close: a half-open peer never acknowledges, and a
-        graceful close could keep the dead link registered while it drains.
+        An unanswered query leaves the link up: the hub ignores queries for
+        a while after some keys, and a half-open link is caught by
+        TCP_USER_TIMEOUT on the unacknowledged write (Linux only) or by the
+        idle check.
         """
         link = self._links.get(device_id)
         if link is None or link.writer is None or link.writer.is_closing():
-            return
-        link.last_error = reason
-        link.writer.transport.abort()
+            return False
+        return await self._async_write_query(link, link.writer) is not None
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
         """Diagnostics-friendly view of every link."""
@@ -753,7 +776,9 @@ class LanTransportManager:
         buffers = ClassicStreamBuffers()
         spec = link.spec
         loop = asyncio.get_running_loop()
-        last_rx = loop.time()
+        idle_from = loop.time()
+        # Bytes from an earlier connection say nothing about this one.
+        heard_at: float | None = None
         query_sent_at: float | None = None
 
         async def reply_wake() -> None:
@@ -773,7 +798,7 @@ class LanTransportManager:
 
         while self._links.get(spec.device_id) is link:
             if query_sent_at is None:
-                deadline = last_rx + self._idle_query_after
+                deadline = idle_from + self._idle_query_after
             else:
                 deadline = query_sent_at + self._query_reply_timeout
             try:
@@ -782,6 +807,13 @@ class LanTransportManager:
                 )
             except asyncio.TimeoutError:
                 if query_sent_at is not None:
+                    now = loop.time()
+                    if heard_at is not None and now - heard_at < self._recent_rx_window:
+                        # Ask again later; heard_at only moves on new bytes,
+                        # so a silent link still drops once it ages out.
+                        query_sent_at = None
+                        idle_from = now
+                        continue
                     link.last_error = "idle_timeout"
                     _LOGGER.debug(
                         "AIFA LAN link %s did not answer a status query; reconnecting",
@@ -794,7 +826,7 @@ class LanTransportManager:
                 continue
             if not chunk:
                 return
-            last_rx = loop.time()
+            heard_at = idle_from = loop.time()
             query_sent_at = None
             link.last_rx_at = dt_util.utcnow()
             link.last_rx_monotonic = time.monotonic()

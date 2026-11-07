@@ -7,6 +7,8 @@ import unittest
 import unittest.mock
 from dataclasses import replace
 
+from homeassistant.exceptions import HomeAssistantError
+
 from custom_components.aifa_smart.api import AifaClassicSensorState, AifaDevice
 from custom_components.aifa_smart.ac import AifaAcStatus
 from custom_components.aifa_smart.coordinator import AifaSmartCoordinator
@@ -223,14 +225,15 @@ class CoordinatorTlsDispatchTests(unittest.TestCase):
 
     def test_dispatch_raises_when_no_classic_socket(self) -> None:
         """Without an active TLS writer, dispatch must surface the failure."""
-        from custom_components.aifa_smart.api import AifaFunctionCommand, AifaSmartError
+        from custom_components.aifa_smart.api import AifaFunctionCommand
 
         coordinator = self._make_coordinator(classic_send_results=False)
         commands = [
             AifaFunctionCommand(id="1", device_id="d1", sub_device_id=None, command="ffa0a2f0"),
         ]
-        with self.assertRaises(AifaSmartError):
+        with self.assertRaises(HomeAssistantError) as raised:
             asyncio.run(_send_all(coordinator, commands))
+        self.assertEqual(raised.exception.translation_key, "cloud_unavailable")
 
         # The send was attempted before raising
         self.assertEqual(coordinator._tls_sent, [("d1", "ffa0a2f0")])
@@ -263,7 +266,7 @@ class CoordinatorTlsDispatchTests(unittest.TestCase):
 
     def test_dispatch_raises_on_first_no_tls_in_a_batch(self) -> None:
         """In a multi-device batch, the first device without TLS aborts the whole batch."""
-        from custom_components.aifa_smart.api import AifaFunctionCommand, AifaSmartError
+        from custom_components.aifa_smart.api import AifaFunctionCommand
 
         coordinator = self._make_coordinator(
             classic_send_results={"d1": True, "d2": False}
@@ -273,7 +276,7 @@ class CoordinatorTlsDispatchTests(unittest.TestCase):
             AifaFunctionCommand(id="2", device_id="d2", sub_device_id="s2", command="bbbb"),
             AifaFunctionCommand(id="3", device_id="d1", sub_device_id="s1", command="cccc"),
         ]
-        with self.assertRaises(AifaSmartError):
+        with self.assertRaises(HomeAssistantError):
             asyncio.run(_send_all(coordinator, commands))
 
         # d1 sent (ok), d2 attempted (failed) — third command never reached
@@ -290,7 +293,7 @@ class CoordinatorTlsDispatchTests(unittest.TestCase):
         self.assertEqual(coordinator._tls_sent, [])
 
     def test_dispatch_propagates_oserror_from_tls_write(self) -> None:
-        """A TLS write that raises OSError propagates to the caller."""
+        """A TLS write that raises OSError surfaces as a translated error."""
         from custom_components.aifa_smart.api import AifaFunctionCommand
 
         coordinator = self._make_coordinator()
@@ -303,8 +306,10 @@ class CoordinatorTlsDispatchTests(unittest.TestCase):
         commands = [
             AifaFunctionCommand(id="1", device_id="d1", sub_device_id=None, command="ffa0a1f0"),
         ]
-        with self.assertRaises(OSError):
+        with self.assertRaises(HomeAssistantError) as raised:
             asyncio.run(_send_all(coordinator, commands))
+        self.assertEqual(raised.exception.translation_key, "cloud_write_failed")
+        self.assertIsInstance(raised.exception.__cause__, OSError)
 
 
 class _AcApplyHarness:
@@ -564,8 +569,10 @@ class CoordinatorAppStatusPacketTests(_AcApplyHarness, unittest.TestCase):
         state.requested_hvac_mode = "off"
         probes: list[str | None] = []
 
-        async def send_without_report(command, confirmation):
+        async def send_without_report(command, confirmation, *, on_written=None):
             coordinator._events.append(command.command)  # noqa: SLF001
+            if on_written is not None:
+                on_written()
             return "lan", None
 
         coordinator._async_send_confirmed = send_without_report  # type: ignore[attr-defined]
@@ -590,8 +597,10 @@ class CoordinatorAppStatusPacketTests(_AcApplyHarness, unittest.TestCase):
         state.apply_observed_status(_report_status("off", None))
         on_report = _report_status("cool", 25, fan_mode="high", swing_mode="fixed_4")
 
-        async def send(command, confirmation):
+        async def send(command, confirmation, *, on_written=None):
             coordinator._events.append(command.command)  # noqa: SLF001
+            if on_written is not None:
+                on_written()
             if command.command == "ffa0a1f0":
                 state.apply_observed_status(on_report)
                 return "lan", on_report

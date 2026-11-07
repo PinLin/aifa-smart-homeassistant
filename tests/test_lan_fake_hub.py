@@ -468,6 +468,9 @@ class CoordinatorOverFakeHubTests(unittest.IsolatedAsyncioTestCase):
 
 
 class _BrokenWriter:
+    def __init__(self) -> None:
+        self.closed = False
+
     def write(self, data: bytes) -> None:
         return None
 
@@ -475,10 +478,10 @@ class _BrokenWriter:
         raise ConnectionResetError("peer reset")
 
     def is_closing(self) -> bool:
-        return False
+        return self.closed
 
     def close(self) -> None:
-        return None
+        self.closed = True
 
 
 class LanManagerUnitTests(unittest.IsolatedAsyncioTestCase):
@@ -495,11 +498,14 @@ class LanManagerUnitTests(unittest.IsolatedAsyncioTestCase):
         manager = self._manager()
         spec = lan.build_hub_specs({"7001": _device()}, require_online=False)["7001"]
         link = lan.LanHubLink(spec=spec)
-        link.writer = _BrokenWriter()  # type: ignore[assignment]
+        writer = _BrokenWriter()
+        link.writer = writer  # type: ignore[assignment]
         manager.links["7001"] = link
         result = await manager.async_send_packet("7001", "ffa016f0", connect_timeout=0.1)
         self.assertIs(result, LanSendResult.WRITE_FAILED)
         self.assertIn("write_failed", link.last_error or "")
+        # Closed so the read loop ends and the link reconnects.
+        self.assertTrue(writer.closed)
 
     async def test_backoff_schedule(self) -> None:
         manager = self._manager()

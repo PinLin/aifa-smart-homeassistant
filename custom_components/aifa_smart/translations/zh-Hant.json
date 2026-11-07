@@ -181,8 +181,14 @@
     "no_transport": {
       "message": "區網和雲端都連不到 AIFA 主機 {device_id}，指令沒有送出。"
     },
+    "cloud_unavailable": {
+      "message": "AIFA 主機 {device_id} 目前沒有雲端連線，指令沒有送出。"
+    },
+    "cloud_write_failed": {
+      "message": "經由雲端傳送到 AIFA 主機 {device_id} 時中途失敗，指令可能已經送到冷氣，所以不會重送。"
+    },
     "hub_no_response": {
-      "message": "AIFA 主機 {device_id} 在指令送出後沒有回報任何狀態，指令可能沒有送達。已重設連線，請再試一次。"
+      "message": "AIFA 主機 {device_id} 在指令送出後沒有回報任何狀態。指令可能沒有送達，也可能是主機暫時不回應狀態查詢；請先確認冷氣狀態再重試。"
     },
     "ac_state_mismatch": {
       "message": "指令送出後，AIFA 主機 {device_id} 回報的冷氣狀態是 {reported}，與預期的 {expected} 不符。和 i-Ctrl Pro App 一樣，指令不會重送。"
@@ -193,6 +199,9 @@
     "ac_fan_speed_unchanged": {
       "message": "送出風速鍵後，AIFA 主機 {device_id} 回報的風速沒有改變。風速鍵每按一次會切到下一段，所以沒有重送。"
     },
+    "ac_power_on_not_reported": {
+      "message": "送出開機鍵後，AIFA 主機 {device_id} 仍回報冷氣關機，開機鍵沒有生效。和 i-Ctrl Pro App 一樣，開機鍵不會重送。"
+    },
     "ac_mode_not_offered": {
       "message": "i-Ctrl Pro 沒有提供這台冷氣的 {mode} 模式鍵。"
     },
@@ -201,6 +210,9 @@
     },
     "ac_anti_mold_mode_unsupported": {
       "message": "智慧防霉不支援冷氣目前的模式，與 i-Ctrl Pro 相同。"
+    },
+    "ac_state_unknown": {
+      "message": "AIFA 主機 {device_id} 重新啟動後還沒有回報冷氣狀態，這個設定會改掉冷氣目前的風速與風向，所以沒有送出。請稍後再試一次。"
     }
   }
 }

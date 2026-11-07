@@ -51,6 +51,8 @@ def test_delays_follow_the_app() -> None:
     assert queue_delay(_QUERY) == QUERY_QUEUE_DELAY
     assert queue_delay(_STATUS_15) == QUERY_QUEUE_DELAY
     assert queue_delay(bytes.fromhex("fff5a00033f0")) == QUERY_QUEUE_DELAY
+    # Anti mold's 6-byte packet is not in the app's delay table; wait like a key.
+    assert queue_delay(bytes.fromhex("a1faac0000f0")) == KEY_QUEUE_DELAY
     # Macro steps carry learned IR codes; they wait like a key.
     assert queue_delay(bytes.fromhex("aabbccddeeff00")) == KEY_QUEUE_DELAY
 

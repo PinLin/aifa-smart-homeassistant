@@ -10,11 +10,16 @@ from homeassistant.components.climate.const import (
     ClimateEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
-from homeassistant.core import HomeAssistant
+from homeassistant.const import (
+    ATTR_TEMPERATURE,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+    UnitOfTemperature,
+)
+from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 
 from .ac import (
     AIFA_AC_MAX_TEMP,
@@ -28,6 +33,7 @@ from .ac import (
 from .const import DOMAIN
 from .coordinator import AifaSmartCoordinator
 from .entity import AifaSubDeviceEntity
+from .runtime import AifaAcRestoreData
 
 _ATTR_HVAC_MODE = "hvac_mode"
 _ATTR_LAST_ACTIVE_HVAC_MODE = "aifa_last_active_hvac_mode"
@@ -90,6 +96,28 @@ async def async_setup_entry(
                 entities.append(AifaAirConditionerClimate(coordinator, device.id, sub_device.id))
 
     async_add_entities(entities)
+
+
+def _restore_data_from_attributes(last_state: State | None) -> AifaAcRestoreData | None:
+    """Read a state saved by a version without extra restore data.
+
+    Those attributes are only there when the entity was available.
+    """
+    if last_state is None or last_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+        return None
+    attributes = last_state.attributes
+    try:
+        target = attributes.get(_ATTR_REQUESTED_TARGET_TEMPERATURE)
+        target = None if target is None else int(float(target))
+    except (TypeError, ValueError):
+        target = None
+    last_active = attributes.get(_ATTR_LAST_ACTIVE_HVAC_MODE)
+    return AifaAcRestoreData(
+        hvac_mode=last_state.state,
+        power_off_held=attributes.get(_ATTR_POWER_OFF_HELD) is True,
+        last_active_hvac_mode=last_active if isinstance(last_active, str) else None,
+        target_temperature=target,
+    )
 
 
 class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntity):
@@ -234,29 +262,21 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
         )
         return attributes
 
+    @property
+    def extra_restore_state_data(self) -> ExtraStoredData:
+        """Stored even while unavailable, unlike the state attributes."""
+        return AifaAcRestoreData.from_runtime(self.runtime)
+
     async def async_added_to_hass(self) -> None:
-        """Restore the last requested state on restart."""
+        """Show what the AC showed before the restart until the hub reports."""
         await super().async_added_to_hass()
 
-        last_state = await self.async_get_last_state()
-        if last_state is None:
-            return
-
-        runtime = self.runtime
-        supported_mode_values = {mode.value for mode in self._attr_hvac_modes}
-
-        requested_target = last_state.attributes.get(_ATTR_REQUESTED_TARGET_TEMPERATURE)
-        if requested_target is not None:
-            runtime.requested_target_temperature = int(float(requested_target))
-
-        # The hub still reports the mode it had before the power off, so the
-        # first report after a restart must not turn the AC back on.
-        if last_state.attributes.get(_ATTR_POWER_OFF_HELD) is True:
-            runtime.hold_power_off(None)
-
-        restored_last_active = last_state.attributes.get(_ATTR_LAST_ACTIVE_HVAC_MODE)
-        if restored_last_active in supported_mode_values and restored_last_active != HVACMode.OFF.value:
-            runtime.last_active_hvac_mode = restored_last_active
+        extra = await self.async_get_last_extra_data()
+        data = None if extra is None else AifaAcRestoreData.from_dict(extra.as_dict())
+        if data is None:
+            data = _restore_data_from_attributes(await self.async_get_last_state())
+        if data is not None:
+            self.runtime.restore(data)
 
     async def async_turn_on(self) -> None:
         """Send the power key only, like the app's On button."""

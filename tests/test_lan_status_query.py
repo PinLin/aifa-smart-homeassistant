@@ -19,6 +19,7 @@ from custom_components.aifa_smart.coordinator import (
 )
 from custom_components.aifa_smart.lan import (
     LAN_IDLE_QUERY_SECONDS,
+    LAN_RECENT_RX_SECONDS,
     LAN_STATUS_QUERY_PACKET,
     LanTransportManager,
 )
@@ -147,6 +148,58 @@ class LanStatusQueryTests(unittest.IsolatedAsyncioTestCase):
         await _wait_until(lambda: manager.is_connected("7001"))
         self.assertEqual(manager.links["7001"].reconnect_count, 1)
 
+    async def test_unanswered_idle_query_waits_while_the_hub_still_sends(self) -> None:
+        self.hub.answer_queries = False
+        manager = await self._connect(idle_query_after=0.2, query_reply_timeout=0.2)
+        await self.hub.push(bytes.fromhex("f1aaa0f0"))
+        # A second query proves the first miss was put off, not fatal.
+        await _wait_until(lambda: self.hub.queries >= 2)
+        self.assertTrue(manager.is_connected("7001"))
+        self.assertEqual(len(self.hub.connect_ports), 1)
+        self.assertEqual(self.hub.eof_count, 0)
+        self.assertIsNone(manager.links["7001"].last_error)
+
+    async def test_unanswered_idle_query_drops_once_the_last_bytes_age_out(self) -> None:
+        self.hub.answer_queries = False
+        manager = await self._connect(
+            idle_query_after=0.2, query_reply_timeout=0.2, recent_rx_window=1.0
+        )
+        await self.hub.push(bytes.fromhex("f1aaa0f0"))
+        await _wait_until(lambda: self.hub.eof_count >= 1)
+        self.assertEqual(manager.links["7001"].last_error, "idle_timeout")
+        # Put off once while the push was recent, then dropped.
+        self.assertGreaterEqual(self.hub.queries, 2)
+        self.hub.answer_queries = True
+        await _wait_until(lambda: len(self.hub.connect_ports) == 2)
+
+    async def test_default_ratios_never_put_off_an_unanswered_idle_query(self) -> None:
+        # 60 / 5 / 30 scaled down: the query only goes out after the window
+        # has passed, so a byte before it cannot hold the link up.
+        scale = 100.0
+        self.hub.answer_queries = False
+        manager = await self._connect(
+            idle_query_after=LAN_IDLE_QUERY_SECONDS / scale,
+            query_reply_timeout=5.0 / scale,
+            recent_rx_window=LAN_RECENT_RX_SECONDS / scale,
+            connect_write_delay=0.0,
+        )
+        await self.hub.push(bytes.fromhex("f1aaa0f0"))
+        await _wait_until(lambda: self.hub.eof_count >= 1)
+        self.assertEqual(self.hub.queries, 1)
+        self.assertEqual(manager.links["7001"].last_error, "idle_timeout")
+
+    async def test_link_with_no_bytes_at_all_drops_without_waiting(self) -> None:
+        self.hub.answer_queries = False
+        manager = await self._connect(
+            idle_query_after=0.2, query_reply_timeout=0.2, recent_rx_window=30.0
+        )
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await _wait_until(lambda: self.hub.eof_count >= 1)
+        self.assertLess(loop.time() - started, 5.0)
+        self.assertEqual(self.hub.queries, 1)
+        self.assertEqual(manager.links["7001"].last_error, "idle_timeout")
+
     async def test_any_inbound_byte_resets_the_idle_timer(self) -> None:
         self.hub.answer_queries = False
         manager = await self._connect(idle_query_after=0.4, query_reply_timeout=0.2)
@@ -159,6 +212,7 @@ class LanStatusQueryTests(unittest.IsolatedAsyncioTestCase):
 
 def test_defaults_match_the_hub_protocol() -> None:
     assert LAN_IDLE_QUERY_SECONDS == 60.0
+    assert LAN_RECENT_RX_SECONDS == 30.0
     assert LAN_STATUS_QUERY_PACKET == "fff3f2f0"
 
 

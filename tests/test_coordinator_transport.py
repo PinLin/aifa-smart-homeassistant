@@ -6,11 +6,12 @@ import json
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.update_coordinator import TimestampDataUpdateCoordinator
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.aifa_smart import coordinator as coordinator_module
@@ -255,7 +256,12 @@ class LanManagerLifecycleTests(unittest.TestCase):
         coordinator, lan, _ = _make_coordinator(TRANSPORT_LAN)
         coordinator.async_sync_background_tasks()
         self.assertEqual(lan.synced, [{}])
-        asyncio.run(coordinator.async_shutdown())
+        # Built without __init__, so the base class has nothing to stop.
+        with patch.object(
+            TimestampDataUpdateCoordinator, "async_shutdown", AsyncMock()
+        ) as base_shutdown:
+            asyncio.run(coordinator.async_shutdown())
+        base_shutdown.assert_awaited_once()
         self.assertEqual(lan.shutdown_calls, 1)
 
 

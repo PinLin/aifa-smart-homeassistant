@@ -132,12 +132,15 @@ class ProbeQueryWatchdogTests(unittest.IsolatedAsyncioTestCase):
         await self.manager.shutdown()
         await self.hub.stop()
 
-    async def test_unanswered_probe_query_closes_the_link(self) -> None:
+    async def test_unanswered_probe_query_keeps_the_link(self) -> None:
         self.hub.answer_queries = False
         self.assertTrue(await self.manager.async_request_status("7001"))
-        await _wait_until(lambda: self.hub.eof_count >= 1)
-        self.assertEqual(self.manager.links["7001"].last_error, "query_timeout")
-        await _wait_until(lambda: len(self.hub.connect_ports) == 2)
+        await _wait_until(lambda: self.hub.queries == 1)
+        await asyncio.sleep(0.6)
+        self.assertTrue(self.manager.is_connected("7001"))
+        self.assertEqual(self.hub.eof_count, 0)
+        self.assertEqual(len(self.hub.connect_ports), 1)
+        self.assertIsNone(self.manager.links["7001"].last_error)
 
     async def test_answered_probe_query_keeps_the_link(self) -> None:
         self.assertTrue(await self.manager.async_request_status("7001"))

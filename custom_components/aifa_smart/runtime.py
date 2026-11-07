@@ -1,14 +1,20 @@
 """Runtime state helpers for AIFA Smart entities."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from typing import Any
+
+from homeassistant.helpers.restore_state import ExtraStoredData
 
 from .ac import (
     AIFA_AC_DEFAULT_TARGET_TEMP,
+    FAN_SPEED_OPTIONS,
     AifaAcStatus,
     clamp_target_temperature,
+    get_ac_capabilities,
     get_default_mode,
+    normalize_ac_mode,
+    normalize_catalog_mode,
 )
 
 
@@ -34,6 +40,69 @@ def _same_report(left: AifaAcStatus, right: AifaAcStatus) -> bool:
     )
 
 
+def _restorable_modes(device_code: str | None) -> set[str]:
+    modes = get_ac_capabilities(device_code).available_modes
+    return {normalize_ac_mode(mode) for mode in modes} | {
+        normalize_catalog_mode(mode) for mode in modes
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class AifaAcRestoreData(ExtraStoredData):
+    """What an AC showed before a restart, kept by HA even while unavailable.
+
+    The climate entity and the fan speed sensor both store it, so whichever
+    is added first restores the shared runtime state.
+    """
+
+    hvac_mode: str | None = None
+    power_off_held: bool = False
+    last_active_hvac_mode: str | None = None
+    target_temperature: int | None = None
+    fan_mode: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "hvac_mode": self.hvac_mode,
+            "power_off_held": self.power_off_held,
+            "last_active_hvac_mode": self.last_active_hvac_mode,
+            "target_temperature": self.target_temperature,
+            "fan_mode": self.fan_mode,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AifaAcRestoreData | None:
+        if not isinstance(data, dict) or "hvac_mode" not in data:
+            return None
+
+        def text(key: str) -> str | None:
+            value = data.get(key)
+            return value if isinstance(value, str) else None
+
+        temperature = data.get("target_temperature")
+        try:
+            target = None if temperature is None else int(float(temperature))
+        except (TypeError, ValueError):
+            target = None
+        return cls(
+            hvac_mode=text("hvac_mode"),
+            power_off_held=data.get("power_off_held") is True,
+            last_active_hvac_mode=text("last_active_hvac_mode"),
+            target_temperature=target,
+            fan_mode=text("fan_mode"),
+        )
+
+    @classmethod
+    def from_runtime(cls, state: AifaAcRuntimeState) -> AifaAcRestoreData:
+        return cls(
+            hvac_mode=state.exposed_hvac_mode,
+            power_off_held=state.power_off_held,
+            last_active_hvac_mode=state.last_active_hvac_mode,
+            target_temperature=state.exposed_target_temperature,
+            fan_mode=state.last_reported_fan_mode,
+        )
+
+
 @dataclass(slots=True)
 class AifaAcRuntimeState:
     """Shared requested and observed state for a single AC sub-device."""
@@ -57,6 +126,11 @@ class AifaAcRuntimeState:
     # Without a report yet, the next one becomes power_off_report.
     power_off_held: bool = False
     power_off_report: AifaAcStatus | None = None
+    # Shown until the hub's first report or a command, so a restart does not
+    # turn a running AC off and back on in HA. Like i-Ctrl Pro, a fresh
+    # install with nothing to restore shows Off.
+    restored_hvac_mode: str | None = None
+    restored: bool = False
 
     @classmethod
     def create(cls, device_code: str | None) -> AifaAcRuntimeState:
@@ -113,6 +187,7 @@ class AifaAcRuntimeState:
 
     def apply_sent_command_status(self, status: AifaAcStatus) -> None:
         """Record the command-derived AC state after a local send."""
+        self.restored_hvac_mode = None
         preserve_observed_main_state = (
             self.observed_status is not None and self._main_fields_match(self.observed_status, status)
         )
@@ -147,12 +222,36 @@ class AifaAcRuntimeState:
         self.power_off_held = False
         self.power_off_report = None
 
+    def restore(self, data: AifaAcRestoreData) -> None:
+        """Take what the AC showed before the restart; only the first call counts."""
+        if self.restored:
+            return
+        self.restored = True
+        modes = _restorable_modes(self.device_code)
+        if data.target_temperature is not None:
+            self.requested_target_temperature = clamp_target_temperature(
+                data.target_temperature, device_code=self.device_code
+            )
+        if data.last_active_hvac_mode in modes:
+            self.last_active_hvac_mode = data.last_active_hvac_mode
+        if data.fan_mode in FAN_SPEED_OPTIONS and self.last_reported_fan_mode is None:
+            self.last_reported_fan_mode = data.fan_mode
+        if data.power_off_held:
+            # The hub still reports the mode it had before the power off, so
+            # the first report after a restart must not turn the AC back on.
+            # A report that already arrived is that stale report.
+            self.hold_power_off(self.observed_status)
+        elif data.hvac_mode in modes:
+            self.restored_hvac_mode = data.hvac_mode
+            self.state_source = "restored"
+
     def clear_pending_command_status(self) -> None:
         """Stop preferring the command-derived state over observed socket state."""
         self.command_status_pending = False
 
     def apply_observed_status(self, observed: AifaAcStatus) -> None:
         """Merge a newly observed AIFA socket state into the runtime model."""
+        self.restored_hvac_mode = None
         if observed.reported_fan_mode is not None:
             self.last_reported_fan_mode = observed.reported_fan_mode
         if self.power_off_held:
@@ -238,9 +337,7 @@ class AifaAcRuntimeState:
             return self.observed_status.mode
         if self.command_status is not None:
             return self.command_status.mode
-        # A requested mode restored from before a restart is not a report;
-        # like i-Ctrl Pro, show Off until the hub sends one.
-        return "off"
+        return self.restored_hvac_mode or "off"
 
     @property
     def exposed_target_temperature(self) -> int:

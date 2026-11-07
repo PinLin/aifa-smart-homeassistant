@@ -181,8 +181,14 @@
     "no_transport": {
       "message": "AIFA hub {device_id} is unreachable on both the local network and the cloud. The command was not sent."
     },
+    "cloud_unavailable": {
+      "message": "AIFA hub {device_id} has no cloud connection right now. The command was not sent."
+    },
+    "cloud_write_failed": {
+      "message": "Sending to AIFA hub {device_id} over the cloud failed partway. The command may or may not have reached the air conditioner, so it was not retried."
+    },
     "hub_no_response": {
-      "message": "AIFA hub {device_id} did not report any status after the command, so it may not have been received. The connection was reset; try again."
+      "message": "AIFA hub {device_id} did not report any status after the command. The command may not have been received, or the hub may be ignoring status queries for a moment; check the air conditioner before trying again."
     },
     "ac_state_mismatch": {
       "message": "AIFA hub {device_id} reports the air conditioner as {reported} instead of {expected} after the command. Like the i-Ctrl Pro app, the command was not resent."
@@ -193,6 +199,9 @@
     "ac_fan_speed_unchanged": {
       "message": "AIFA hub {device_id} still reports the same fan speed after the speed key. The key was not resent, because each press steps to the next speed."
     },
+    "ac_power_on_not_reported": {
+      "message": "AIFA hub {device_id} still reports the air conditioner as off after the power key, so the key did not take. Like the i-Ctrl Pro app, the power key was not resent."
+    },
     "ac_mode_not_offered": {
       "message": "i-Ctrl Pro has no {mode} button for this air conditioner."
     },
@@ -201,6 +210,9 @@
     },
     "ac_anti_mold_mode_unsupported": {
       "message": "Anti mold does not support the current mode of this air conditioner, the same as in i-Ctrl Pro."
+    },
+    "ac_state_unknown": {
+      "message": "AIFA hub {device_id} has not reported the air conditioner's state since the restart. Sending this setting would reset the fan speed and swing, so it was not sent; try again shortly."
     }
   }
 }

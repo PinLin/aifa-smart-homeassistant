@@ -71,12 +71,17 @@ _MIN_HEALTHY_SECONDS = 10.0
 # SetCode. A hub answering a query can drop a key arriving with it.
 KEY_QUEUE_DELAY = 0.6
 QUERY_QUEUE_DELAY = 0.3
-_QUERY_LIKE_LENGTHS = frozenset({6, 15})
+_STATUS_PACKET_LENGTH = 15
+_SET_CODE_PREFIX = b"\xff\xf5"
 
 
 def queue_delay(packet: bytes) -> float:
     """How long the next write waits after `packet`; other codes wait like a key."""
-    if packet == bytes.fromhex(CLASSIC_AC_QUERY_PACKET) or len(packet) in _QUERY_LIKE_LENGTHS:
+    if (
+        packet == bytes.fromhex(CLASSIC_AC_QUERY_PACKET)
+        or len(packet) == _STATUS_PACKET_LENGTH
+        or (len(packet) == 6 and packet.startswith(_SET_CODE_PREFIX))
+    ):
         return QUERY_QUEUE_DELAY
     return KEY_QUEUE_DELAY
 
@@ -175,7 +180,8 @@ async def process_classic_stream_chunk(
     """Parse one chunk of the hub byte stream shared by the cloud and LAN links.
 
     Mutates `buffers` in place and returns True when any callback reported a
-    state change.
+    state change. A SetCode echo has the notify frame's shape; one that
+    `on_set_code_ack` claims as the answer to our own SetCode is not a notify.
     """
     buffers.status += chunk
     buffers.wake += chunk
@@ -256,6 +262,7 @@ class ClassicSocketManager:
         self._socket_writers: dict[str, asyncio.StreamWriter] = {}
         self._socket_write_locks: dict[str, asyncio.Lock] = {}
         self._socket_writable_at: dict[str, float] = {}
+        self._closed = False
 
     # ----- Public API -----
 
@@ -328,19 +335,11 @@ class ClassicSocketManager:
             if delay > 0:
                 await asyncio.sleep(delay)
 
-    def drop_connection(self, device_id: str) -> None:
-        """Abort the long-lived socket of a hub so the listener reconnects.
-
-        TCP keepalive notices a half-open socket only after a few minutes;
-        a command that drew no reply is reason enough to reconnect now.
-        """
-        writer = self._socket_writers.pop(device_id, None)
-        self._socket_write_locks.pop(device_id, None)
-        if writer is not None and not writer.is_closing():
-            writer.transport.abort()
-
     def sync_specs(self, devices: dict[str, AifaDevice]) -> None:
         """Refresh the desired set of hubs that keep a classic socket open."""
+        if self._closed:
+            # A refresh still in flight during unload must not reopen sockets.
+            return
         previous_specs = self._specs
         self._specs = self._build_specs(devices)
         for device_id, previous in previous_specs.items():
@@ -354,6 +353,7 @@ class ClassicSocketManager:
 
     async def shutdown(self) -> None:
         """Cancel the startup hook and every listener task."""
+        self._closed = True
         self._stop_listeners()
         self._specs.clear()
         tasks = [
@@ -391,6 +391,8 @@ class ClassicSocketManager:
 
     def _ensure_listener_tasks(self) -> None:
         """Ensure one long-lived classic socket listener exists per supported hub."""
+        if self._closed:
+            return
         if not self._hass.is_running:
             if self._start_unsub is None:
                 self._start_unsub = self._hass.bus.async_listen_once(

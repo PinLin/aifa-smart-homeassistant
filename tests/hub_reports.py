@@ -38,8 +38,10 @@ def confirming_sender(coordinator, sent: list[str]):
     apply path sees the same observed state as with a real hub.
     """
 
-    async def send(command, confirmation):
+    async def send(command, confirmation, *, on_written=None):
         sent.append(command.command)
+        if on_written is not None:
+            on_written()
         if confirmation.mode is not None:
             mode = confirmation.mode
         elif command.command[4:6] == "a1":

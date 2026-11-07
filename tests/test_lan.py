@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import unittest
+from unittest.mock import patch
 
 from custom_components.aifa_smart.classic_listener import (
     AifaClassicSocketListenerSpec,
@@ -11,6 +13,8 @@ from custom_components.aifa_smart.classic_listener import (
     process_classic_stream_chunk,
 )
 from custom_components.aifa_smart.lan import (
+    _TargetedSender,
+    _send_to_each,
     build_connect_packet,
     build_search_packet,
     compute_broadcast_addresses,
@@ -237,6 +241,45 @@ class ClassicManagerUsesSharedParserTests(unittest.TestCase):
         self.assertEqual(writer.writes, [bytes.fromhex("ccdd")])
         self.assertEqual(observed, [(spec, 0)])
         self.assertEqual(buffers.notify, bytes.fromhex("faf5"))
+
+
+
+class _RefusingTransport:
+    """Fails like the selector transport: error_received from inside sendto."""
+
+    def __init__(self, protocol: _TargetedSender, refused: str) -> None:
+        self._protocol = protocol
+        self._refused = refused
+        self.tried: list[str] = []
+
+    def sendto(self, data: bytes, addr: tuple[str, int]) -> None:
+        self.tried.append(addr[0])
+        if addr[0] == self._refused:
+            # ENOKEY on Linux; macOS has no such errno name.
+            self._protocol.error_received(OSError(126, "Required key not available"))
+
+
+class BroadcastErrorTests(unittest.TestCase):
+    def test_refused_address_is_logged_once_and_others_still_get_every_send(self) -> None:
+        targets = ["192.168.1.255", "100.64.255.255", "10.0.0.255"]
+        transports = []
+        with patch(
+            "custom_components.aifa_smart.lan._reported_send_errors", set()
+        ), self.assertLogs("custom_components.aifa_smart.lan", logging.DEBUG) as logs:
+            # Two connect attempts, three broadcast rounds each.
+            for _ in range(2):
+                sender = _TargetedSender()
+                transport = _RefusingTransport(sender, "100.64.255.255")
+                for _ in range(3):
+                    _send_to_each(transport, sender, b"x", targets, 11123)  # type: ignore[arg-type]
+                transports.append(transport)
+        for transport in transports:
+            self.assertEqual(transport.tried.count("100.64.255.255"), 1)
+            self.assertEqual(transport.tried.count("192.168.1.255"), 3)
+            self.assertEqual(transport.tried.count("10.0.0.255"), 3)
+        refused = [line for line in logs.output if "100.64.255.255" in line]
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(len(logs.output), 1)
 
 
 if __name__ == "__main__":

@@ -11,9 +11,11 @@ from homeassistant.const import PERCENTAGE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 
 from .ac import AC_KEYS, FAN_SPEED_OPTIONS, is_supported_ac_sub_device, visible_ac_keys
 from .coordinator import AifaSmartCoordinator
+from .runtime import AifaAcRestoreData
 from .entity import (
     AifaAccountEntity,
     AifaDeviceEntity,
@@ -273,7 +275,7 @@ class AifaSubDeviceFunctionCountSensor(_AifaBaseSubDeviceSensor):
         return None if sub_device is None else len(sub_device.functions)
 
 
-class AifaAcFanSpeedSensor(AifaSubDeviceEntity, SensorEntity):
+class AifaAcFanSpeedSensor(AifaSubDeviceEntity, RestoreEntity, SensorEntity):
     """Fan speed from the hub's last status report (b7)."""
 
     # Reports arrive over the command transport, so follow its availability.
@@ -291,10 +293,27 @@ class AifaAcFanSpeedSensor(AifaSubDeviceEntity, SensorEntity):
         )
 
     @property
-    def native_value(self) -> str | None:
+    def _runtime(self):
         sub_device = self.sub_device
         return self.coordinator.get_ac_runtime_state(
             self._device_id,
             self._sub_device_id,
             device_code=None if sub_device is None else sub_device.device_code,
-        ).last_reported_fan_mode
+        )
+
+    @property
+    def native_value(self) -> str | None:
+        return self._runtime.last_reported_fan_mode
+
+    @property
+    def extra_restore_state_data(self) -> ExtraStoredData:
+        # Same data as the climate entity's; either one restores both.
+        return AifaAcRestoreData.from_runtime(self._runtime)
+
+    async def async_added_to_hass(self) -> None:
+        """Show the speed from before the restart until the hub reports."""
+        await super().async_added_to_hass()
+        extra = await self.async_get_last_extra_data()
+        data = None if extra is None else AifaAcRestoreData.from_dict(extra.as_dict())
+        if data is not None:
+            self._runtime.restore(data)
