@@ -23,6 +23,7 @@ from .const import (
     OAUTH_CLIENT_ID,
     OAUTH_TOKEN_PATH,
     SUB_DEVICE_DEVICE_CODES_PATH,
+    SUB_DEVICE_PATH,
     SUB_DEVICE_SET_CODE_PATH,
 )
 
@@ -214,6 +215,8 @@ class AifaSubDevice:
     ac_supports_power_saving: bool | None = None
     ac_supports_turbo: bool | None = None
     estimated_capabilities: list[str] = field(default_factory=list)
+    # i-Ctrl Pro refuses to change the code while any learned key exists.
+    learned_key_count: int = 0
     functions: list[AifaFunction] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -500,6 +503,162 @@ def extract_classic_status_packets(buffer: bytes) -> tuple[list[bytes], bytes]:
     return packets, b""
 
 
+def extract_set_code_ack_packets(buffer: bytes) -> tuple[list[bytes], bytes]:
+    """Extract the hub's `fa f5 <slot> <hi> <lo> f0` SetCode echoes."""
+    packets: list[bytes] = []
+    scan_index = 0
+    buffer_length = len(buffer)
+
+    while scan_index <= buffer_length - 6:
+        start = buffer.find(b"\xfa\xf5", scan_index)
+        if start < 0 or start + 6 > buffer_length:
+            break
+        candidate = buffer[start : start + 6]
+        if candidate[-1] == _CLASSIC_PACKET_END:
+            packets.append(candidate)
+            scan_index = start + 6
+            continue
+        scan_index = start + 1
+
+    incomplete_start = buffer.rfind(b"\xfa", scan_index)
+    if incomplete_start >= 0 and buffer_length - incomplete_start < 6:
+        return packets, buffer[incomplete_start:]
+    return packets, b""
+
+
+# (prefix, length) of the frames ending in f0 that may hold the bytes fb f5.
+_SET_CODE_REJECT_SKIPPED_FRAMES: dict[int, tuple[tuple[int, ...], int]] = {
+    0xFE: ((0xA0, 0xA1), 14),
+    0xFA: ((0xF5,), 6),
+    0xF1: ((0xEE,), 4),
+}
+
+
+def extract_set_code_reject_packets(buffer: bytes) -> tuple[list[bytes], bytes]:
+    """Extract the hub's 2-byte `fb f5` answer to a SetCode it does not support.
+
+    The reply has no end byte, so the bytes of a status report or an echo
+    could look like one; complete frames of those kinds are stepped over,
+    and one cut off at the end is kept until the rest arrives.
+    """
+    packets: list[bytes] = []
+    index = 0
+    length = len(buffer)
+    while index < length:
+        byte = buffer[index]
+        if byte == 0xFB:
+            if index + 1 >= length:
+                return packets, buffer[index:]
+            if buffer[index + 1] == 0xF5:
+                packets.append(buffer[index : index + 2])
+                index += 2
+                continue
+            index += 1
+            continue
+        frame = _SET_CODE_REJECT_SKIPPED_FRAMES.get(byte)
+        if frame is None:
+            index += 1
+            continue
+        second_bytes, frame_length = frame
+        if index + 1 >= length:
+            return packets, buffer[index:]
+        if buffer[index + 1] not in second_bytes:
+            index += 1
+            continue
+        if index + frame_length > length:
+            return packets, buffer[index:]
+        if buffer[index + frame_length - 1] == _CLASSIC_PACKET_END:
+            index += frame_length
+            continue
+        index += 1
+    return packets, b""
+
+
+_CODE_MATCH_SLOTS = (0xA0, 0xA1)
+_CODE_MATCH_SKIPPED_FRAMES = {
+    prefix: frame
+    for prefix, frame in _SET_CODE_REJECT_SKIPPED_FRAMES.items()
+    if prefix != 0xFA
+}
+
+
+def _is_bcd_byte(byte: int) -> bool:
+    return byte >> 4 <= 9 and byte & 0x0F <= 9
+
+
+def extract_code_match_packets(
+    buffer: bytes, *, held: bool = False
+) -> tuple[list[bytes], bytes]:
+    """Extract the hub's replies to a code match from a buffer ending at a chunk.
+
+    `fb f5 <slot>` (failed) comes out as 3 bytes, `fa f5 <slot> <hi> <lo> f0`
+    as 6. i-Ctrl Pro tells the 4-byte end `fa f5 <slot> xx` by the length of
+    the notification; a byte stream has none, so it is 4 bytes when the 6
+    bytes it starts do not end in f0, or when the chunk ends after it. A
+    chunk may also end inside a candidate, so when xx can open its BCD code
+    the 4 bytes are also kept for the next chunk; the caller waits a moment
+    before it trusts such an end. `held` says the buffer starts with such
+    4 bytes, already returned, so they only come out again as a candidate.
+    A 2-byte `fb f5` (a refused SetCode) and status or heartbeat frames are
+    stepped over.
+    """
+    packets: list[bytes] = []
+    index = 0
+    length = len(buffer)
+    while index < length:
+        byte = buffer[index]
+        if byte in (0xFA, 0xFB):
+            if index + 2 >= length:
+                if buffer[index + 1 : index + 2] in (b"", b"\xf5"):
+                    return packets, buffer[index:]
+                index += 1
+                continue
+            if buffer[index + 1] != 0xF5:
+                index += 1
+                continue
+            if buffer[index + 2] not in _CODE_MATCH_SLOTS:
+                index += 2 if byte == 0xFB else 1
+                continue
+            if byte == 0xFB:
+                packets.append(buffer[index : index + 3])
+                index += 3
+                continue
+            if index + 6 <= length and buffer[index + 5] == _CLASSIC_PACKET_END:
+                packets.append(buffer[index : index + 6])
+                index += 6
+                continue
+            if index + 4 < length < index + 6:
+                return packets, buffer[index:]
+            again = held and index == 0
+            if index + 4 == length and _is_bcd_byte(buffer[index + 3]):
+                if not again:
+                    packets.append(buffer[index : index + 4])
+                return packets, buffer[index:]
+            if index + 4 <= length:
+                if not again:
+                    packets.append(buffer[index : index + 4])
+                index += 4
+                continue
+            return packets, buffer[index:]
+        frame = _CODE_MATCH_SKIPPED_FRAMES.get(byte)
+        if frame is None:
+            index += 1
+            continue
+        second_bytes, frame_length = frame
+        if index + 1 >= length:
+            return packets, buffer[index:]
+        if buffer[index + 1] not in second_bytes:
+            index += 1
+            continue
+        if index + frame_length > length:
+            return packets, buffer[index:]
+        if buffer[index + frame_length - 1] == _CLASSIC_PACKET_END:
+            index += frame_length
+            continue
+        index += 1
+    return packets, b""
+
+
 def extract_classic_wake_packets(buffer: bytes) -> tuple[list[bytes], bytes]:
     """Extract wake-up packets that require the classic ``ccdd`` reply."""
     packets: list[bytes] = []
@@ -691,8 +850,26 @@ def _parse_sub_device(raw: Mapping[str, Any], device_id: Any) -> AifaSubDevice |
         type=_coerce_str(_pick(raw, "type")),
         sub_type=_coerce_str(_pick(raw, "subType", "sub_type")),
         device_code=_coerce_str(_pick(raw, "deviceCode", "device_code")),
+        learned_key_count=_count_learned_keys(raw.get("learnedKeys"), sub_device_id),
         raw=dict(raw),
     )
+
+
+def _count_learned_keys(rows: Any, sub_device_id: Any) -> int:
+    """Count learned keys like i-Ctrl Pro: rows whose subDeviceId is this sub-device.
+
+    A row without subDeviceId sits under this sub-device, so it counts too.
+    """
+    if not isinstance(rows, list):
+        return 0
+    count = 0
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        owner = _pick(row, "subDeviceId", "sub_device_id")
+        if owner is None or str(owner) == str(sub_device_id):
+            count += 1
+    return count
 
 
 def _parse_function_command(raw: Mapping[str, Any], fallback_order: int) -> AifaFunctionCommand | None:
@@ -1033,27 +1210,25 @@ class AifaSmartApiClient:
             return AifaDeviceCodeCatalog()
         return _parse_device_code_catalog(payload)
 
-    async def async_push_sub_device_code(
-        self, *, sub_device_id: int, device_code_id: int
-    ) -> None:
-        """Tell the hub to load a Classic device-code IR profile.
+    async def async_push_sub_device_code(self, *, sub_device_id: int | str) -> None:
+        """Ask the cloud to push the sub-device's stored code to the hub.
 
-        POST /sub-devices/{id}/set-code with `{"deviceCodeId": N}`. Cloud
-        relays the request via TLS 8751; on 204 the hub writes the code
-        into NAND-persistent storage and resumes broadcasting its BCD in
-        the idle frame `fea00<HHLL>...f0`.
-
-        Verified empirically (against firmware v4):
-        - Hub state survives full power cycle (NAND-backed).
-        - Cloud rejects with 404 "Device not connected" when the hub is
-          offline — set-code is NOT queued for later delivery.
-        - 5-digit (Plus) codes return 202 "No device code set or device
-          code is downloaded"; the IR data must first be pushed via the
-          TLS DevicePacket.plusDownload* protocol, not implemented here.
+        POST /sub-devices/{id}/set-code with no body, as i-Ctrl Pro 1.2.9
+        sends it; the app only calls it while running a macro, never when
+        changing a code. The cloud answers 404 while the hub is offline and
+        does not queue the request.
         """
         path = SUB_DEVICE_SET_CODE_PATH.format(sub_device_id=sub_device_id)
+        await self._authorized_request("POST", path)
+
+    async def async_update_sub_device_code(
+        self, sub_device_id: str, device_code: int
+    ) -> None:
+        """Store a new code in the cloud: PATCH /sub-devices/{id} with only deviceCode."""
         await self._authorized_request(
-            "POST", path, json={"deviceCodeId": device_code_id}
+            "PATCH",
+            SUB_DEVICE_PATH.format(sub_device_id=sub_device_id),
+            json={"deviceCode": int(device_code)},
         )
 
     async def async_transfer_packet(

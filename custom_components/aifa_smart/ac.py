@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Final
 
 _LOGGER = logging.getLogger(__name__)
@@ -401,32 +402,20 @@ def _is_bcd_byte(byte: int) -> bool:
 
 
 def _bcd_encode_device_code(device_code: int) -> tuple[int, int]:
-    """Encode a device code into the (byte_3, byte_4) status-packet pair.
+    """Encode a device code into its two packet bytes like i-Ctrl Pro 1.2.9.
 
-    Mirrors the Dart-side `deviceCodeToBytes` reverse-engineered from blutter
-    output of `air_conditioner_status.dart` v1.2.5:
-    `code.toString().padLeft(4, "0")`, then interpret chars [0:2] and [2:4]
-    as two hex bytes (`int.parse(.., radix:16)`).
-
-    For 4-digit codes (offline catalog 1..414, plus our pre-cloud-aware
-    legacy range 0..9999) this is mathematically equivalent to BCD-encoding
-    `(code // 100, code % 100)` because all chars are 0..9.
-
-    For 5-digit codes (cloud catalog `remote=true` rows 19844..19999) the
-    5th character is silently dropped (substring(2, 4) discards index 4).
-    This causes intentional aliasing — e.g. 19844..19848 all map to
-    (0x19, 0x84). The AIFA hub disambiguates using its `set-code`-loaded
-    value, treating bytes 3-4 only as a "family hint". So 5-digit support
-    requires the hub to be re-synced via PATCH+set-code BEFORE the encoded
-    packet is sent (otherwise the hub will translate to the wrong family).
+    `deviceCodeToBytes` pads the decimal string to 4 characters, parses
+    characters [0:2] and [2:] as hex, and a Uint8List keeps only the low
+    8 bits. Codes up to 9999 come out as plain BCD; a 5-digit code keeps
+    its last two digits, so different codes can share bytes.
 
     Examples:
-        device 0     → "0000"  → (0x00, 0x00)
-        device 11    → "0011"  → (0x00, 0x11)
+        device 25    → "0025"  → (0x00, 0x25)
         device 136   → "0136"  → (0x01, 0x36)
         device 9999  → "9999"  → (0x99, 0x99)
-        device 19844 → "19844" → (0x19, 0x84)  ← collides with 19845..19848
-        device 19999 → "19999" → (0x19, 0x99)  ← collides with 19990..19998
+        device 10000 → "10000" → (0x10, 0x00), the same bytes as 1000
+        device 19844 → "19844" → (0x19, 0x44)
+        device 19866 → "19866" → (0x19, 0x66)
     """
     if not 0 <= device_code <= 99999:
         raise ValueError(
@@ -441,20 +430,111 @@ def _bcd_encode_device_code(device_code: int) -> tuple[int, int]:
             "DevicePacketPlusDownload* protocol is not implemented here); "
             "(2) the hub broadcasts no acCommand state echo in Plus mode, so "
             "the climate entity stays in assumed-state mode (HA UI shows '?' "
-            "badge) — there is no real status feedback; (3) BCD bytes 3-4 "
-            "drop the 5th digit, so codes within the same hundreds (e.g. "
-            "19844..19848) collide on the wire — IR firing depends on which "
-            "specific 5-digit code the AIFA app pushed to the hub.",
+            "badge) — there is no real status feedback; (3) bytes 3-4 keep "
+            "only the first two and the last two digits, so codes such as "
+            "19844 and 19944 share bytes on the wire — IR firing depends on "
+            "which specific 5-digit code the AIFA app pushed to the hub.",
             device_code,
         )
     padded = str(device_code).rjust(4, "0")
-    high_str = padded[0:2]
-    low_str = padded[2:4]
-    if not (high_str.isdigit() and low_str.isdigit()):
-        raise ValueError(
-            f"device_code chars must all be digits; got {device_code!r}"
-        )
-    return (int(high_str, 16), int(low_str, 16))
+    return (int(padded[0:2], 16) & 0xFF, int(padded[2:], 16) & 0xFF)
+
+
+# SetCode bytes for a 5-digit code alias other codes, and i-Ctrl Pro only
+# sends SetCode for catalog rows with remote == false.
+SET_CODE_MAX_DEVICE_CODE = 9999
+SET_CODE_ACK_LENGTH = 6
+
+
+def set_code_slot(sub_type: str | int | None) -> int:
+    """Air-conditioner slot for SetCode: 0xA1 only when subType is 1."""
+    try:
+        return 0xA1 if int(str(sub_type).strip()) == 1 else 0xA0
+    except (TypeError, ValueError):
+        return 0xA0
+
+
+def build_set_code_command(slot: int, device_code: int) -> str:
+    """Build SetCode `ff f5 <slot> <hi> <lo> f0` for a code up to 9999."""
+    if not 0 <= device_code <= SET_CODE_MAX_DEVICE_CODE:
+        raise ValueError(f"SetCode needs a code from 0 to 9999; got {device_code}")
+    high, low = _bcd_encode_device_code(device_code)
+    return bytes([0xFF, 0xF5, slot & 0xFF, high, low, 0xF0]).hex()
+
+
+# i-Ctrl Pro's pairing test press uses the generic power key of every
+# sub-device type, not the AC page's on key 0xA1.
+PAIRING_TEST_KEY = 0xA0
+
+
+def build_pairing_key_command(slot: int) -> str:
+    """Build the pairing test press `ff <slot> a0 f0`."""
+    return bytes([0xFF, slot & 0xFF, PAIRING_TEST_KEY, 0xF0]).hex()
+
+
+def parse_set_code_ack(packet: bytes) -> tuple[int, int, int] | None:
+    """Return (slot, hi, lo) from the hub's `fa f5 <slot> <hi> <lo> f0` echo."""
+    if (
+        len(packet) != SET_CODE_ACK_LENGTH
+        or packet[0] != 0xFA
+        or packet[1] != 0xF5
+        or packet[-1] != 0xF0
+        # `fa f5 <slot> ff ff f0` ends a code match; no code is spelled ff.
+        or 0xFF in packet[3:5]
+    ):
+        return None
+    return packet[2], packet[3], packet[4]
+
+
+def build_code_match_start_command(slot: int) -> str:
+    """Build i-Ctrl Pro's StartMatch `ff f5 f4 f1 <slot> f0`."""
+    return bytes([0xFF, 0xF5, 0xF4, 0xF1, slot & 0xFF, 0xF0]).hex()
+
+
+def build_code_match_next_command(slot: int) -> str:
+    """Build NextMatch `ff f5 f4 f3 <slot> f0`, which asks for the next candidate."""
+    return bytes([0xFF, 0xF5, 0xF4, 0xF3, slot & 0xFF, 0xF0]).hex()
+
+
+class CodeMatchReply(StrEnum):
+    """What one hub reply during a code match means."""
+
+    CANDIDATE = "candidate"
+    END = "end"
+    FAILED = "failed"
+
+
+def parse_code_match_packet(packet: bytes) -> tuple[CodeMatchReply, int, int | None] | None:
+    """Return (kind, slot, candidate code) like i-Ctrl Pro reads a match reply.
+
+    `fb f5 <slot> …` fails the match; `fa f5 <slot> xx` (4 bytes) or a frame
+    with ff after b2 ends it; any other `fa f5 <slot> …` is a candidate whose
+    bytes after b2, f0 dropped, read as decimal. The code is None when those
+    bytes are not decimal digits.
+    """
+    if len(packet) < 3 or packet[1] != 0xF5 or packet[0] not in (0xFA, 0xFB):
+        return None
+    slot = packet[2]
+    if packet[0] == 0xFB:
+        return CodeMatchReply.FAILED, slot, None
+    if len(packet) == 4:
+        return CodeMatchReply.END, slot, None
+    digits = [byte for byte in packet[3:] if byte != 0xF0]
+    if 0xFF in digits:
+        return CodeMatchReply.END, slot, None
+    try:
+        code = int("".join(f"{byte:02x}" for byte in digits))
+    except ValueError:
+        code = None
+    return CodeMatchReply.CANDIDATE, slot, code
+
+
+def device_code_wire_bytes(device_code: str | int | None) -> tuple[int, int] | None:
+    """Bytes a code occupies in packets, or None when it cannot be encoded."""
+    try:
+        return _bcd_encode_device_code(int(str(device_code).strip()))
+    except (TypeError, ValueError):
+        return None
 
 
 def clamp_timer_ir_value(value: int | None) -> int:

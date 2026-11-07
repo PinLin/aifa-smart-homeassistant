@@ -372,6 +372,9 @@ class LanHubLink:
 ApplyLanObservedStatusFn = Callable[
     [AifaClassicSocketListenerSpec, int, AifaAcStatus], bool
 ]
+ApplyLanSetCodeAckFn = Callable[[AifaClassicSocketListenerSpec, int, int, int], bool]
+ApplyLanSetCodeRejectFn = Callable[[AifaClassicSocketListenerSpec], None]
+ApplyLanCodeMatchFn = Callable[[AifaClassicSocketListenerSpec, bytes], bool]
 BroadcastProviderFn = Callable[[], Awaitable[list[str]]]
 
 
@@ -398,8 +401,14 @@ class LanTransportManager:
         on_link_state_changed: Callable[[], None] | None = None,
         unavailable_grace: float = LAN_UNAVAILABLE_GRACE_SECONDS,
         connect_write_delay: float = LAN_CONNECT_WRITE_DELAY,
+        on_set_code_ack: ApplyLanSetCodeAckFn | None = None,
+        on_set_code_reject: ApplyLanSetCodeRejectFn | None = None,
+        on_code_match: ApplyLanCodeMatchFn | None = None,
     ) -> None:
         self._hass = hass
+        self._on_set_code_ack = on_set_code_ack
+        self._on_set_code_reject = on_set_code_reject
+        self._on_code_match = on_code_match
         self._on_observed_status = on_observed_status
         self._on_data_changed = on_data_changed
         self._broadcast_provider = broadcast_provider or (
@@ -792,6 +801,20 @@ class LanTransportManager:
             link.last_status_at = dt_util.utcnow()
             return self._on_observed_status(spec, sub_type, observed)
 
+        def on_set_code_ack(slot: int, high: int, low: int) -> bool:
+            if self._on_set_code_ack is None:
+                return False
+            return self._on_set_code_ack(spec, slot, high, low)
+
+        def on_set_code_reject() -> None:
+            if self._on_set_code_reject is not None:
+                self._on_set_code_reject(spec)
+
+        def on_code_match(packet: bytes) -> bool:
+            if self._on_code_match is None:
+                return False
+            return self._on_code_match(spec, packet)
+
         def on_sensor(sensor: AifaClassicSensorState) -> bool:
             _LOGGER.debug("AIFA LAN sensor packet from %s: %s", spec.device_id, sensor)
             return False
@@ -838,5 +861,8 @@ class LanTransportManager:
                 on_status=on_status,
                 on_sensor=on_sensor,
                 on_notify=lambda: None,
+                on_set_code_ack=on_set_code_ack,
+                on_set_code_reject=on_set_code_reject,
+                on_code_match=on_code_match,
             ):
                 self._on_data_changed()

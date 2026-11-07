@@ -52,6 +52,7 @@ _SUB_DEVICE_FIELDS = (
     "ac_supports_power_saving",
     "ac_supports_turbo",
     "estimated_capabilities",
+    "learned_key_count",
 )
 _MACRO_COMMAND_FIELDS = (
     "id",
@@ -129,6 +130,8 @@ def deserialize_account(
             sub_values = dict(_check_row(raw_sub, _SUB_DEVICE_FIELDS))
             for list_field in ("ac_available_modes", "estimated_capabilities"):
                 sub_values[list_field] = list(sub_values.get(list_field) or [])
+            learned = sub_values.get("learned_key_count")
+            sub_values["learned_key_count"] = learned if isinstance(learned, int) else 0
             sub_devices.append(AifaSubDevice(**sub_values))
         devices[values["id"]] = AifaDevice(
             **values,

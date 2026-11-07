@@ -80,15 +80,25 @@ def test_default_transport_is_cloud() -> None:
     assert transport_from_options({CONF_TRANSPORT: TRANSPORT_AUTO}) == TRANSPORT_AUTO
 
 
+
+async def _open_transport(hass: HomeAssistant, entry):
+    """The options flow opens on a menu; transport is one of its two pages."""
+    menu = await hass.config_entries.options.async_init(entry.entry_id)
+    assert menu["type"] is FlowResultType.MENU
+    assert menu["menu_options"] == ["transport", "device_code"]
+    return await hass.config_entries.options.async_configure(
+        menu["flow_id"], {"next_step_id": "transport"}
+    )
+
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("enable_custom_integrations")
 async def test_options_form_defaults_to_cloud(hass: HomeAssistant) -> None:
     entry = _entry(hass)
 
-    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await _open_transport(hass, entry)
 
     assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "init"
+    assert result["step_id"] == "transport"
     assert result["data_schema"]({})[CONF_TRANSPORT] == TRANSPORT_CLOUD
 
 
@@ -97,7 +107,7 @@ async def test_options_form_defaults_to_cloud(hass: HomeAssistant) -> None:
 async def test_options_form_preselects_current_transport(hass: HomeAssistant) -> None:
     entry = _entry(hass, {CONF_TRANSPORT: TRANSPORT_LAN})
 
-    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await _open_transport(hass, entry)
 
     assert result["data_schema"]({})[CONF_TRANSPORT] == TRANSPORT_LAN
 
@@ -107,7 +117,7 @@ async def test_options_form_preselects_current_transport(hass: HomeAssistant) ->
 async def test_options_flow_writes_transport(hass: HomeAssistant) -> None:
     entry = _entry(hass, {"unrelated": 1})
 
-    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await _open_transport(hass, entry)
     result2 = await hass.config_entries.options.async_configure(
         result["flow_id"], {CONF_TRANSPORT: TRANSPORT_AUTO}
     )
@@ -121,7 +131,7 @@ async def test_options_flow_writes_transport(hass: HomeAssistant) -> None:
 async def test_options_flow_rejects_unknown_transport(hass: HomeAssistant) -> None:
     entry = _entry(hass)
 
-    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await _open_transport(hass, entry)
     with pytest.raises(vol.Invalid):
         await hass.config_entries.options.async_configure(
             result["flow_id"], {CONF_TRANSPORT: "bluetooth"}
@@ -139,7 +149,7 @@ async def test_transport_change_reloads_entry(hass: HomeAssistant) -> None:
         patch.object(hass.config_entries, "async_reload", reload),
     ):
         async_setup_options_reload(hass, entry)
-        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await _open_transport(hass, entry)
         await hass.config_entries.options.async_configure(
             result["flow_id"], {CONF_TRANSPORT: TRANSPORT_LAN}
         )
@@ -215,7 +225,11 @@ def test_translations_cover_transport_options() -> None:
     assert english == strings
     assert _key_tree(chinese) == _key_tree(strings)
     assert set(strings["selector"]["transport"]["options"]) == set(TRANSPORTS)
-    assert "transport" in strings["options"]["step"]["init"]["data"]
+    assert "transport" in strings["options"]["step"]["transport"]["data"]
+    assert set(strings["options"]["step"]["init"]["menu_options"]) == {
+        "transport",
+        "device_code",
+    }
 
 
 def test_manifest_depends_on_network() -> None:

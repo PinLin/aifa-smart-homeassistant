@@ -34,6 +34,7 @@ from .ac import (
     AifaAcStatus,
     decode_observed_status_packet,
     is_supported_ac_sub_device,
+    parse_set_code_ack,
 )
 from .api import (
     AifaClassicSensorState,
@@ -46,6 +47,9 @@ from .api import (
     extract_classic_sensor_packets,
     extract_classic_status_packets,
     extract_classic_wake_packets,
+    extract_code_match_packets,
+    extract_set_code_ack_packets,
+    extract_set_code_reject_packets,
 )
 from .const import DOMAIN
 
@@ -165,6 +169,9 @@ class ClassicStreamBuffers:
     wake: bytes = b""
     notify: bytes = b""
     sensor: bytes = b""
+    set_code_ack: bytes = b""
+    set_code_reject: bytes = b""
+    code_match: bytes = b""
 
 
 async def process_classic_stream_chunk(
@@ -176,17 +183,25 @@ async def process_classic_stream_chunk(
     on_status: Callable[[int, AifaAcStatus], bool],
     on_sensor: Callable[[AifaClassicSensorState], bool],
     on_notify: Callable[[], None],
+    on_set_code_ack: Callable[[int, int, int], bool] | None = None,
+    on_set_code_reject: Callable[[], None] | None = None,
+    on_code_match: Callable[[bytes], bool] | None = None,
 ) -> bool:
     """Parse one chunk of the hub byte stream shared by the cloud and LAN links.
 
     Mutates `buffers` in place and returns True when any callback reported a
     state change. A SetCode echo has the notify frame's shape; one that
     `on_set_code_ack` claims as the answer to our own SetCode is not a notify.
+    `on_set_code_reject` gets the hub's `fb f5` refusal of a SetCode.
+    A code-match reply that `on_code_match` claims is neither an echo nor
+    a notify: a candidate has the echo's shape.
     """
     buffers.status += chunk
     buffers.wake += chunk
     buffers.notify += chunk
     buffers.sensor += chunk
+    buffers.set_code_ack += chunk
+    buffers.set_code_reject += chunk
     updated = False
 
     wake_packets, buffers.wake = extract_classic_wake_packets(buffers.wake)
@@ -208,9 +223,43 @@ async def process_classic_stream_chunk(
             continue
         updated = on_sensor(decoded_sensor) or updated
 
+    matched: list[bytes] = []
+    if on_code_match is not None:
+        # Only a short end the extractor already returned is left as 4 bytes.
+        held = len(buffers.code_match) == 4
+        buffers.code_match += chunk
+        match_packets, buffers.code_match = extract_code_match_packets(
+            buffers.code_match, held=held
+        )
+        matched = [packet for packet in match_packets if on_code_match(packet)]
+
+    claimed: list[bytes] = []
+    ack_packets, buffers.set_code_ack = extract_set_code_ack_packets(buffers.set_code_ack)
+    for packet in ack_packets:
+        if packet in matched:
+            matched.remove(packet)
+            claimed.append(packet)
+            continue
+        if on_set_code_ack is None:
+            continue
+        ack = parse_set_code_ack(packet)
+        if ack is not None and on_set_code_ack(*ack):
+            claimed.append(packet)
+
+    reject_packets, buffers.set_code_reject = extract_set_code_reject_packets(
+        buffers.set_code_reject
+    )
+    if on_set_code_reject is not None:
+        for _ in reject_packets:
+            on_set_code_reject()
+
     notify_packets, buffers.notify = extract_classic_notify_packets(buffers.notify)
-    if notify_packets:
+    for packet in notify_packets:
+        if packet in claimed:
+            claimed.remove(packet)
+            continue
         on_notify()
+        break
 
     # Trimming from the front can lose an in-progress packet at the boundary,
     # but each extractor re-syncs on the next prefix match.
@@ -218,6 +267,9 @@ async def process_classic_stream_chunk(
     buffers.wake = _trim_socket_buffer(buffers.wake)
     buffers.notify = _trim_socket_buffer(buffers.notify)
     buffers.sensor = _trim_socket_buffer(buffers.sensor)
+    buffers.set_code_ack = _trim_socket_buffer(buffers.set_code_ack)
+    buffers.set_code_reject = _trim_socket_buffer(buffers.set_code_reject)
+    buffers.code_match = _trim_socket_buffer(buffers.code_match)
     return updated
 
 
@@ -227,6 +279,9 @@ ApplyObservedStatusFn = Callable[
     [AifaClassicSocketListenerSpec, int, AifaAcStatus], bool
 ]
 ApplySensorStateFn = Callable[[str, AifaClassicSensorState], bool]
+ApplySetCodeAckFn = Callable[[AifaClassicSocketListenerSpec, int, int, int], bool]
+ApplySetCodeRejectFn = Callable[[AifaClassicSocketListenerSpec], None]
+ApplyCodeMatchFn = Callable[[AifaClassicSocketListenerSpec, bytes], bool]
 NotifyDataChangedFn = Callable[[], None]
 NotifyFullRefreshFn = Callable[[], Awaitable[None]]
 
@@ -244,6 +299,9 @@ class ClassicSocketManager:
         on_data_changed: NotifyDataChangedFn,
         on_notify_full_refresh: NotifyFullRefreshFn,
         connect_write_delay: float = CLASSIC_CONNECT_WRITE_DELAY,
+        on_set_code_ack: ApplySetCodeAckFn | None = None,
+        on_set_code_reject: ApplySetCodeRejectFn | None = None,
+        on_code_match: ApplyCodeMatchFn | None = None,
     ) -> None:
         self._hass = hass
         self._client = client
@@ -251,6 +309,9 @@ class ClassicSocketManager:
         self._on_sensor_state = on_sensor_state
         self._on_data_changed = on_data_changed
         self._on_notify_full_refresh = on_notify_full_refresh
+        self._on_set_code_ack = on_set_code_ack
+        self._on_set_code_reject = on_set_code_reject
+        self._on_code_match = on_code_match
         self._connect_write_delay = connect_write_delay
         self._specs: dict[str, AifaClassicSocketListenerSpec] = {}
         self._listener_tasks: dict[str, asyncio.Task[None]] = {}
@@ -540,7 +601,34 @@ class ClassicSocketManager:
             ),
             on_sensor=lambda sensor: self._on_sensor_state(spec.device_id, sensor),
             on_notify=lambda: self._schedule_notify_refresh(spec.device_id),
+            on_set_code_ack=self._set_code_ack_handler(spec),
+            on_set_code_reject=self._set_code_reject_handler(spec),
+            on_code_match=self._code_match_handler(spec),
         )
+
+    def _set_code_ack_handler(
+        self, spec: AifaClassicSocketListenerSpec
+    ) -> Callable[[int, int, int], bool] | None:
+        handler = self._on_set_code_ack
+        if handler is None:
+            return None
+        return lambda slot, high, low: handler(spec, slot, high, low)
+
+    def _set_code_reject_handler(
+        self, spec: AifaClassicSocketListenerSpec
+    ) -> Callable[[], None] | None:
+        handler = self._on_set_code_reject
+        if handler is None:
+            return None
+        return lambda: handler(spec)
+
+    def _code_match_handler(
+        self, spec: AifaClassicSocketListenerSpec
+    ) -> Callable[[bytes], bool] | None:
+        handler = self._on_code_match
+        if handler is None:
+            return None
+        return lambda packet: handler(spec, packet)
 
     def _schedule_notify_refresh(self, device_id: str) -> None:
         """Reload the account after a notify frame; the hub itself is not asked.

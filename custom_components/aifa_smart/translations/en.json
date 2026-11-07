@@ -31,6 +31,13 @@
     "step": {
       "init": {
         "title": "AIFA Smart options",
+        "menu_options": {
+          "transport": "Transport",
+          "device_code": "Change remote code"
+        }
+      },
+      "transport": {
+        "title": "AIFA Smart options",
         "description": "Choose how commands reach the AIFA hub. Local network talks to the hub directly without the AIFA cloud; Automatic tries the local network first and uses the cloud when the hub cannot be reached locally.",
         "data": {
           "transport": "Transport"
@@ -38,11 +45,79 @@
         "data_description": {
           "transport": "Local network and Automatic need Home Assistant and the hub on the same network."
         }
+      },
+      "device_code": {
+        "title": "Change remote code",
+        "description": "Pick the air conditioner whose remote code to change, and how to find the code. Like i-Ctrl Pro, one with learned keys cannot be changed.",
+        "data": {
+          "sub_device": "Air conditioner",
+          "method": "Method"
+        }
+      },
+      "match": {
+        "title": "Find the code with the remote",
+        "description": "The hub reads the original remote of {name}, like i-Ctrl Pro's one-touch match:\n1. Press Submit.\n2. Point the remote at the hub from about 5 cm or more.\n3. Press the remote's power key."
+      },
+      "match_result": {
+        "title": "Codes found",
+        "description": "i-Ctrl found {count} candidate codes for {name}: {codes}. Try them one by one on the next page; the first one is not always right."
+      },
+      "brand": {
+        "title": "Choose device brand",
+        "description": "{name} uses code {current_code}. Only codes the hub can store directly are listed.",
+        "data": {
+          "brand": "Brand"
+        }
+      },
+      "code": {
+        "title": "Choose code",
+        "description": "{name} uses code {current_code}; the hub is on code {hub_code}. Try sends a code to the hub and presses the power key: watch whether the air conditioner reacts. Save stores the code in the AIFA cloud. Leaving without saving puts the hub back on {current_code}.",
+        "data": {
+          "code": "Code",
+          "action": "Action"
+        },
+        "data_description": {
+          "action": "Like i-Ctrl Pro's pairing, turn the air conditioner off before trying codes."
+        }
       }
     },
     "error": {
       "hub_not_found": "These AIFA hubs did not answer a local network search: {hubs}. Local network control may not reach them. Submit again to save anyway.",
-      "no_hub_found": "No AIFA hub answered a local network search. Local network control may not work. Submit again to save anyway."
+      "no_hub_found": "No AIFA hub answered a local network search. Local network control may not work. Submit again to save anyway.",
+      "learned_keys": "This air conditioner has learned keys or has used a cloud code. Like i-Ctrl Pro, its code cannot be changed until those keys are deleted in the app.",
+      "current_code_unsupported": "This air conditioner uses a code the hub cannot be set back to, so its code cannot be changed here.",
+      "code_unsupported": "This code cannot be stored on the hub directly.",
+      "sub_device_unsupported": "This sub-device is not a supported air conditioner.",
+      "set_code_not_sent": "The hub could not be reached, so nothing was changed. The hub stays on code {hub_code}.",
+      "set_code_mismatch": "The hub reported a code other than {new_code}. The hub was set back to {current_code} and confirmed it; nothing was saved in the cloud.",
+      "set_code_rejected": "The hub does not support code {new_code} and stays on code {hub_code}. Nothing was saved in the cloud.",
+      "set_code_rejected_unverified": "The hub refused code {new_code}, but did not report that it still uses {current_code}. The hub was set back to {current_code} and confirmed it; nothing was saved in the cloud.",
+      "set_code_unconfirmed": "The hub did not confirm code {new_code} in time, so whether it took the code is unknown. The hub was set back to {current_code} and confirmed it; nothing was saved in the cloud.",
+      "cloud_update_failed": "Saving code {new_code} in the AIFA cloud failed. The hub was set back to {current_code} and confirmed it.",
+      "cloud_update_unknown": "The AIFA cloud did not answer while saving code {new_code}, and putting {current_code} back in the cloud failed too. The hub was set back to {current_code}, but the cloud may now show {new_code}. Check the code in i-Ctrl Pro.",
+      "restore_unconfirmed": "The change failed, and the hub did not confirm going back to {current_code}. The hub's code is now unknown: it may be {current_code} or {new_code}. The cloud still has {current_code}. Check the air conditioner in i-Ctrl Pro, or try again.",
+      "restore_unconfirmed_cloud_unknown": "The change failed, and the hub did not confirm going back to {current_code}. The hub's code is now unknown: it may be {current_code} or {new_code}. The AIFA cloud did not answer either, so it may show {current_code} or {new_code}. Check the air conditioner in i-Ctrl Pro.",
+      "code_change_busy": "Another options dialog is changing a code on this hub. Finish or close it first.",
+      "code_trial_running": "The previous try is still running. Wait for it to finish.",
+      "trial_key_not_sent": "The hub is now on code {new_code}, but the power key could not be sent. Try again.",
+      "trial_restore_unconfirmed": "The hub did not confirm going back to {current_code}; its code is unknown. Try again.",
+      "code_match_failed": "The one-touch match failed. Try again.",
+      "code_match_timeout": "The hub found no code within 15 s. Point the remote at the hub and try again.",
+      "code_match_none": "The hub found no code for this remote.",
+      "code_match_not_sent": "The hub could not be reached, so the match did not finish. Try again.",
+      "code_match_running": "The hub is looking for a code. Wait for it to finish.",
+      "code_match_unsupported": "None of the codes the hub found can be set on the hub."
+    },
+    "abort": {
+      "not_loaded": "AIFA Smart has not finished loading. Try again once it is running.",
+      "no_sub_devices": "No supported air conditioner was found.",
+      "cannot_connect": "Failed to reach the AIFA Smart API.",
+      "no_device_codes": "The AIFA cloud lists no code that the hub can store directly for this air conditioner.",
+      "device_code_unchanged": "{name} keeps code {current_code}, and the hub uses it. The brand chosen is shown for it from now on.",
+      "device_code_changed": "{name} now uses code {new_code}. AIFA Smart reloads to apply it."
+    },
+    "progress": {
+      "match": "Press the original remote's power key at the hub. The hub listens for up to 15 s."
     }
   },
   "selector": {
@@ -51,6 +126,18 @@
         "cloud": "Cloud",
         "lan": "Local network",
         "auto": "Automatic (local network, fall back to cloud)"
+      }
+    },
+    "action": {
+      "options": {
+        "try": "Try",
+        "save": "Save"
+      }
+    },
+    "method": {
+      "options": {
+        "brand": "Choose the brand",
+        "match": "Find the code with the remote"
       }
     }
   },
@@ -169,6 +256,10 @@
     "polling_failing": {
       "title": "AIFA Smart API unreachable",
       "description": "Sustained polling failures for entry {entry_id}. Check that Home Assistant can reach the AIFA Smart cloud API, then review the integration log for details. The notification clears automatically once polling succeeds again."
+    },
+    "device_code_mismatch": {
+      "title": "Remote code differs between hub and cloud",
+      "description": "The hub reports code {hub_code} for {name}, but the AIFA cloud has {cloud_code}. Home Assistant builds its commands with the cloud code. Check which code works in i-Ctrl Pro, then set it there or under the AIFA Smart options (Change remote code). The check runs again after every restart or reload."
     }
   },
   "exceptions": {
@@ -210,6 +301,15 @@
     },
     "ac_anti_mold_mode_unsupported": {
       "message": "Anti mold does not support the current mode of this air conditioner, the same as in i-Ctrl Pro."
+    },
+    "ac_device_code_changed": {
+      "message": "The air conditioner's remote code changed while this command was waiting, so it was not sent with the old code. Try again after AIFA Smart reloads."
+    },
+    "ac_device_code_trial": {
+      "message": "The hub is on a code being tried in the options dialog, so the command was not sent. Finish or close the dialog first."
+    },
+    "ac_device_code_match": {
+      "message": "The hub is looking for a remote code in the options dialog, so the command was not sent. Wait for it to finish."
     },
     "ac_state_unknown": {
       "message": "AIFA hub {device_id} has not reported the air conditioner's state since the restart. Sending this setting would reset the fan speed and swing, so it was not sent; try again shortly."

@@ -204,6 +204,10 @@ def _build_coordinator(transport: str, *, device=None, lan=None, listener=None):
     coordinator._ac_pending_release_tasks = {}  # type: ignore[attr-defined]
     coordinator._hub_report_waiters = {}  # type: ignore[attr-defined]
     coordinator._lan_queried_at = {}  # type: ignore[attr-defined]
+    coordinator._code_trials = {}  # type: ignore[attr-defined]
+    coordinator._code_matches = {}  # type: ignore[attr-defined]
+    coordinator._code_match_tasks = set()  # type: ignore[attr-defined]
+    coordinator._code_changes_running = set()  # type: ignore[attr-defined]
     coordinator.async_update_listeners = lambda: None  # type: ignore[method-assign]
     coordinator.async_request_refresh = lambda: asyncio.sleep(0)  # type: ignore[method-assign]
 

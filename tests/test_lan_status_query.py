@@ -222,6 +222,9 @@ class SlotIsolationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.hub = await QueryingFakeHub().start()
         coordinator = AifaSmartCoordinator.__new__(AifaSmartCoordinator)
+        coordinator._code_trials = {}  # type: ignore[attr-defined]
+        coordinator._code_matches = {}  # type: ignore[attr-defined]
+        coordinator._code_match_tasks = set()  # type: ignore[attr-defined]
         coordinator.data = AifaAccountData(  # type: ignore[attr-defined]
             devices={"7001": _device()}, macros=[], fetched_at=None,  # type: ignore[arg-type]
         )

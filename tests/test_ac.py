@@ -427,11 +427,10 @@ class AifaAcEncoderRegressionTests(unittest.TestCase):
 class AifaAcDeviceCodeBcdTests(unittest.TestCase):
     """The Dart-side encoder always BCD-encodes device_code into bytes 3-4.
 
-    Static evidence: AirConditionerStatusOn.toBytes calls deviceCodeToBytes
-    which does .toString().padLeft(4, "0") then int.parse(substring(0,2),
-    radix:16) and int.parse(substring(2,4), radix:16) — i.e., interpret each
-    pair of decimal digits as a hex byte. So device 136 → "0136" → bytes
-    [0x01, 0x36].
+    Static evidence (i-Ctrl Pro 1.2.9, deviceCodeToBytes 0x64d548):
+    .toString().padLeft(4, "0"), then int.parse(substring(0, 2), radix: 16)
+    and int.parse(substring(2), radix: 16), each kept to its low 8 bits by
+    a Uint8List. So device 136 → "0136" → bytes [0x01, 0x36].
     """
 
     def test_device_136_encodes_as_01_36(self) -> None:
@@ -439,24 +438,20 @@ class AifaAcDeviceCodeBcdTests(unittest.TestCase):
 
         self.assertEqual(_bcd_encode_device_code(136), (0x01, 0x36))
 
-    def test_cloud_code_19844_encodes_per_dart_truncation(self) -> None:
-        """5-digit cloud codes (remote=true catalog rows 19844..19999): Dart
-        does substring(2, 4) which silently drops the 5th char. Resulting
-        bytes alias across siblings — the hub disambiguates using its
-        set-code-loaded value, treating bytes 3-4 as a family hint."""
+    def test_cloud_code_19844_encodes_like_the_app(self) -> None:
+        """5-digit codes: substring(2) is "844", 0x844 & 0xff is 0x44."""
         from custom_components.aifa_smart.ac import _bcd_encode_device_code
 
-        self.assertEqual(_bcd_encode_device_code(19844), (0x19, 0x84))
+        self.assertEqual(_bcd_encode_device_code(19844), (0x19, 0x44))
         self.assertEqual(_bcd_encode_device_code(19999), (0x19, 0x99))
 
-    def test_cloud_code_5th_digit_dropped(self) -> None:
-        """19844..19848 all collapse to (0x19, 0x84) because Dart's
-        substring(2, 4) discards index 4. This aliasing is by design on
-        the AIFA hub side."""
+    def test_cloud_codes_keep_their_last_two_digits(self) -> None:
+        """19844..19848 differ on the wire; 19844 and 19944 share bytes."""
         from custom_components.aifa_smart.ac import _bcd_encode_device_code
 
-        for code in (19844, 19845, 19846, 19847, 19848):
-            self.assertEqual(_bcd_encode_device_code(code), (0x19, 0x84))
+        for code, low in ((19844, 0x44), (19845, 0x45), (19846, 0x46), (19847, 0x47), (19848, 0x48)):
+            self.assertEqual(_bcd_encode_device_code(code), (0x19, low))
+        self.assertEqual(_bcd_encode_device_code(19944), _bcd_encode_device_code(19844))
 
     def test_device_above_99999_raises(self) -> None:
         """6+ digit codes don't exist in any AIFA catalog (max real is 19999)
@@ -482,9 +477,9 @@ class AifaAcDeviceCodeBcdTests(unittest.TestCase):
             _build("cool", 24, key_press=8, code="not-a-number")
 
     def test_build_status_command_uses_cloud_code_19844_bcd(self) -> None:
-        """Bytes 3-4 mirror Dart's substring truncation for 5-digit codes."""
+        """Bytes 3-4 follow deviceCodeToBytes for 5-digit codes."""
         cmd = _build("cool", 24, key_press=8, code="19844")
-        self.assertEqual(cmd[6:10], "1984")
+        self.assertEqual(cmd[6:10], "1944")
 
     def test_build_status_command_raises_on_overlong_device_code(self) -> None:
         with self.assertRaisesRegex(ValueError, "cannot be BCD-encoded"):

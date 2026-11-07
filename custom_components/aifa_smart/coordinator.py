@@ -8,9 +8,10 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from enum import StrEnum
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, HassJob, HomeAssistant, callback
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
     HomeAssistantError,
@@ -26,20 +27,27 @@ from homeassistant.util import dt as dt_util
 from .ac import (
     CLASSIC_AC_QUERY_PACKET,
     FAN_SPEED_KEY,
+    SET_CODE_MAX_DEVICE_CODE,
     STATUS_KEY_PRESS_MODE,
     STATUS_KEY_PRESS_TEMPERATURE_DOWN,
     STATUS_KEY_PRESS_TEMPERATURE_UP,
     AifaAcKey,
     AifaAcStatus,
+    CodeMatchReply,
     ac_key_requires_power_on,
     build_ac_key_command,
     build_app_status_command,
     build_classic_temperature_key_command,
+    build_code_match_next_command,
+    build_code_match_start_command,
     build_estimated_capabilities,
     build_mode_key_command,
+    build_pairing_key_command,
     build_power_off_command,
     build_power_on_command,
+    build_set_code_command,
     clamp_target_temperature,
+    device_code_wire_bytes,
     get_ac_capabilities,
     get_default_mode,
     hub_reports_ac_state,
@@ -48,16 +56,20 @@ from .ac import (
     is_supported_ac_sub_device,
     normalize_ac_mode,
     normalize_catalog_mode,
+    parse_code_match_packet,
+    set_code_slot,
 )
 from .api import (
     AifaClassicSensorState,
     AifaDevice,
+    AifaDeviceCode,
     AifaDeviceCodeCatalog,
     AifaFunction,
     AifaFunctionCommand,
     AifaMacro,
     AifaSensorSample,
     AifaSmartApiClient,
+    AifaSmartApiError,
     AifaSmartAuthError,
     AifaSmartConnectionError,
     AifaSmartError,
@@ -65,10 +77,12 @@ from .api import (
 )
 from .classic_listener import (
     AifaClassicSocketListenerSpec,
+    AifaClassicSocketTarget,
     ClassicSocketManager,
     _ac_socket_sub_type,
 )
 from .const import (
+    CONF_SELECTED_BRANDS,
     DOMAIN,
     LAN_AUTO_SUPPRESS_SECONDS,
     LAN_CONNECT_TIMEOUT,
@@ -112,6 +126,64 @@ AC_POWER_OFF_STRICT_CONFIRM = False
 # report before the hub's own report is shown again.
 AC_PENDING_RELEASE_SECONDS = 14.0
 AC_PENDING_RELEASE_OFF_SECONDS = 26.0
+# The hub echoes SetCode as `fa f5 <slot> <hi> <lo> f0` within a second, or
+# answers `fb f5` and keeps its code when it does not support the new one.
+SET_CODE_ACK_TIMEOUT = 3.0
+# i-Ctrl Pro waits 2 s after SetCode before it sends the next packet.
+SET_CODE_SETTLE_SECONDS = 2.0
+# Right after `fb f5` the hub ignores packets for a short while, so the
+# follow-up query waits before it is sent.
+SET_CODE_REJECT_SETTLE = 0.5
+SET_CODE_QUERY_TIMEOUT = 3.0
+ISSUE_DEVICE_CODE_MISMATCH = "device_code_mismatch"
+# i-Ctrl Pro gives up 15 s after StartMatch; a candidate does not restart it.
+CODE_MATCH_TIMEOUT = 15.0
+# A 4-byte end may be the head of a candidate split across reads; the hub
+# sends the rest at once or nothing more.
+CODE_MATCH_SHORT_END_GRACE = 0.3
+# Errors after which bytes may have reached the hub.
+_WRITE_FAILED_KEYS = frozenset({"lan_write_failed", "cloud_write_failed"})
+
+
+class SetCodeOutcome(StrEnum):
+    """What the hub showed after one SetCode."""
+
+    CONFIRMED = "confirmed"
+    # The hub answered with a different code: it did not take this one.
+    MISMATCH = "mismatch"
+    # Nothing came back in time; the hub may or may not use the new code.
+    UNCONFIRMED = "unconfirmed"
+    # Nothing was written, so the hub still uses its old code.
+    NOT_SENT = "not_sent"
+    # The hub answered `fb f5` and a query showed it kept its old code.
+    REJECTED = "rejected"
+    # The hub answered `fb f5`, but no query showed the old code.
+    REJECTED_UNVERIFIED = "rejected_unverified"
+    # The hub echoed the code and no query followed: a query right before
+    # the test press would make the hub drop it.
+    ACKED = "acked"
+
+
+@dataclass(slots=True)
+class CodeTrial:
+    """A hub left on a code it was tried on; the cloud still has `original_code`."""
+
+    owner: str
+    sub_device_id: str
+    slot: int
+    original_code: int
+    # None when the hub never confirmed what it uses.
+    hub_code: int | None
+    press: asyncio.Task[None] | None = None
+    remove_shutdown_job: CALLBACK_TYPE | None = None
+
+
+class DeviceCodeChangeError(HomeAssistantError):
+    """A code change that failed; `reason` is the options-flow error key."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +231,22 @@ class _HubReportWaiter:
     """Status reports a hub sent while one command waits for confirmation."""
 
     reports: list[tuple[str, int, AifaAcStatus]] = field(default_factory=list)
+    # SetCode echoes as (source, slot, hi, lo).
+    acks: list[tuple[str, int, int, int]] = field(default_factory=list)
+    # Sources of `fb f5` SetCode refusals.
+    rejects: list[str] = field(default_factory=list)
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Reports during a code change carry a code the cloud does not have yet.
+    changing_code: bool = False
+
+
+@dataclass(slots=True)
+class _CodeMatch:
+    """Replies a hub sent while it looks for the code of a remote."""
+
+    slot: int
+    # (source, kind, candidate code, 4-byte end)
+    replies: list[tuple[str, CodeMatchReply, int | None, bool]] = field(default_factory=list)
     event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -288,8 +376,12 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
     _device_cache: AifaDeviceCache | None = None
     # True from an offline start until the first successful cloud refresh.
     running_on_cache: bool = False
+    # Sub-devices whose reported code was compared with the cloud since setup.
+    _device_code_checked: set[tuple[str, str]] | None = None
     # Set on unload; a refresh that is not an entry task may still finish.
     _closed: bool = False
+    # Set when unload starts, so no code trial begins after it undid them.
+    _closing: bool = False
 
     def __init__(
         self,
@@ -312,6 +404,10 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         self._ac_apply_locks: dict[str, asyncio.Lock] = {}
         self._ac_last_send_at: dict[tuple[str, str | None], float] = {}
         self._hub_report_waiters: dict[str, list[_HubReportWaiter]] = {}
+        self._code_trials: dict[str, CodeTrial] = {}
+        self._code_changes_running: set[str] = set()
+        self._code_matches: dict[str, _CodeMatch] = {}
+        self._code_match_tasks: set[asyncio.Task[list[int]]] = set()
         self._lan_queried_at: dict[str, datetime | None] = {}
         self._consecutive_failures = 0
         # The base class registers async_shutdown on the entry's unload.
@@ -330,7 +426,11 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
             on_sensor_state=self._apply_classic_sensor_state,
             on_data_changed=self.async_update_listeners,
             on_notify_full_refresh=self.async_request_refresh,
+            on_set_code_ack=self._apply_cloud_set_code_ack,
+            on_set_code_reject=self._apply_cloud_set_code_reject,
+            on_code_match=self._apply_cloud_code_match,
         )
+        self._device_code_checked = set()
         self._transport = transport_from_options(entry.options)
         self._lan_failed_at: dict[str, float] = {}
         self._transport_counters: dict[str, int | str | None] = {
@@ -346,6 +446,9 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
                 on_observed_status=self._apply_lan_observed_status,
                 on_data_changed=self.async_update_listeners,
                 on_link_state_changed=self._on_lan_link_state_changed,
+                on_set_code_ack=self._apply_lan_set_code_ack,
+                on_set_code_reject=self._apply_lan_set_code_reject,
+                on_code_match=self._apply_lan_code_match,
             )
             self._device_cache = AifaDeviceCache(hass, entry.entry_id)
 
@@ -423,6 +526,17 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
 
     async def async_shutdown(self) -> None:
         """Cancel background classic-socket and pending-release tasks."""
+        # Before the links close: a reload must not leave the hub on a code
+        # the cloud does not have.
+        self._closing = True
+        for device_id, trial in list(self._code_trials.items()):
+            await self._async_end_code_trial(device_id, trial)
+        # Waiting out a match would hold the unload for up to 15 s.
+        for task in list(self._code_match_tasks):
+            _LOGGER.warning("Unloading during a code match; the hub may wait for NextMatch")
+            task.cancel()
+        if self._code_match_tasks:
+            await asyncio.gather(*self._code_match_tasks, return_exceptions=True)
         self._closed = True
         await super().async_shutdown()
         await self._classic_listener.shutdown()
@@ -467,8 +581,13 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         only when nothing could be written or a write failed, never resends;
         the cloud path has no REST fallback, as in the app.
         """
+        self._raise_if_code_trial(command.device_id, command.sub_device_id)
+        # Any packet would wait out the match on the hub lock.
+        self._raise_if_code_match(command.device_id)
         # A report during an AC command's wait must not come from this packet.
         async with self._ac_apply_lock(command.device_id):
+            self._raise_if_code_trial(command.device_id, command.sub_device_id)
+            self._raise_if_code_match(command.device_id)
             transport = await self._async_send_raw_command(command)
         return self._send_response(command, transport)
 
@@ -815,7 +934,23 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         hub's last report.
         """
         lock_key = (device_id, sub_device_id)
+        # A code match holds the lock for up to 15 s; refuse at once.
+        self._raise_if_code_trial(device_id, sub_device_id)
         async with self._ac_apply_lock(device_id):
+            self._raise_if_code_trial(device_id, sub_device_id)
+            current = self.get_sub_device(device_id, sub_device_id)
+            if (
+                device_code is not None
+                and current is not None
+                and current.device_code != device_code
+            ):
+                # A code change finished while this command waited for the
+                # lock; its packet would carry the old code.
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="ac_device_code_changed",
+                    translation_placeholders={"device_id": device_id},
+                )
             await self._async_throttle_ac_send(lock_key)
             state = self.get_ac_runtime_state(
                 device_id, sub_device_id, device_code=device_code
@@ -932,7 +1067,9 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         on_written: Callable[[], None] | None = None,
     ) -> None:
         lock_key = (device_id, sub_device_id)
+        self._raise_if_code_trial(device_id, sub_device_id)
         async with self._ac_apply_lock(device_id):
+            self._raise_if_code_trial(device_id, sub_device_id)
             await self._async_throttle_ac_send(lock_key)
             await self._async_send_confirmed(
                 AifaFunctionCommand(
@@ -943,6 +1080,33 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
                 ),
                 confirmation(),
                 on_written=on_written,
+            )
+
+    def _raise_if_code_trial(self, device_id: str, sub_device_id: str | None) -> None:
+        """Refuse AC packets while the hub is left on a code being tried or matches one.
+
+        Every AC on a hub shares slot 0, so all of them are refused.
+        """
+        matching = device_id in self._code_matches
+        if (not matching and device_id not in self._code_trials) or sub_device_id is None:
+            return
+        sub_device = self.get_sub_device(device_id, sub_device_id)
+        if sub_device is None or not is_supported_ac_sub_device(
+            sub_device.type, sub_device.device_code
+        ):
+            return
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="ac_device_code_match" if matching else "ac_device_code_trial",
+            translation_placeholders={"device_id": device_id},
+        )
+
+    def _raise_if_code_match(self, device_id: str) -> None:
+        if device_id in self._code_matches:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="ac_device_code_match",
+                translation_placeholders={"device_id": device_id},
             )
 
     def _ac_apply_lock(self, device_id: str) -> asyncio.Lock:
@@ -1381,17 +1545,35 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         except AifaSmartError as err:
             raise UpdateFailed(str(err)) from err
 
-    async def _async_enrich_sub_device(self, sub_device: AifaSubDevice) -> None:
-        """Attach selected device-code metadata and AC capability hints."""
-        catalog = self._device_code_catalogs.get(sub_device.id)
-        if catalog is None:
-            catalog = await self.client.async_get_sub_device_device_codes(sub_device.id)
-            self._device_code_catalogs[sub_device.id] = catalog
+    def selected_brand_id(self, sub_device: AifaSubDevice) -> str | None:
+        """The brand chosen in the options flow while the code is still the one chosen."""
+        options = getattr(getattr(self, "entry", None), "options", None) or {}
+        records = options.get(CONF_SELECTED_BRANDS)
+        record = records.get(sub_device.id) if isinstance(records, dict) else None
+        if not isinstance(record, dict) or not record.get("brand_id"):
+            return None
+        # Changed elsewhere, e.g. in i-Ctrl Pro, the choice no longer applies.
+        if _code_key(record.get("device_code")) != _code_key(sub_device.device_code):
+            return None
+        return str(record["brand_id"])
 
-        sub_device.available_brand_count = len(catalog.brands)
-        sub_device.available_device_code_count = len(catalog.device_codes)
-
-        selected = catalog.find_by_code(sub_device.device_code)
+    def _apply_catalog_row(
+        self, sub_device: AifaSubDevice, catalog: AifaDeviceCodeCatalog
+    ) -> None:
+        brand_id = self.selected_brand_id(sub_device)
+        selected = None
+        if brand_id is not None:
+            code = _code_key(sub_device.device_code)
+            selected = next(
+                (
+                    row
+                    for row in catalog.device_codes
+                    if row.brand_id == brand_id and _code_key(row.code) == code
+                ),
+                None,
+            )
+        if selected is None:
+            selected = catalog.find_by_code(sub_device.device_code)
         if selected is not None:
             sub_device.device_code_brand_id = selected.brand_id
             sub_device.device_code_brand_name = selected.brand_name
@@ -1402,6 +1584,53 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
             sub_device.device_code_type = selected.type
             sub_device.device_code_remote = selected.remote
             sub_device.device_code_popular = selected.popular
+
+    def _record_selected_brand(
+        self, sub_device_id: str, brand_id: str | None, device_code: str | int
+    ) -> None:
+        options = self.entry.options
+        records = dict(options.get(CONF_SELECTED_BRANDS) or {})
+        if brand_id:
+            records[sub_device_id] = {
+                "brand_id": brand_id,
+                "device_code": _code_key(device_code),
+            }
+        else:
+            records.pop(sub_device_id, None)
+        self.hass.config_entries.async_update_entry(
+            self.entry, options={**options, CONF_SELECTED_BRANDS: records}
+        )
+
+    async def async_select_brand(
+        self, device_id: str, sub_device_id: str, row: AifaDeviceCode
+    ) -> None:
+        """Keep the brand chosen with the code the AC already uses.
+
+        Shown from the cached catalog; without one the next poll shows it.
+        """
+        sub_device = self.get_sub_device(device_id, sub_device_id)
+        if sub_device is None:
+            return
+        self._record_selected_brand(sub_device_id, row.brand_id, sub_device.device_code)
+        catalog = self._device_code_catalogs.get(sub_device_id)
+        if catalog is None:
+            return
+        self._apply_catalog_row(sub_device, catalog)
+        if self.data is not None:
+            await self._async_save_device_cache(self.data)
+        self.async_update_listeners()
+
+    async def _async_enrich_sub_device(self, sub_device: AifaSubDevice) -> None:
+        """Attach selected device-code metadata and AC capability hints."""
+        catalog = self._device_code_catalogs.get(sub_device.id)
+        if catalog is None:
+            catalog = await self.client.async_get_sub_device_device_codes(sub_device.id)
+            self._device_code_catalogs[sub_device.id] = catalog
+
+        sub_device.available_brand_count = len(catalog.brands)
+        sub_device.available_device_code_count = len(catalog.device_codes)
+
+        self._apply_catalog_row(sub_device, catalog)
 
         if (sub_device.type or "").strip() == "0" and sub_device.device_code:
             capabilities = get_ac_capabilities(sub_device.device_code)
@@ -1562,6 +1791,8 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         """
         updated = False
         for target in spec.targets:
+            if self._reported_slot(spec.device_id, target) == sub_type:
+                self._check_reported_device_code(spec.device_id, target, observed)
             if target.sub_type != sub_type:
                 continue
             status = observed
@@ -1593,3 +1824,794 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
                 waiter.reports.append((source, sub_type, observed))
                 waiter.event.set()
         return updated
+
+    def _apply_lan_set_code_ack(
+        self, spec: AifaClassicSocketListenerSpec, slot: int, high: int, low: int
+    ) -> bool:
+        return self._record_set_code_ack(spec.device_id, "lan", slot, high, low)
+
+    def _apply_cloud_set_code_ack(
+        self, spec: AifaClassicSocketListenerSpec, slot: int, high: int, low: int
+    ) -> bool:
+        return self._record_set_code_ack(spec.device_id, "cloud", slot, high, low)
+
+    def _record_set_code_ack(
+        self, device_id: str, source: str, slot: int, high: int, low: int
+    ) -> bool:
+        """Hand an echo to the waiters; True when a code change of ours takes it."""
+        claimed = False
+        for waiter in self._hub_report_waiters.get(device_id, ()):
+            waiter.acks.append((source, slot, high, low))
+            waiter.event.set()
+            claimed = claimed or waiter.changing_code
+        return claimed and slot in (0xA0, 0xA1)
+
+    def _apply_lan_set_code_reject(self, spec: AifaClassicSocketListenerSpec) -> None:
+        self._record_set_code_reject(spec.device_id, "lan")
+
+    def _apply_cloud_set_code_reject(self, spec: AifaClassicSocketListenerSpec) -> None:
+        self._record_set_code_reject(spec.device_id, "cloud")
+
+    def _record_set_code_reject(self, device_id: str, source: str) -> None:
+        """Hand a `fb f5` to a code change of ours; nobody else uses it."""
+        for waiter in self._hub_report_waiters.get(device_id, ()):
+            if waiter.changing_code:
+                waiter.rejects.append(source)
+                waiter.event.set()
+
+    def _apply_lan_code_match(self, spec: AifaClassicSocketListenerSpec, packet: bytes) -> bool:
+        return self._record_code_match(spec.device_id, "lan", packet)
+
+    def _apply_cloud_code_match(self, spec: AifaClassicSocketListenerSpec, packet: bytes) -> bool:
+        return self._record_code_match(spec.device_id, "cloud", packet)
+
+    def _record_code_match(self, device_id: str, source: str, packet: bytes) -> bool:
+        """Hand a match reply to a running match; True when it takes the packet.
+
+        Nothing else may read a candidate: it has the shape of a SetCode echo.
+        """
+        match = self._code_matches.get(device_id)
+        parsed = parse_code_match_packet(packet)
+        if match is None or parsed is None or parsed[1] != match.slot:
+            return False
+        kind, _, code = parsed
+        match.replies.append((source, kind, code, len(packet) == 4))
+        match.event.set()
+        return True
+
+    def _reported_slot(self, device_id: str, target: AifaClassicSocketTarget) -> int:
+        """Slot whose reports carry this AC's code: fe a1 for subType 1.
+
+        target.sub_type is 0 for every AC (_ac_socket_sub_type), so it cannot
+        tell two ACs on one hub apart.
+        """
+        sub_device = self.get_sub_device(device_id, target.sub_device_id)
+        return set_code_slot(None if sub_device is None else sub_device.sub_type) & 0x01
+
+    def _check_reported_device_code(
+        self, device_id: str, target: AifaClassicSocketTarget, observed: AifaAcStatus
+    ) -> None:
+        """Compare the hub's first reported code with the cloud's, once per setup.
+
+        Only raises a repair issue: which side is right is for the user to say.
+        """
+        checked = self._device_code_checked
+        key = (device_id, target.sub_device_id)
+        if checked is None or key in checked:
+            return
+        if device_id in self._code_trials or any(
+            w.changing_code for w in self._hub_report_waiters.get(device_id, ())
+        ):
+            return
+        # 5-digit codes are never echoed, and their bytes alias other codes.
+        if not hub_reports_ac_state(target.device_code):
+            checked.add(key)
+            return
+        cloud_bytes = device_code_wire_bytes(target.device_code)
+        hub_bytes = device_code_wire_bytes(observed.device_code)
+        if cloud_bytes is None or hub_bytes is None:
+            return
+        checked.add(key)
+        issue_id = f"{ISSUE_DEVICE_CODE_MISMATCH}_{target.sub_device_id}"
+        if cloud_bytes == hub_bytes:
+            ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+            return
+        sub_device = self.get_sub_device(device_id, target.sub_device_id)
+        _LOGGER.warning(
+            "AIFA hub %s reports code %s for sub-device %s, the cloud has %s",
+            device_id,
+            observed.device_code,
+            target.sub_device_id,
+            target.device_code,
+        )
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            issue_id,
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=ISSUE_DEVICE_CODE_MISMATCH,
+            translation_placeholders={
+                "name": sub_device.name if sub_device is not None else target.sub_device_id,
+                "hub_code": str(observed.device_code),
+                "cloud_code": str(target.device_code),
+            },
+        )
+
+    async def async_change_device_code(
+        self,
+        device_id: str,
+        sub_device_id: str,
+        row: AifaDeviceCode,
+        *,
+        owner: str | None = None,
+    ) -> bool:
+        """Run the change in a task of its own and wait for it.
+
+        Closing the dialog cancels the flow step; the change must still run
+        to the end, or the hub could stay on a code the cloud never got.
+        `owner` names the flow whose code trial the change may finish.
+        """
+        if device_id in self._code_matches:
+            raise DeviceCodeChangeError("code_match_running")
+        task = self.hass.async_create_background_task(
+            self._async_change_device_code(device_id, sub_device_id, row, owner),
+            name=f"{DOMAIN}_change_device_code_{sub_device_id}",
+        )
+        # A trial started behind a running change would take the code the
+        # cloud had before it.
+        self._code_changes_running.add(device_id)
+        task.add_done_callback(lambda _: self._code_changes_running.discard(device_id))
+        return await asyncio.shield(task)
+
+    def _code_change_target(
+        self, device_id: str, sub_device_id: str, row: AifaDeviceCode
+    ) -> tuple[AifaSubDevice, int, int, int]:
+        """Return (sub-device, slot, cloud code, new code), or raise why not."""
+        sub_device, slot, old_code = self._code_change_sub_device(device_id, sub_device_id)
+        new_code = settable_device_code(row.code)
+        if new_code is None or row.remote is not False:
+            raise DeviceCodeChangeError("code_unsupported")
+        return sub_device, slot, old_code, new_code
+
+    def _code_change_sub_device(
+        self, device_id: str, sub_device_id: str
+    ) -> tuple[AifaSubDevice, int, int]:
+        """Return (sub-device, slot, cloud code), or raise why its code cannot change."""
+        sub_device = self.get_sub_device(device_id, sub_device_id)
+        if sub_device is None or not is_supported_ac_sub_device(
+            sub_device.type, sub_device.device_code
+        ):
+            raise DeviceCodeChangeError("sub_device_unsupported")
+        if sub_device.learned_key_count:
+            raise DeviceCodeChangeError("learned_keys")
+        # Control packets and reports use slot 0 for every AC
+        # (_ac_socket_sub_type), so a slot 1 SetCode would change a code
+        # the integration never uses.
+        if set_code_slot(sub_device.sub_type) != 0xA0:
+            raise DeviceCodeChangeError("sub_device_unsupported")
+        old_code = settable_device_code(sub_device.device_code)
+        if old_code is None:
+            raise DeviceCodeChangeError("current_code_unsupported")
+        return sub_device, set_code_slot(sub_device.sub_type), old_code
+
+    def _owned_code_trial(self, device_id: str, owner: str | None) -> CodeTrial | None:
+        trial = self._code_trials.get(device_id)
+        if trial is not None and trial.owner != owner:
+            raise DeviceCodeChangeError("code_change_busy")
+        return trial
+
+    async def _async_change_device_code(
+        self,
+        device_id: str,
+        sub_device_id: str,
+        row: AifaDeviceCode,
+        owner: str | None = None,
+    ) -> bool:
+        """Switch an air conditioner to another remote code, like i-Ctrl Pro.
+
+        The cloud is only updated after the hub confirmed the new code twice:
+        its SetCode echo and a status report carrying the code. A hub that a
+        trial left on the new code only needs the report. Any failure puts
+        the old code back on the hub, and on the cloud when a PATCH may have
+        landed. Returns False when the code is already in use.
+        """
+        sub_device, slot, old_code, new_code = self._code_change_target(
+            device_id, sub_device_id, row
+        )
+        if new_code == old_code:
+            return False
+
+        async with self._ac_apply_lock(device_id):
+            trial = self._owned_code_trial(device_id, owner)
+            hub_code = old_code if trial is None else trial.hub_code
+            if (
+                trial is not None
+                and hub_code == new_code
+                and await self._async_confirm_hub_code(device_id, slot, new_code)
+            ):
+                outcome = SetCodeOutcome.CONFIRMED
+            else:
+                outcome = await self._async_set_hub_code(
+                    device_id, slot, new_code, current_code=hub_code
+                )
+            if outcome is SetCodeOutcome.NOT_SENT:
+                raise DeviceCodeChangeError("set_code_not_sent")
+            if outcome is SetCodeOutcome.REJECTED:
+                raise DeviceCodeChangeError("set_code_rejected")
+            if outcome is not SetCodeOutcome.CONFIRMED:
+                restored = await self._async_restore_hub_code(device_id, slot, old_code)
+                self._note_trial_hub_code(device_id, owner, old_code if restored else None)
+                if not restored:
+                    raise DeviceCodeChangeError("restore_unconfirmed")
+                raise DeviceCodeChangeError(
+                    {
+                        SetCodeOutcome.MISMATCH: "set_code_mismatch",
+                        SetCodeOutcome.REJECTED_UNVERIFIED: "set_code_rejected_unverified",
+                    }.get(outcome, "set_code_unconfirmed")
+                )
+            self._note_trial_hub_code(device_id, owner, new_code)
+            try:
+                await self.client.async_update_sub_device_code(sub_device_id, new_code)
+            except AifaSmartError as err:
+                _LOGGER.warning(
+                    "Storing code %s for AIFA sub-device %s in the cloud failed: %s",
+                    new_code,
+                    sub_device_id,
+                    err,
+                )
+                restored = await self._async_restore_hub_code(device_id, slot, old_code)
+                self._note_trial_hub_code(device_id, owner, old_code if restored else None)
+                cloud_known = not _update_may_have_landed(err) or await self._async_restore_cloud_code(
+                    sub_device_id, old_code
+                )
+                if restored:
+                    raise DeviceCodeChangeError(
+                        "cloud_update_failed" if cloud_known else "cloud_update_unknown"
+                    ) from err
+                raise DeviceCodeChangeError(
+                    "restore_unconfirmed" if cloud_known else "restore_unconfirmed_cloud_unknown"
+                ) from err
+            trial = self._code_trials.get(device_id)
+            if trial is not None and trial.owner == owner:
+                # The cloud now has the code the hub uses.
+                self._drop_code_trial(device_id, trial)
+
+        self._record_selected_brand(sub_device_id, row.brand_id, new_code)
+        # A poll during the change may have replaced the sub-device object.
+        current = self.get_sub_device(device_id, sub_device_id) or sub_device
+        await self._async_apply_new_device_code(device_id, current, new_code)
+        # Entities, key lists and listener specs are all built from the code
+        # at setup; scheduled here so a closed dialog still gets the reload.
+        self.hass.config_entries.async_schedule_reload(self.entry.entry_id)
+        return True
+
+    async def async_match_device_code(self, device_id: str, sub_device_id: str) -> list[int]:
+        """Let the hub find codes for the original remote, like i-Ctrl Pro's one-touch match.
+
+        After StartMatch the user presses the remote's power key at the hub;
+        it answers with a candidate, then one more for every NextMatch, until
+        an end frame. Returns the candidates in the hub's order; nothing is
+        set on the hub or stored in the cloud.
+        """
+        _, slot, _ = self._code_change_sub_device(device_id, sub_device_id)
+        if self._closing or self._code_change_running(device_id):
+            raise DeviceCodeChangeError("code_change_busy")
+        if device_id in self._code_matches:
+            raise DeviceCodeChangeError("code_match_running")
+        # Registered before the lock, so trials, changes and AC commands are
+        # refused while this waits for it.
+        match = _CodeMatch(slot=slot)
+        self._code_matches[device_id] = match
+        # The hub has no StopMatch and waits for NextMatch after a candidate,
+        # so a closed dialog must not cut the match short: it runs to its end
+        # frame or the 15 s timeout in a task of its own.
+        task = self.hass.async_create_background_task(
+            self._async_run_code_match(device_id, match),
+            name=f"{DOMAIN}_match_device_code_{sub_device_id}",
+        )
+        if not task.done():
+            self._code_match_tasks.add(task)
+            task.add_done_callback(self._code_match_tasks.discard)
+        return await asyncio.shield(task)
+
+    async def _async_run_code_match(self, device_id: str, match: _CodeMatch) -> list[int]:
+        try:
+            async with self._ac_apply_lock(device_id):
+                if self._closing or self._code_change_running(device_id):
+                    raise DeviceCodeChangeError("code_change_busy")
+                return await self._async_match_device_code(device_id, match)
+        finally:
+            if self._code_matches.get(device_id) is match:
+                del self._code_matches[device_id]
+
+    def _code_change_running(self, device_id: str) -> bool:
+        """Whether a SetCode may be under way: a candidate would look like its echo."""
+        return (
+            device_id in self._code_changes_running
+            or device_id in self._code_trials
+            or any(w.changing_code for w in self._hub_report_waiters.get(device_id, ()))
+        )
+
+    async def _async_match_device_code(self, device_id: str, match: _CodeMatch) -> list[int]:
+        # Replies before StartMatch belong to an earlier match.
+        index = len(match.replies)
+        transport = await self._async_send_match_packet(
+            device_id, build_code_match_start_command(match.slot)
+        )
+        source = _report_source(transport)
+        next_packet = build_code_match_next_command(match.slot)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + CODE_MATCH_TIMEOUT
+        codes: list[int] = []
+        short_end_at: float | None = None
+        while True:
+            while index < len(match.replies):
+                reply_source, kind, code, short = match.replies[index]
+                index += 1
+                if reply_source != source:
+                    continue
+                if kind is CodeMatchReply.END and short:
+                    if short_end_at is None:
+                        short_end_at = loop.time() + CODE_MATCH_SHORT_END_GRACE
+                    continue
+                if kind is CodeMatchReply.CANDIDATE:
+                    short_end_at = None
+                if kind is CodeMatchReply.FAILED:
+                    # i-Ctrl Pro drops the candidates it already has.
+                    _LOGGER.warning("AIFA hub %s failed the code match", device_id)
+                    raise DeviceCodeChangeError("code_match_failed")
+                if kind is CodeMatchReply.END:
+                    _LOGGER.debug("AIFA hub %s matched codes %s", device_id, codes)
+                    if not codes:
+                        raise DeviceCodeChangeError("code_match_none")
+                    return codes
+                if code is not None and code not in codes:
+                    codes.append(code)
+                # The hub waits for NextMatch before it sends another one.
+                await self._async_send_match_packet(device_id, next_packet, transport)
+            if short_end_at is not None and loop.time() >= short_end_at:
+                _LOGGER.debug("AIFA hub %s matched codes %s", device_id, codes)
+                if not codes:
+                    raise DeviceCodeChangeError("code_match_none")
+                return codes
+            remaining = deadline - loop.time()
+            if short_end_at is not None:
+                # The grace may run past the timeout: the end did arrive in time.
+                remaining = short_end_at - loop.time()
+            elif remaining <= 0:
+                _LOGGER.warning(
+                    "AIFA hub %s did not end the code match in %s s (candidates %s)",
+                    device_id,
+                    CODE_MATCH_TIMEOUT,
+                    codes,
+                )
+                raise DeviceCodeChangeError("code_match_timeout")
+            match.event.clear()
+            try:
+                await asyncio.wait_for(match.event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _async_send_match_packet(
+        self, device_id: str, packet: str, transport: str | None = None
+    ) -> str:
+        """Send one match packet; NextMatch goes where StartMatch went."""
+        command = AifaFunctionCommand(
+            id="code-match", device_id=device_id, sub_device_id=None, command=packet
+        )
+        try:
+            if transport is None:
+                return await self._async_send_raw_command(command)
+            if transport == "lan":
+                return await self._async_send_raw_command_lan(command)
+            return await self._async_send_raw_command_cloud(command)
+        except (HomeAssistantError, OSError, RuntimeError) as err:
+            _LOGGER.warning("Code match packet %s to AIFA hub %s failed: %s", packet, device_id, err)
+            raise DeviceCodeChangeError("code_match_not_sent") from err
+
+    def code_trial(self, device_id: str) -> CodeTrial | None:
+        """The trial that left this hub off its cloud code, if any."""
+        return self._code_trials.get(device_id)
+
+    async def async_try_device_code(
+        self, device_id: str, sub_device_id: str, row: AifaDeviceCode, *, owner: str
+    ) -> None:
+        """Put the hub on a code and press its power key, like i-Ctrl Pro's pairing.
+
+        Nothing is stored in the cloud. The hub stays on the code until a
+        save, `async_release_code_trial` or an unload puts it back.
+        """
+        _, slot, old_code, new_code = self._code_change_target(
+            device_id, sub_device_id, row
+        )
+        if self._closing or device_id in self._code_changes_running:
+            raise DeviceCodeChangeError("code_change_busy")
+        if device_id in self._code_matches:
+            raise DeviceCodeChangeError("code_match_running")
+        trial = self._owned_code_trial(device_id, owner)
+        if trial is None:
+            # Registered before the press starts, so a flow removed while it
+            # runs still finds the trial to undo.
+            trial = CodeTrial(
+                owner=owner,
+                sub_device_id=sub_device_id,
+                slot=slot,
+                original_code=old_code,
+                hub_code=old_code,
+            )
+            self._code_trials[device_id] = trial
+            trial.remove_shutdown_job = self.hass.async_add_shutdown_job(
+                HassJob(self._async_end_code_trial_on_stop),
+                device_id,
+                trial,
+            )
+        elif trial.press is not None and not trial.press.done():
+            raise DeviceCodeChangeError("code_trial_running")
+        # Closing the dialog cancels the flow step; the press must still end
+        # with a known hub code.
+        trial.press = self.hass.async_create_background_task(
+            self._async_try_device_code(device_id, trial, new_code),
+            name=f"{DOMAIN}_try_device_code_{sub_device_id}",
+        )
+        await asyncio.shield(trial.press)
+
+    async def _async_try_device_code(
+        self, device_id: str, trial: CodeTrial, code: int
+    ) -> None:
+        try:
+            async with self._ac_apply_lock(device_id):
+                if self._code_trials.get(device_id) is not trial:
+                    raise DeviceCodeChangeError("code_change_busy")
+                outcome = await self._async_set_hub_code(
+                    device_id, trial.slot, code, current_code=trial.hub_code, trial=True
+                )
+                if outcome is SetCodeOutcome.NOT_SENT:
+                    raise DeviceCodeChangeError("set_code_not_sent")
+                if outcome is SetCodeOutcome.REJECTED:
+                    raise DeviceCodeChangeError("set_code_rejected")
+                if outcome is not SetCodeOutcome.ACKED:
+                    restored = await self._async_restore_hub_code(
+                        device_id, trial.slot, trial.original_code
+                    )
+                    trial.hub_code = trial.original_code if restored else None
+                    if not restored:
+                        raise DeviceCodeChangeError("restore_unconfirmed")
+                    raise DeviceCodeChangeError(
+                        {
+                            SetCodeOutcome.MISMATCH: "set_code_mismatch",
+                            SetCodeOutcome.REJECTED_UNVERIFIED: "set_code_rejected_unverified",
+                        }.get(outcome, "set_code_unconfirmed")
+                    )
+                trial.hub_code = code
+                # Like i-Ctrl Pro, nothing is awaited after the press: whether
+                # the AC reacted is for the user to see.
+                try:
+                    await self._async_send_raw_command(
+                        AifaFunctionCommand(
+                            id=f"pairing-key-{code}",
+                            device_id=device_id,
+                            sub_device_id=None,
+                            command=build_pairing_key_command(trial.slot),
+                        )
+                    )
+                except (HomeAssistantError, OSError, RuntimeError) as err:
+                    _LOGGER.warning(
+                        "Pairing key to AIFA hub %s after SetCode %s failed: %s",
+                        device_id,
+                        code,
+                        err,
+                    )
+                    raise DeviceCodeChangeError("trial_key_not_sent") from err
+                self._ac_last_send_at[(device_id, trial.sub_device_id)] = time.monotonic()
+        finally:
+            if self._code_trials.get(device_id) is trial and trial.hub_code == trial.original_code:
+                self._drop_code_trial(device_id, trial)
+
+    @callback
+    def async_release_code_trial(self, device_id: str, owner: str) -> None:
+        """Put the hub back on its cloud code once the owning flow is gone."""
+        trial = self._code_trials.get(device_id)
+        if trial is None or trial.owner != owner:
+            return
+        self.hass.async_create_background_task(
+            self._async_end_code_trial(device_id, trial),
+            name=f"{DOMAIN}_end_code_trial_{trial.sub_device_id}",
+        )
+
+    async def async_end_code_trial(self, device_id: str, owner: str) -> bool:
+        """Put the hub back on its cloud code and wait; False when unconfirmed.
+
+        An unconfirmed restore keeps the trial, so the next call sends
+        SetCode again instead of taking the hub's code as known.
+        """
+        trial = self._code_trials.get(device_id)
+        if trial is None:
+            return True
+        if trial.owner != owner:
+            raise DeviceCodeChangeError("code_change_busy")
+        task = self.hass.async_create_background_task(
+            self._async_end_code_trial(device_id, trial, keep_unconfirmed=True),
+            name=f"{DOMAIN}_end_code_trial_{trial.sub_device_id}",
+        )
+        return await asyncio.shield(task)
+
+    async def _async_end_code_trial_on_stop(self, device_id: str, trial: CodeTrial) -> None:
+        # HA iterates its shutdown jobs while running them; removing this one
+        # from inside, as a restore that fails at once would, skips the next.
+        trial.remove_shutdown_job = None
+        await self._async_end_code_trial(device_id, trial)
+
+    async def _async_end_code_trial(
+        self, device_id: str, trial: CodeTrial, *, keep_unconfirmed: bool = False
+    ) -> bool:
+        press = trial.press
+        if press is not None and not press.done():
+            await asyncio.wait({press})
+        async with self._ac_apply_lock(device_id):
+            if self._code_trials.get(device_id) is not trial:
+                return True
+            restored = trial.hub_code == trial.original_code or await self._async_restore_hub_code(
+                device_id, trial.slot, trial.original_code
+            )
+            if restored or not keep_unconfirmed:
+                # Even unconfirmed once the flow is gone: keeping the trial
+                # would refuse every AC command with no dialog left to end it.
+                self._drop_code_trial(device_id, trial)
+            else:
+                trial.hub_code = None
+            return restored
+
+    def _note_trial_hub_code(
+        self, device_id: str, owner: str | None, code: int | None
+    ) -> None:
+        trial = self._code_trials.get(device_id)
+        if trial is None or trial.owner != owner:
+            return
+        trial.hub_code = code
+        if code == trial.original_code:
+            self._drop_code_trial(device_id, trial)
+
+    def _drop_code_trial(self, device_id: str, trial: CodeTrial) -> None:
+        if self._code_trials.get(device_id) is trial:
+            del self._code_trials[device_id]
+        if trial.remove_shutdown_job is not None:
+            trial.remove_shutdown_job()
+            trial.remove_shutdown_job = None
+        # Reports during the trial were not compared with the cloud code;
+        # the next one is, so a hub left on another code raises the issue.
+        if self._device_code_checked is not None:
+            self._device_code_checked.discard((device_id, trial.sub_device_id))
+
+    async def _async_confirm_hub_code(self, device_id: str, slot: int, code: int) -> bool:
+        """Query the hub and return True when its report carries `code`."""
+        waiter = _HubReportWaiter(changing_code=True)
+        waiters = self._hub_report_waiters.setdefault(device_id, [])
+        waiters.append(waiter)
+        try:
+            try:
+                transport = await self._async_send_raw_command(
+                    AifaFunctionCommand(
+                        id="set-code-check",
+                        device_id=device_id,
+                        sub_device_id=None,
+                        command=CLASSIC_AC_QUERY_PACKET,
+                    )
+                )
+            except (HomeAssistantError, OSError, RuntimeError) as err:
+                _LOGGER.debug("Code check query to AIFA hub %s failed: %s", device_id, err)
+                return False
+            source = _report_source(transport)
+            wanted = device_code_wire_bytes(code)
+            report_sub_type = slot & 0x01
+            return await _async_wait_until(
+                waiter,
+                lambda: any(
+                    report_source == source
+                    and sub_type == report_sub_type
+                    and device_code_wire_bytes(observed.device_code) == wanted
+                    for report_source, sub_type, observed in waiter.reports
+                ),
+                SET_CODE_QUERY_TIMEOUT,
+            )
+        finally:
+            waiters.remove(waiter)
+            if not waiters and self._hub_report_waiters.get(device_id) is waiters:
+                del self._hub_report_waiters[device_id]
+
+    async def _async_restore_hub_code(self, device_id: str, slot: int, code: int) -> bool:
+        outcome = await self._async_set_hub_code(device_id, slot, code)
+        if outcome is not SetCodeOutcome.CONFIRMED:
+            _LOGGER.error(
+                "AIFA hub %s did not confirm the restored code %s (%s); "
+                "the hub's code is unknown",
+                device_id,
+                code,
+                outcome,
+            )
+            return False
+        return True
+
+    async def _async_restore_cloud_code(self, sub_device_id: str, code: int) -> bool:
+        """Put the old code back after a PATCH whose result is unknown."""
+        try:
+            await self.client.async_update_sub_device_code(sub_device_id, code)
+        except AifaSmartError as err:
+            _LOGGER.error(
+                "Restoring code %s for AIFA sub-device %s in the cloud failed: %s",
+                code,
+                sub_device_id,
+                err,
+            )
+            return False
+        return True
+
+    async def _async_set_hub_code(
+        self,
+        device_id: str,
+        slot: int,
+        code: int,
+        *,
+        current_code: int | None = None,
+        trial: bool = False,
+    ) -> SetCodeOutcome:
+        """Send SetCode, then check the echo and a queried status report.
+
+        A `fb f5` refusal ends the wait for the echo at once. A query then
+        decides: `current_code` makes it REJECTED and anything else
+        REJECTED_UNVERIFIED; without `current_code`, as when restoring, the
+        code sent makes it CONFIRMED. With `trial` an echo of the code ends
+        it as ACKED after the settle time, ready for the test press.
+        Callers hold the hub's apply lock.
+        """
+        command = AifaFunctionCommand(
+            id=f"set-code-{code}",
+            device_id=device_id,
+            sub_device_id=None,
+            command=build_set_code_command(slot, code),
+        )
+        expected_bytes = device_code_wire_bytes(code)
+        report_sub_type = slot & 0x01
+        waiter = _HubReportWaiter(changing_code=True)
+        waiters = self._hub_report_waiters.setdefault(device_id, [])
+        waiters.append(waiter)
+        try:
+            try:
+                transport = await self._async_send_raw_command(command)
+            except HomeAssistantError as err:
+                if getattr(err, "translation_key", None) in _WRITE_FAILED_KEYS:
+                    return SetCodeOutcome.UNCONFIRMED
+                _LOGGER.warning("SetCode to AIFA hub %s was not sent: %s", device_id, err)
+                return SetCodeOutcome.NOT_SENT
+            except (OSError, RuntimeError) as err:
+                _LOGGER.warning("SetCode to AIFA hub %s failed while writing: %s", device_id, err)
+                return SetCodeOutcome.UNCONFIRMED
+            source = _report_source(transport)
+            expected_ack = (source, slot, *expected_bytes)  # type: ignore[misc]
+            # A late refusal of an earlier SetCode is not about this one.
+            rejects_start = len(waiter.rejects)
+
+            if not await _async_wait_until(
+                waiter,
+                lambda: expected_ack in waiter.acks
+                or source in waiter.rejects[rejects_start:],
+                SET_CODE_ACK_TIMEOUT,
+            ):
+                if any(ack[0] == source for ack in waiter.acks):
+                    _LOGGER.warning(
+                        "AIFA hub %s echoed %s instead of SetCode %s",
+                        device_id,
+                        waiter.acks,
+                        command.command,
+                    )
+                    return SetCodeOutcome.MISMATCH
+                _LOGGER.warning("AIFA hub %s did not echo SetCode %s", device_id, command.command)
+                return SetCodeOutcome.UNCONFIRMED
+
+            rejected = expected_ack not in waiter.acks
+            wanted_bytes = expected_bytes
+            if rejected:
+                _LOGGER.warning(
+                    "AIFA hub %s refused SetCode %s with fb f5", device_id, command.command
+                )
+                if current_code is not None:
+                    wanted_bytes = device_code_wire_bytes(current_code)
+                await asyncio.sleep(SET_CODE_REJECT_SETTLE)
+            else:
+                await asyncio.sleep(SET_CODE_SETTLE_SECONDS)
+                if trial:
+                    return SetCodeOutcome.ACKED
+            start = len(waiter.reports)
+
+            def covered() -> list[AifaAcStatus]:
+                return [
+                    observed
+                    for report_source, sub_type, observed in waiter.reports[start:]
+                    if report_source == source and sub_type == report_sub_type
+                ]
+
+            unverified = (
+                SetCodeOutcome.REJECTED_UNVERIFIED
+                if rejected and current_code is not None
+                else None
+            )
+            if not await self._async_query_hub_status(device_id, transport):
+                return unverified or SetCodeOutcome.UNCONFIRMED
+            if await _async_wait_until(
+                waiter,
+                lambda: any(
+                    device_code_wire_bytes(observed.device_code) == wanted_bytes
+                    for observed in covered()
+                ),
+                SET_CODE_QUERY_TIMEOUT,
+            ):
+                if rejected and current_code is not None:
+                    return SetCodeOutcome.REJECTED
+                return SetCodeOutcome.CONFIRMED
+            if unverified is not None:
+                _LOGGER.warning(
+                    "AIFA hub %s refused SetCode %s but did not report code %s",
+                    device_id,
+                    code,
+                    current_code,
+                )
+                return unverified
+            reports = covered()
+            if reports:
+                _LOGGER.warning(
+                    "AIFA hub %s reports code %s after SetCode %s",
+                    device_id,
+                    reports[-1].device_code,
+                    code,
+                )
+                return SetCodeOutcome.MISMATCH
+            return SetCodeOutcome.UNCONFIRMED
+        finally:
+            waiters.remove(waiter)
+            if not waiters and self._hub_report_waiters.get(device_id) is waiters:
+                del self._hub_report_waiters[device_id]
+
+    async def _async_apply_new_device_code(
+        self, device_id: str, sub_device: AifaSubDevice, new_code: int
+    ) -> None:
+        """Use the new code locally until the entry reloads from the cloud."""
+        sub_device.device_code = str(new_code)
+        try:
+            await self._async_enrich_sub_device(sub_device)
+        except AifaSmartError as err:
+            _LOGGER.debug("Refreshing code metadata for %s failed: %s", sub_device.id, err)
+        self._async_refresh_runtime_state(device_id, sub_device)
+        if self._device_code_checked is not None:
+            self._device_code_checked.discard((device_id, sub_device.id))
+        ir.async_delete_issue(
+            self.hass, DOMAIN, f"{ISSUE_DEVICE_CODE_MISMATCH}_{sub_device.id}"
+        )
+        if self.data is not None:
+            await self._async_save_device_cache(self.data)
+        self.async_update_listeners()
+
+
+def settable_device_code(device_code: str | None) -> int | None:
+    """The code as SetCode can carry it, or None."""
+    try:
+        code = int(str(device_code).strip())
+    except (TypeError, ValueError):
+        return None
+    return code if 0 < code <= SET_CODE_MAX_DEVICE_CODE else None
+
+
+def _code_key(device_code: str | int | None) -> str | None:
+    """A code as the cloud and the catalog spell it, so "0115" matches 115."""
+    code = settable_device_code(device_code)
+    if code is not None:
+        return str(code)
+    return None if device_code is None else str(device_code).strip()
+
+
+def _update_may_have_landed(err: AifaSmartError) -> bool:
+    """A timeout or a 5xx may hide a stored PATCH; a 4xx or auth error does not."""
+    if isinstance(err, AifaSmartAuthError):
+        return False
+    if isinstance(err, AifaSmartApiError):
+        return err.status is None or err.status >= 500
+    return True

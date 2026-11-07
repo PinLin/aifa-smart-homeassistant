@@ -15,7 +15,12 @@ from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.aifa_smart.api import AifaDeviceCodeCatalog, AifaSmartApiClient
+from custom_components.aifa_smart.classic_listener import (
+    ClassicStreamBuffers,
+    process_classic_stream_chunk,
+)
 from custom_components.aifa_smart.const import TRANSPORT_CLOUD, TRANSPORT_LAN
+from custom_components.aifa_smart.coordinator import _HubReportWaiter
 from custom_components.aifa_smart.device_cache import cache_store_key
 from tests.test_device_cache import _StubLan, _device, _entry, _macros
 
@@ -170,3 +175,71 @@ async def test_refresh_finishing_after_unload_leaves_lan_and_cache_alone(
 
     assert len(lan.synced) == synced
     assert cache_store_key(entry.entry_id) not in hass_storage
+    assert coordinator._classic_listener._listener_tasks == {}  # noqa: SLF001
+
+
+# ----- A SetCode echo is not a notify frame -----
+
+_ECHO = bytes.fromhex("faf5a00033f0")
+
+
+async def _parse(chunk: bytes, ack_consumed: bool) -> tuple[int, list]:
+    notified = 0
+    acks: list = []
+
+    def on_notify() -> None:
+        nonlocal notified
+        notified += 1
+
+    def on_ack(slot: int, high: int, low: int) -> bool:
+        acks.append((slot, high, low))
+        return ack_consumed and (slot, high, low) == (0xA0, 0x00, 0x33)
+
+    async def reply_wake() -> None:
+        return None
+
+    await process_classic_stream_chunk(
+        chunk,
+        ClassicStreamBuffers(),
+        device_type=None,
+        reply_wake=reply_wake,
+        on_status=lambda sub_type, observed: False,
+        on_sensor=lambda sensor: False,
+        on_notify=on_notify,
+        on_set_code_ack=on_ack,
+    )
+    return notified, acks
+
+
+@pytest.mark.asyncio
+async def test_echo_of_our_own_set_code_draws_no_refresh() -> None:
+    notified, acks = await _parse(_ECHO, ack_consumed=True)
+    assert acks == [(0xA0, 0x00, 0x33)]
+    assert notified == 0
+
+
+@pytest.mark.asyncio
+async def test_frame_nobody_waits_for_still_refreshes() -> None:
+    # A code changed in i-Ctrl Pro echoes the same way and should reload the account.
+    notified, acks = await _parse(_ECHO, ack_consumed=False)
+    assert acks == [(0xA0, 0x00, 0x33)]
+    assert notified == 1
+
+
+@pytest.mark.asyncio
+async def test_other_frame_in_the_same_chunk_still_refreshes() -> None:
+    notified, _ = await _parse(_ECHO + bytes.fromhex("faf5010203f0"), ack_consumed=True)
+    assert notified == 1
+
+
+def test_coordinator_claims_an_echo_only_during_its_own_code_change() -> None:
+    from tests.test_command_confirmation import _build_coordinator
+
+    coordinator = _build_coordinator("cloud")
+    assert coordinator._record_set_code_ack("7001", "cloud", 0xA0, 0x00, 0x33) is False  # noqa: SLF001
+    coordinator._hub_report_waiters["7001"] = [_HubReportWaiter()]  # noqa: SLF001
+    assert coordinator._record_set_code_ack("7001", "cloud", 0xA0, 0x00, 0x33) is False  # noqa: SLF001
+    coordinator._hub_report_waiters["7001"].append(_HubReportWaiter(changing_code=True))  # noqa: SLF001
+    assert coordinator._record_set_code_ack("7001", "cloud", 0xA0, 0x00, 0x33) is True  # noqa: SLF001
+    # Not a SetCode slot, so not an answer to ours.
+    assert coordinator._record_set_code_ack("7001", "cloud", 0x01, 0x02, 0x03) is False  # noqa: SLF001

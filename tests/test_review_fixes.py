@@ -43,6 +43,9 @@ class _SentLan:
 
 def _send_coordinator(transport: str):
     coordinator = AifaSmartCoordinator.__new__(AifaSmartCoordinator)
+    coordinator._code_trials = {}  # type: ignore[attr-defined]
+    coordinator._code_matches = {}  # type: ignore[attr-defined]
+    coordinator._code_match_tasks = set()  # type: ignore[attr-defined]
     coordinator.data = AifaAccountData(  # type: ignore[attr-defined]
         devices={},
         macros=[

@@ -20,6 +20,9 @@ class CoordinatorRuntimeStateIsolationTests(unittest.TestCase):
 
     def _make_minimal_coordinator(self) -> AifaSmartCoordinator:
         coordinator = AifaSmartCoordinator.__new__(AifaSmartCoordinator)
+        coordinator._code_trials = {}  # type: ignore[attr-defined]
+        coordinator._code_matches = {}  # type: ignore[attr-defined]
+        coordinator._code_match_tasks = set()  # type: ignore[attr-defined]
         coordinator._ac_runtime_states = {}  # type: ignore[attr-defined]
         return coordinator
 
@@ -54,6 +57,9 @@ class CoordinatorMacroExecutionTests(unittest.TestCase):
         from custom_components.aifa_smart.coordinator import AifaAccountData
 
         coordinator = AifaSmartCoordinator.__new__(AifaSmartCoordinator)
+        coordinator._code_trials = {}  # type: ignore[attr-defined]
+        coordinator._code_matches = {}  # type: ignore[attr-defined]
+        coordinator._code_match_tasks = set()  # type: ignore[attr-defined]
         coordinator.data = AifaAccountData(  # type: ignore[attr-defined]
             devices={},
             macros=[macro] if macro is not None else [],
@@ -186,6 +192,9 @@ class CoordinatorTlsDispatchTests(unittest.TestCase):
         from custom_components.aifa_smart.coordinator import AifaAccountData
 
         coordinator = AifaSmartCoordinator.__new__(AifaSmartCoordinator)
+        coordinator._code_trials = {}  # type: ignore[attr-defined]
+        coordinator._code_matches = {}  # type: ignore[attr-defined]
+        coordinator._code_match_tasks = set()  # type: ignore[attr-defined]
         coordinator.data = AifaAccountData(  # type: ignore[attr-defined]
             devices={},
             macros=[],
@@ -331,6 +340,9 @@ class _AcApplyHarness:
             sub_devices=[sub_device], version=version, subversion=subversion,
         )
         coordinator = AifaSmartCoordinator.__new__(AifaSmartCoordinator)
+        coordinator._code_trials = {}  # type: ignore[attr-defined]
+        coordinator._code_matches = {}  # type: ignore[attr-defined]
+        coordinator._code_match_tasks = set()  # type: ignore[attr-defined]
         coordinator.data = AifaAccountData(  # type: ignore[attr-defined]
             devices={"d1": hub}, macros=[], fetched_at=None,  # type: ignore[arg-type]
         )
@@ -637,6 +649,9 @@ class ApplyClassicSensorStateTests(unittest.TestCase):
     @staticmethod
     def _apply(device: AifaDevice, decoded: AifaClassicSensorState) -> bool:
         coordinator = AifaSmartCoordinator.__new__(AifaSmartCoordinator)
+        coordinator._code_trials = {}  # type: ignore[attr-defined]
+        coordinator._code_matches = {}  # type: ignore[attr-defined]
+        coordinator._code_match_tasks = set()  # type: ignore[attr-defined]
         coordinator.get_device = lambda device_id: device
         return coordinator._apply_classic_sensor_state(device.id, decoded)
 

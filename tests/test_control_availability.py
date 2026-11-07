@@ -47,6 +47,9 @@ class _Lan:
 
 def _coordinator(transport: str, *, lan_available: bool | None, cloud_ok: bool):
     coordinator = AifaSmartCoordinator.__new__(AifaSmartCoordinator)
+    coordinator._code_trials = {}  # type: ignore[attr-defined]
+    coordinator._code_matches = {}  # type: ignore[attr-defined]
+    coordinator._code_match_tasks = set()  # type: ignore[attr-defined]
     coordinator._transport = transport  # type: ignore[attr-defined]
     coordinator._lan_manager = (  # type: ignore[attr-defined]
         None if lan_available is None else _Lan(lan_available)

@@ -64,6 +64,9 @@ def _make_coordinator(
     with_lan: bool = True,
 ):
     coordinator = AifaSmartCoordinator.__new__(AifaSmartCoordinator)
+    coordinator._code_trials = {}  # type: ignore[attr-defined]
+    coordinator._code_matches = {}  # type: ignore[attr-defined]
+    coordinator._code_match_tasks = set()  # type: ignore[attr-defined]
     coordinator.data = AifaAccountData(  # type: ignore[attr-defined]
         devices={}, macros=[], fetched_at=None,  # type: ignore[arg-type]
     )
@@ -247,6 +250,9 @@ class CloudDispatchUnchangedTests(unittest.TestCase):
 
     def test_bare_coordinator_defaults_to_cloud(self) -> None:
         coordinator = AifaSmartCoordinator.__new__(AifaSmartCoordinator)
+        coordinator._code_trials = {}  # type: ignore[attr-defined]
+        coordinator._code_matches = {}  # type: ignore[attr-defined]
+        coordinator._code_match_tasks = set()  # type: ignore[attr-defined]
         self.assertEqual(coordinator.transport, TRANSPORT_CLOUD)
         self.assertIsNone(coordinator.lan_manager)
 

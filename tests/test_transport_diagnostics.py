@@ -61,6 +61,9 @@ def _diagnostics_coordinator() -> AifaSmartCoordinator:
     manager.broadcast_addresses = ["192.168.30.255"]
 
     coordinator = AifaSmartCoordinator.__new__(AifaSmartCoordinator)
+    coordinator._code_trials = {}  # type: ignore[attr-defined]
+    coordinator._code_matches = {}  # type: ignore[attr-defined]
+    coordinator._code_match_tasks = set()  # type: ignore[attr-defined]
     coordinator.data = AifaAccountData(  # type: ignore[attr-defined]
         devices={"7001": _device()}, macros=[], fetched_at=_T0,
     )
@@ -83,6 +86,16 @@ def _diagnostics_coordinator() -> AifaSmartCoordinator:
     }
     return coordinator
 
+
+
+async def _open_transport(hass: HomeAssistant, entry):
+    """The options flow opens on a menu; transport is one of its two pages."""
+    menu = await hass.config_entries.options.async_init(entry.entry_id)
+    assert menu["type"] is FlowResultType.MENU
+    assert menu["menu_options"] == ["transport", "device_code"]
+    return await hass.config_entries.options.async_configure(
+        menu["flow_id"], {"next_step_id": "transport"}
+    )
 
 @pytest.mark.asyncio
 async def test_transport_block_snapshot() -> None:
@@ -201,7 +214,7 @@ async def test_found_hub_saves_on_first_submit(hass: HomeAssistant) -> None:
     entry = _entry(hass)
     addr_patch, search_patch, search = _search({"a0:b1:c2:d3:e4:f5": "192.0.2.10"})
     with addr_patch, search_patch:
-        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await _open_transport(hass, entry)
         result = await _submit(hass, result["flow_id"], TRANSPORT_LAN)
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert entry.options == {CONF_TRANSPORT: TRANSPORT_LAN}
@@ -214,7 +227,7 @@ async def test_missing_hub_warns_then_second_submit_saves(hass: HomeAssistant) -
     entry = _entry(hass)
     addr_patch, search_patch, search = _search({})
     with addr_patch, search_patch:
-        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await _open_transport(hass, entry)
         result = await _submit(hass, result["flow_id"], TRANSPORT_AUTO)
         assert result["type"] is FlowResultType.FORM
         assert result["errors"] == {"base": "hub_not_found"}
@@ -234,7 +247,7 @@ async def test_switching_choice_after_warning_searches_again(hass: HomeAssistant
     entry = _entry(hass)
     addr_patch, search_patch, search = _search({})
     with addr_patch, search_patch:
-        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await _open_transport(hass, entry)
         result = await _submit(hass, result["flow_id"], TRANSPORT_LAN)
         result = await _submit(hass, result["flow_id"], TRANSPORT_AUTO)
         assert result["type"] is FlowResultType.FORM
@@ -247,7 +260,7 @@ async def test_cloud_choice_never_searches(hass: HomeAssistant) -> None:
     entry = _entry(hass)
     addr_patch, search_patch, search = _search({})
     with addr_patch, search_patch:
-        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await _open_transport(hass, entry)
         result = await _submit(hass, result["flow_id"], TRANSPORT_CLOUD)
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert search.await_count == 0
@@ -259,7 +272,7 @@ async def test_unloaded_entry_warns_only_when_nothing_answers(hass: HomeAssistan
     entry = _entry(hass, with_hub_list=False)
     addr_patch, search_patch, _search_mock = _search({})
     with addr_patch, search_patch:
-        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await _open_transport(hass, entry)
         result = await _submit(hass, result["flow_id"], TRANSPORT_LAN)
     assert result["errors"] == {"base": "no_hub_found"}
 
@@ -270,9 +283,39 @@ async def test_search_socket_error_counts_as_not_found(hass: HomeAssistant) -> N
     entry = _entry(hass)
     addr_patch, search_patch, _search_mock = _search(OSError("address in use"))
     with addr_patch, search_patch:
-        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await _open_transport(hass, entry)
         result = await _submit(hass, result["flow_id"], TRANSPORT_LAN)
     assert result["errors"] == {"base": "hub_not_found"}
+
+
+DEVICE_CODE_CHANGE_ERRORS = {
+    "learned_keys",
+    "current_code_unsupported",
+    "code_unsupported",
+    "sub_device_unsupported",
+    "set_code_not_sent",
+    "set_code_mismatch",
+    "set_code_rejected",
+    "set_code_rejected_unverified",
+    "set_code_unconfirmed",
+    "cloud_update_failed",
+    "cloud_update_unknown",
+    "restore_unconfirmed",
+    "restore_unconfirmed_cloud_unknown",
+    "code_change_busy",
+    "code_trial_running",
+    "trial_key_not_sent",
+    "trial_restore_unconfirmed",
+}
+
+CODE_MATCH_ERRORS = {
+    "code_match_failed",
+    "code_match_timeout",
+    "code_match_none",
+    "code_match_not_sent",
+    "code_match_running",
+    "code_match_unsupported",
+}
 
 
 def test_warning_strings_exist_in_every_language() -> None:
@@ -281,5 +324,10 @@ def test_warning_strings_exist_in_every_language() -> None:
     component = Path(__file__).parent.parent / "custom_components" / "aifa_smart"
     for name in ("strings.json", "translations/en.json", "translations/zh-Hant.json"):
         errors = json.loads((component / name).read_text())["options"]["error"]
-        assert set(errors) == {"hub_not_found", "no_hub_found"}, name
+        assert set(errors) == {
+            "hub_not_found",
+            "no_hub_found",
+            *DEVICE_CODE_CHANGE_ERRORS,
+            *CODE_MATCH_ERRORS,
+        }, name
         assert "{hubs}" in errors["hub_not_found"], name
