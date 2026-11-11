@@ -165,9 +165,6 @@ def bypass_setup_entry():
         yield
 
 
-@pytest.fixture
-def verify_cleanup():
-    yield
 
 
 def _entry(hass: HomeAssistant, *, with_hub_list: bool = True) -> MockConfigEntry:

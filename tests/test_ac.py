@@ -15,14 +15,9 @@ from custom_components.aifa_smart.ac import (
     build_power_on_command,
     build_app_status_command,
     clamp_target_temperature,
-    clamp_timer_ir_value,
     decode_observed_status_packet,
-    encode_timer_ir_bcd,
-    encode_temperature_bcd,
     get_ac_capabilities,
     get_ac_profile,
-    get_supported_fan_modes,
-    get_supported_swing_modes,
     hub_requires_mode_keys,
     is_supported_ac_device_code,
     is_supported_ac_sub_device,
@@ -66,7 +61,7 @@ def _build(
 
 
 def _as_report(command: str):
-    """i-Ctrl Pro's fromCommandBytes: drop the keyPress byte, then fromBytes."""
+    """The AIFA Smart app's fromCommandBytes: drop the keyPress byte, then fromBytes."""
     packet = bytes.fromhex(command)
     decoded = decode_observed_status_packet(b"\xfe" + packet[1:2] + packet[3:])
     assert decoded is not None
@@ -113,31 +108,17 @@ class AifaAcPacketTests(unittest.TestCase):
             ("auto", "cool", "heat", "fan", "dry"),
         )
         self.assertEqual(
-            get_supported_fan_modes("136"),
+            capabilities.fan_modes,
             ("auto", "low", "medium", "high"),
         )
         self.assertEqual(
-            get_supported_swing_modes("136"),
+            capabilities.swing_modes,
             ("off", "auto", "fixed_1", "fixed_2", "fixed_3", "fixed_4", "fixed_5"),
         )
         self.assertFalse(capabilities.extra_windspeed)
         self.assertTrue(capabilities.supports_turbo)
         self.assertTrue(capabilities.supports_sleep)
         self.assertTrue(capabilities.supports_power_saving)
-
-    def test_temperature_encoding_uses_bcd(self) -> None:
-        """AIFA temperatures are encoded as decimal BCD bytes."""
-        self.assertEqual(encode_temperature_bcd(19), 0x19)
-        self.assertEqual(encode_temperature_bcd(24), 0x24)
-        self.assertEqual(encode_temperature_bcd(30), 0x30)
-
-    def test_timer_ir_encoding_uses_bcd(self) -> None:
-        """AIFA timer IR values use the same decimal BCD byte family."""
-        self.assertEqual(clamp_timer_ir_value(None), 0)
-        self.assertEqual(clamp_timer_ir_value(123), 99)
-        self.assertEqual(encode_timer_ir_bcd(0), 0x00)
-        self.assertEqual(encode_timer_ir_bcd(1), 0x01)
-        self.assertEqual(encode_timer_ir_bcd(12), 0x12)
 
     def test_temperature_clamping_respects_supported_range(self) -> None:
         """Out-of-range target temperatures should clamp safely."""
@@ -240,7 +221,7 @@ class AifaAcPacketTests(unittest.TestCase):
         self.assertFalse(status.turbo)
 
     def test_decode_observed_status_packet_power_saving_mask_is_0x01(self) -> None:
-        """i-Ctrl Pro's fromBytes reads power saving from bit 0 (0x654450)."""
+        """The AIFA Smart app's fromBytes reads power saving from bit 0 (0x654450)."""
         pkt = bytes.fromhex("fea00136260024010001000000f0")
         _, status = decode_observed_status_packet(pkt)  # type: ignore[misc]
         self.assertFalse(status.sleep)
@@ -427,7 +408,7 @@ class AifaAcEncoderRegressionTests(unittest.TestCase):
 class AifaAcDeviceCodeBcdTests(unittest.TestCase):
     """The Dart-side encoder always BCD-encodes device_code into bytes 3-4.
 
-    Static evidence (i-Ctrl Pro 1.2.9, deviceCodeToBytes 0x64d548):
+    Static evidence (AIFA Smart app 1.2.9, deviceCodeToBytes 0x64d548):
     .toString().padLeft(4, "0"), then int.parse(substring(0, 2), radix: 16)
     and int.parse(substring(2), radix: 16), each kept to its low 8 bits by
     a Uint8List. So device 136 → "0136" → bytes [0x01, 0x36].

@@ -1,6 +1,6 @@
-"""The integration asks the hub only when i-Ctrl Pro would.
+"""The integration asks the hub only when the AIFA Smart app would.
 
-i-Ctrl Pro sends `ff f3 f2 f0` on connect and when the AC page opens, and
+The AIFA Smart app sends `ff f3 f2 f0` on connect and when the AC page opens, and
 otherwise relies on what the hub pushes. A hub busy answering extra queries
 has been seen to drop a key press that arrives at the same time.
 """
@@ -274,7 +274,10 @@ async def test_cloud_confirmation_queries_once_after_the_push_wait() -> None:
     commands = [at for packet, at in sent_at if packet != "fff3f2f0"]
     assert len(commands) == 1
     assert len(queries) == 1
-    assert 1.4 <= queries[0] - commands[0] < 2.0
+    # A sleep never ends early; the upper bound only has to rule out a
+    # second push window, so it leaves a whole window of slack.
+    push_window = coordinator_module.AC_CONFIRM_PUSH_TIMEOUT
+    assert push_window <= queries[0] - commands[0] < 2 * push_window
 
 
 class _LanStub:
@@ -319,7 +322,10 @@ async def test_lan_confirmation_queries_once_after_the_push_wait() -> None:
     commands = [at for packet, at in lan.events if packet != "fff3f2f0"]
     assert len(commands) == 1
     assert len(queries) == 1
-    assert 1.4 <= queries[0] - commands[0] < 2.0
+    # A sleep never ends early; the upper bound only has to rule out a
+    # second push window, so it leaves a whole window of slack.
+    push_window = coordinator_module.AC_CONFIRM_PUSH_TIMEOUT
+    assert push_window <= queries[0] - commands[0] < 2 * push_window
 
 
 async def test_pending_release_clears_without_writing_to_the_hub() -> None:
@@ -328,13 +334,18 @@ async def test_pending_release_clears_without_writing_to_the_hub() -> None:
     listener.coordinator = coordinator
     state = coordinator.get_ac_runtime_state("7001", "ac-1", device_code="136")
     state.command_status_pending = True
-    with patch.object(coordinator_module, "AC_PENDING_RELEASE_SECONDS", 0.2):
+    with patch.object(coordinator_module, "AC_PENDING_RELEASE_SECONDS", 60.0):
         coordinator._schedule_ac_pending_release(  # noqa: SLF001
             "7001", "ac-1", expected_mode="cool"
         )
         await asyncio.sleep(0.1)
         assert state.command_status_pending
-        await asyncio.sleep(0.2)
+    # Rescheduling replaces the long window with one that runs out now.
+    with patch.object(coordinator_module, "AC_PENDING_RELEASE_SECONDS", 0.05):
+        coordinator._schedule_ac_pending_release(  # noqa: SLF001
+            "7001", "ac-1", expected_mode="cool"
+        )
+        await _until(lambda: not state.command_status_pending)
     assert not state.command_status_pending
     assert coordinator._ac_pending_release_tasks == {}  # noqa: SLF001
     assert listener.sent == []

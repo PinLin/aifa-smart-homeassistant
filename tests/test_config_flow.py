@@ -33,17 +33,6 @@ def bypass_setup_entry():
         yield
 
 
-@pytest.fixture(autouse=True)
-def verify_cleanup():
-    """Override PHCC's verify_cleanup for this file.
-
-    A successful CREATE_ENTRY result causes HA to spin up entity/device
-    registries and an aiohttp resolver thread under the hood. Those are
-    framework-owned (not from our code), but PHCC's lingering-thread
-    assertion still catches them. Suppressing the check keeps these flow
-    tests focused on behaviour we control.
-    """
-    yield
 
 
 def _make_client(*, tokens: AifaTokens | None = None) -> AsyncMock:

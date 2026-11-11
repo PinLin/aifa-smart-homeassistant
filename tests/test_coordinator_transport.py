@@ -306,5 +306,29 @@ def test_exception_messages_are_translated() -> None:
             assert "{device_id}" in exceptions[key]["message"], (path, key)
 
 
+def test_every_raised_translation_key_exists_in_all_three_files() -> None:
+    import re
+
+    raised = {
+        match
+        for source in _COMPONENT_DIR.glob("*.py")
+        for match in re.findall(
+            r'translation_domain=DOMAIN,\s*translation_key="([a-z_]+)"', source.read_text()
+        )
+    }
+    assert {"cloud_unavailable", "cloud_write_failed", "macro_not_found"} <= raised
+    tables = [
+        json.loads(path.read_text())["exceptions"]
+        for path in (
+            _COMPONENT_DIR / "strings.json",
+            _COMPONENT_DIR / "translations" / "en.json",
+            _COMPONENT_DIR / "translations" / "zh-Hant.json",
+        )
+    ]
+    for key in raised:
+        placeholders = [set(re.findall(r"{(\w+)}", table[key]["message"])) for table in tables]
+        assert placeholders[0] == placeholders[1] == placeholders[2], key
+
+
 if __name__ == "__main__":
     unittest.main()

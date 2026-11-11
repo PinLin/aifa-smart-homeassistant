@@ -2,7 +2,7 @@
 
 On the real hub a status query written right after the LAN connection
 opened drew nothing, while the same query 0.5 s later was answered.
-i-Ctrl Pro waits 500 ms after connecting (LAN) or after the relay's
+The AIFA Smart app waits 500 ms after connecting (LAN) or after the relay's
 handshake ack (cloud) before it reports the link connected and writes.
 """
 from __future__ import annotations

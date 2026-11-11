@@ -150,7 +150,7 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
         ]
         self._attr_hvac_modes = _supported_hvac_modes(device_code)
 
-        # i-Ctrl Pro has no fan or swing selection, only cycle keys (button
+        # The AIFA Smart app has no fan or swing selection, only cycle keys (button
         # entities), so the climate entity offers neither.
         supported_features = (
             ClimateEntityFeature.TURN_ON | ClimateEntityFeature.TURN_OFF
@@ -320,7 +320,10 @@ class AifaAirConditionerClimate(AifaSubDeviceEntity, RestoreEntity, ClimateEntit
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Set a target temperature in the mode the AC is showing."""
         if ATTR_TEMPERATURE not in kwargs:
-            raise HomeAssistantError("AIFA climate requires target temperature")
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="ac_temperature_required",
+            )
 
         requested_mode = kwargs.get(_ATTR_HVAC_MODE)
         if requested_mode is not None and HVACMode(requested_mode) != self.hvac_mode:

@@ -69,10 +69,8 @@ LAN_STATUS_QUERY_PACKET = "fff3f2f0"
 # takes ~90 s and misses links whose writes are still being buffered.
 LAN_IDLE_QUERY_SECONDS = 60.0
 LAN_QUERY_REPLY_TIMEOUT = 5.0
-# An unanswered idle query does not condemn a link that carried bytes this
-# recently, since the hub can ignore queries for 8 s or more. With the
-# defaults the idle query only goes out after 60 s of silence, so this only
-# matters if the idle and reply times ever add up to less than it.
+# An unanswered idle query does not drop a link that carried bytes this
+# recently, since the hub can ignore queries for 8 s or more.
 LAN_RECENT_RX_SECONDS = 30.0
 # The hub drops whatever arrives in the first moments of a connection; the
 # AIFA app reports the link connected, and starts writing, 0.5 s in.
@@ -435,8 +433,6 @@ class LanTransportManager:
         self._closed = False
         self.broadcast_addresses: list[str] = []
 
-    # ----- Public API -----
-
     @property
     def links(self) -> dict[str, LanHubLink]:
         return self._links
@@ -584,8 +580,6 @@ class LanTransportManager:
             self._stop_link(device_id)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-
-    # ----- Lifecycle -----
 
     def _notify_link_state(self) -> None:
         if self._on_link_state_changed is not None:

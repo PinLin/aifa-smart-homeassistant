@@ -3,14 +3,14 @@
 Each AIFA i-Ctrl hub speaks a private TLS protocol on api.aifaremote.com:8751
 in addition to its REST surface. The hub pushes:
 
-- Observed AC status (mode + target_temp; helper flags are not reliably shadowed)
+- AC status reports (mode and fan speed; the setpoint byte is 0 on the firmware seen)
 - Sensor packets (temperature / humidity)
 - Wake-up frames (need a stock reply to keep the connection alive)
 - Notify frames (signal that something else has just changed)
 
 This module owns the lifecycle of those connections — one task per hub, with
 exponential-backoff reconnect and four streaming parser buffers (capped to
-bound long-lived memory growth). Like i-Ctrl Pro, it queries the hub once per
+bound long-lived memory growth). Like the AIFA Smart app, it queries the hub once per
 connection and otherwise relies on what the hub pushes: a hub busy answering
 queries has been seen to drop a key press that arrives at the same time.
 State mutations are delegated back to the coordinator via callbacks so this
@@ -70,7 +70,7 @@ CLASSIC_CONNECT_WRITE_DELAY = 0.5
 # A link that drops sooner than this keeps growing the backoff, so a relay
 # that closes right after the handshake cannot draw a query every second.
 _MIN_HEALTHY_SECONDS = 10.0
-# i-Ctrl Pro's command queue holds the next write for the previous packet's
+# The AIFA Smart app's command queue holds the next write for the previous packet's
 # delay: 600 ms after a key, 300 ms after a query, a 15-byte packet or
 # SetCode. A hub answering a query can drop a key arriving with it.
 KEY_QUEUE_DELAY = 0.6
@@ -532,7 +532,7 @@ class ClassicSocketManager:
                 ):
                     self._on_data_changed()
 
-            # i-Ctrl Pro asks once per connection; every later report is pushed.
+            # The AIFA Smart app asks once per connection; every later report is pushed.
             await self._async_write(
                 spec.device_id, writer, CLASSIC_AC_QUERY_PACKET, queued=True
             )
@@ -568,7 +568,7 @@ class ClassicSocketManager:
         """Write one packet the listener itself owes the hub.
 
         A wake reply answers the hub and does not hold the queue; the
-        connect query does, like any packet i-Ctrl Pro queues.
+        connect query does, like any packet the AIFA Smart app queues.
         """
         lock = self._socket_write_locks.get(device_id)
         data = bytes.fromhex(packet_hex)

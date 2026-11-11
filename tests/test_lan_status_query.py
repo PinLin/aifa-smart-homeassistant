@@ -144,6 +144,8 @@ class LanStatusQueryTests(unittest.IsolatedAsyncioTestCase):
         manager = await self._connect(idle_query_after=0.2, query_reply_timeout=0.2)
         await _wait_until(lambda: self.hub.eof_count >= 1)
         self.assertEqual(manager.links["7001"].last_error, "idle_timeout")
+        # The new link answers, so it cannot drop again before the checks.
+        self.hub.answer_queries = True
         await _wait_until(lambda: len(self.hub.connect_ports) == 2)
         await _wait_until(lambda: manager.is_connected("7001"))
         self.assertEqual(manager.links["7001"].reconnect_count, 1)
@@ -202,8 +204,10 @@ class LanStatusQueryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_any_inbound_byte_resets_the_idle_timer(self) -> None:
         self.hub.answer_queries = False
-        manager = await self._connect(idle_query_after=0.4, query_reply_timeout=0.2)
-        for _ in range(4):
+        # Pushes 0.2 s apart for twice the idle time: each gap leaves 0.8 s
+        # of slack, while the whole run would have drawn a query.
+        manager = await self._connect(idle_query_after=1.0, query_reply_timeout=0.2)
+        for _ in range(10):
             await asyncio.sleep(0.2)
             await self.hub.push(bytes.fromhex("f1aaa0f0"))
         self.assertEqual(self.hub.queries, 0)

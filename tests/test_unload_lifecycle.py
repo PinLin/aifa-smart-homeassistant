@@ -220,7 +220,7 @@ async def test_echo_of_our_own_set_code_draws_no_refresh() -> None:
 
 @pytest.mark.asyncio
 async def test_frame_nobody_waits_for_still_refreshes() -> None:
-    # A code changed in i-Ctrl Pro echoes the same way and should reload the account.
+    # A code changed in the AIFA Smart app echoes the same way and should reload the account.
     notified, acks = await _parse(_ECHO, ack_consumed=False)
     assert acks == [(0xA0, 0x00, 0x33)]
     assert notified == 1

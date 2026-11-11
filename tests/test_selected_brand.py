@@ -1,6 +1,6 @@
 """The brand shown for a code several brands share is the one chosen in the options flow.
 
-The cloud keeps only `deviceCode` for a sub-device, and i-Ctrl Pro 1.2.9
+The cloud keeps only `deviceCode` for a sub-device, and AIFA Smart app 1.2.9
 PATCHes only `{"deviceCode": N}`, so a code picked under a second brand
 would otherwise show as the first catalog brand with that code.
 """
@@ -137,7 +137,7 @@ async def test_chosen_brand_is_shown_at_once_and_after_a_reload(
 async def test_choice_for_another_code_falls_back_to_the_catalog_lookup(
     hass: HomeAssistant, catalog_calls
 ) -> None:
-    # Chosen with 33; the cloud now says 115, e.g. after a change in i-Ctrl Pro.
+    # Chosen with 33; the cloud now says 115, e.g. after a change in the AIFA Smart app.
     entry = await _setup(
         hass, {CONF_SELECTED_BRANDS: {"ac-1": {"brand_id": _CHOSEN, "device_code": "33"}}}
     )

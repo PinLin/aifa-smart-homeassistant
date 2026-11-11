@@ -1,9 +1,9 @@
-"""Finding a remote code with the hub's IR receiver, like i-Ctrl Pro's one-touch match.
+"""Finding a remote code with the hub's IR receiver, like the AIFA Smart app's one-touch match.
 
 A v5/210623 hub answers StartMatch `ff f5 f4 f1 a0 f0` with
 `cc dd`, sends the first candidate `fa f5 a0 00 33 f0` about 2 s after the
 remote's power key, one more for every NextMatch `ff f5 f4 f3 a0 f0`, and
-ended with `fa f5 a0 ff ff f0`. The cases run the options flow against a
+ends with `fa f5 a0 ff ff f0`. The cases run the options flow against a
 fake hub on 127.0.0.1 that does the same.
 """
 from __future__ import annotations

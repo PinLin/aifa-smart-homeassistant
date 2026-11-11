@@ -1,4 +1,4 @@
-"""Saving an air conditioner's remote code, like i-Ctrl Pro's check mark after its pairing.
+"""Saving an air conditioner's remote code, like the AIFA Smart app's check mark after its pairing.
 
 The end-to-end cases run the options flow against a fake hub on 127.0.0.1
 that behaves like the v5/210623 hub: it echoes SetCode as
@@ -156,13 +156,6 @@ async def test_patch_body_carries_only_the_device_code() -> None:
     request.assert_awaited_once_with("PATCH", "/sub-devices/ac-1", json={"deviceCode": 33})
 
 
-async def test_set_code_api_matches_the_app_and_sends_no_body() -> None:
-    client = AifaSmartApiClient(MagicMock(), email="a@example.com", password="x")
-    with patch.object(client, "_authorized_request", AsyncMock(return_value={})) as request:
-        await client.async_push_sub_device_code(sub_device_id="ac-1")
-    request.assert_awaited_once_with("POST", "/sub-devices/ac-1/set-code")
-
-
 # ----- Fake hub -----
 
 
@@ -287,10 +280,6 @@ def bypass_setup_entry():
         yield
 
 
-@pytest.fixture(autouse=True)
-def verify_cleanup():
-    """Same override as test_options_flow: HA-owned threads linger after flows."""
-    yield
 
 
 class Rig:
@@ -725,3 +714,22 @@ async def test_unloaded_entry_mid_flow_aborts(hass: HomeAssistant) -> None:
         await built.close()
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "not_loaded"
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_command_sent_during_a_change_waits_for_it(rig: Rig) -> None:
+    """A command must not reach the hub between SetCode and its check."""
+    from homeassistant.exceptions import HomeAssistantError
+
+    change = asyncio.ensure_future(
+        rig.coordinator.async_change_device_code("7001", "ac-1", _rows()[1])
+    )
+    await _wait_until(lambda: rig.set_codes_sent() != [])
+    with patch.object(rig.hass.config_entries, "async_schedule_reload"):
+        with pytest.raises(HomeAssistantError) as err:
+            await rig.coordinator.async_apply_ac_state(
+                "7001", "ac-1", hvac_mode="on", device_code="115"
+            )
+        assert await change is True
+    assert err.value.translation_key == "ac_device_code_changed"
+    assert rig.hub.packets == ["fff5a00033f0", "fff3f2f0"]

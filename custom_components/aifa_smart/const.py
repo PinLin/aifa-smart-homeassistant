@@ -13,7 +13,6 @@ DEVICES_PATH = "/devices"
 FUNCTIONS_PATH = "/functions"
 DEVICE_TRANSFER_PATH = "/devices/transfer"
 SUB_DEVICE_DEVICE_CODES_PATH = "/sub-devices/{sub_device_id}/device-codes"
-SUB_DEVICE_SET_CODE_PATH = "/sub-devices/{sub_device_id}/set-code"
 SUB_DEVICE_PATH = "/sub-devices/{sub_device_id}"
 MACROS_PATH = "/macros"
 

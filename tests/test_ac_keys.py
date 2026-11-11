@@ -1,4 +1,4 @@
-"""AC page keys follow i-Ctrl Pro 1.2.9: which ones exist, what they send, how they confirm."""
+"""AC page keys follow AIFA Smart app 1.2.9: which ones exist, what they send, how they confirm."""
 from __future__ import annotations
 
 import types
@@ -473,10 +473,6 @@ class FanSpeedSensorTests(unittest.TestCase):
 # ----- Full setup against a real hass -----
 
 
-@pytest.fixture
-def verify_cleanup():
-    """HA-owned threads linger after full setups, as in test_device_cache."""
-    yield
 
 _OLD_SWITCH_KEYS = ("turbo", "sleep", "power_saving")
 

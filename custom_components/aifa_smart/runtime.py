@@ -127,7 +127,7 @@ class AifaAcRuntimeState:
     power_off_held: bool = False
     power_off_report: AifaAcStatus | None = None
     # Shown until the hub's first report or a command, so a restart does not
-    # turn a running AC off and back on in HA. Like i-Ctrl Pro, a fresh
+    # turn a running AC off and back on in HA. Like the AIFA Smart app, a fresh
     # install with nothing to restore shows Off.
     restored_hvac_mode: str | None = None
     restored: bool = False
@@ -137,7 +137,7 @@ class AifaAcRuntimeState:
         """Build a runtime state with sane defaults for a device code."""
         return cls(
             device_code=device_code,
-            # i-Ctrl Pro shows Off until the hub's first status report.
+            # The AIFA Smart app shows Off until the hub's first status report.
             requested_hvac_mode="off",
             requested_target_temperature=clamp_target_temperature(
                 AIFA_AC_DEFAULT_TARGET_TEMP,
@@ -270,8 +270,8 @@ class AifaAcRuntimeState:
         # Stale-observed guard: if a command is in flight (command_status_pending)
         # and the incoming observed packet contradicts that command's mode/temp,
         # the hub almost certainly has not propagated our IR yet — observed is
-        # the *previous* state. Bumping observed_revision still lets the wait
-        # loop see fresh data, but we don't let stale "off" clobber a freshly
+        # the *previous* state. The report is still recorded (and bumps
+        # observed_revision), but a stale "off" must not clobber a freshly
         # sent "cool" (which would silently revert command_status, and so
         # the shown mode, to off). The next pushed report unwinds pending, or
         # the coordinator's pending release does once its window ends.

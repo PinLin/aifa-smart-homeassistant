@@ -1,4 +1,4 @@
-"""Writes keep i-Ctrl Pro's queue spacing, on the LAN and on the cloud socket.
+"""Writes keep the AIFA Smart app's queue spacing, on the LAN and on the cloud socket.
 
 ConnectionRepository sends one packet, then holds the next for that
 packet's delay: 600 ms after a key, 300 ms after a query, a 15-byte packet

@@ -213,7 +213,7 @@ class AifaClassicTemperatureKeyButton(AifaSubDeviceEntity, ButtonEntity):
 
 
 class AifaAcKeyButton(AifaSubDeviceEntity, ButtonEntity):
-    """One key of the i-Ctrl Pro AC page; the app shows no on/off state for it."""
+    """One key of the AIFA Smart app AC page; the app shows no on/off state for it."""
 
     _control_entity = True
 

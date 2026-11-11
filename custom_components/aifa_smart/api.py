@@ -24,7 +24,6 @@ from .const import (
     OAUTH_TOKEN_PATH,
     SUB_DEVICE_DEVICE_CODES_PATH,
     SUB_DEVICE_PATH,
-    SUB_DEVICE_SET_CODE_PATH,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -215,7 +214,7 @@ class AifaSubDevice:
     ac_supports_power_saving: bool | None = None
     ac_supports_turbo: bool | None = None
     estimated_capabilities: list[str] = field(default_factory=list)
-    # i-Ctrl Pro refuses to change the code while any learned key exists.
+    # The AIFA Smart app refuses to change the code while any learned key exists.
     learned_key_count: int = 0
     functions: list[AifaFunction] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
@@ -592,7 +591,7 @@ def extract_code_match_packets(
     """Extract the hub's replies to a code match from a buffer ending at a chunk.
 
     `fb f5 <slot>` (failed) comes out as 3 bytes, `fa f5 <slot> <hi> <lo> f0`
-    as 6. i-Ctrl Pro tells the 4-byte end `fa f5 <slot> xx` by the length of
+    as 6. The AIFA Smart app tells the 4-byte end `fa f5 <slot> xx` by the length of
     the notification; a byte stream has none, so it is 4 bytes when the 6
     bytes it starts do not end in f0, or when the chunk ends after it. A
     chunk may also end inside a candidate, so when xx can open its BCD code
@@ -774,7 +773,7 @@ def decode_classic_sensor_packet(
                 + (1.05 * raw_temperature)
                 + 0.235
             )
-            # i-Ctrl Pro subtracts 1 °C for deviceType 4 (i-Ctrl AC) hubs.
+            # The AIFA Smart app subtracts 1 °C for deviceType 4 (i-Ctrl AC) hubs.
             if device_type is not None and device_type.strip() == "4":
                 temperature -= 1.0
 
@@ -856,7 +855,7 @@ def _parse_sub_device(raw: Mapping[str, Any], device_id: Any) -> AifaSubDevice |
 
 
 def _count_learned_keys(rows: Any, sub_device_id: Any) -> int:
-    """Count learned keys like i-Ctrl Pro: rows whose subDeviceId is this sub-device.
+    """Count learned keys like the AIFA Smart app: rows whose subDeviceId is this sub-device.
 
     A row without subDeviceId sits under this sub-device, so it counts too.
     """
@@ -1209,17 +1208,6 @@ class AifaSmartApiClient:
         if not isinstance(payload, Mapping):
             return AifaDeviceCodeCatalog()
         return _parse_device_code_catalog(payload)
-
-    async def async_push_sub_device_code(self, *, sub_device_id: int | str) -> None:
-        """Ask the cloud to push the sub-device's stored code to the hub.
-
-        POST /sub-devices/{id}/set-code with no body, as i-Ctrl Pro 1.2.9
-        sends it; the app only calls it while running a macro, never when
-        changing a code. The cloud answers 404 while the hub is offline and
-        does not queue the request.
-        """
-        path = SUB_DEVICE_SET_CODE_PATH.format(sub_device_id=sub_device_id)
-        await self._authorized_request("POST", path)
 
     async def async_update_sub_device_code(
         self, sub_device_id: str, device_code: int

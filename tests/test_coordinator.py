@@ -151,11 +151,10 @@ class CoordinatorMacroExecutionTests(unittest.TestCase):
         self.assertEqual(slept, [0.2])
 
     def test_execute_unknown_macro_raises(self) -> None:
-        from custom_components.aifa_smart.api import AifaSmartError
-
         coordinator = self._make_coordinator_with_macro(None)
-        with self.assertRaises(AifaSmartError):
+        with self.assertRaises(HomeAssistantError) as raised:
             asyncio.run(coordinator.async_execute_macro("does-not-exist"))
+        self.assertEqual(raised.exception.translation_key, "macro_not_found")
 
     def test_execute_macro_with_empty_commands_returns_no_responses(self) -> None:
         from custom_components.aifa_smart.api import AifaMacro

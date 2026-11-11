@@ -1,12 +1,12 @@
 """After a restart or reload the AC shows what it showed before, until the hub reports.
 
-This departs from i-Ctrl Pro on purpose (it shows Off until the first
+This departs from the AIFA Smart app on purpose (it shows Off until the first
 report): flipping a running AC to off and back on in HA would trigger
 automations on every restart. With nothing to restore it shows Off.
 
 The state is kept as RestoreEntity extra data, which HA stores even while
 the entity is unavailable; state attributes are not written then, so a
-restart during a network outage used to lose a held power off.
+restart during a network outage keeps a held power off.
 """
 from __future__ import annotations
 

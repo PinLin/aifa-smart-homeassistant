@@ -292,7 +292,7 @@ class LanConfirmationTests(unittest.IsolatedAsyncioTestCase):
         await _wait_until(lambda: self.manager.is_connected("7001"))
         if first_report:
             # The integration's first poll queries the hub; until a report
-            # arrives the AC shows off, like i-Ctrl Pro.
+            # arrives the AC shows off, like the AIFA Smart app.
             await FakeHub.push(self.hub, _report(0, self.hub.mode_byte, self.hub.fan_byte))
             await _wait_until(_has_report(self.coordinator))
         return self.coordinator
@@ -715,7 +715,7 @@ class CloudConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.coordinator.data.macros.append(AifaMacro(id="m", name="Macro", commands=list(commands)))
 
     async def test_macro_step_is_not_confirmed(self) -> None:
-        # Like i-Ctrl Pro: a learned IR code may draw no report at all.
+        # Like the AIFA Smart app: a learned IR code may draw no report at all.
         self._add_macro(
             AifaMacroCommand(id="1", macro_id="m", device_id="7001", sub_device_id=None, command="aabb"),
             AifaMacroCommand(id="2", macro_id="m", device_id="7001", sub_device_id=None, command="ccdd"),

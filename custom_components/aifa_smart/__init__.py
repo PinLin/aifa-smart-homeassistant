@@ -223,11 +223,7 @@ _AC_FLAG_SWITCH_KEYS: tuple[str, ...] = ("turbo", "sleep", "power_saving")
 
 
 async def _async_remove_ac_flag_switches(hass: HomeAssistant, entry_id: str) -> None:
-    """Drop the turbo/sleep/power_saving switches that AC key buttons replaced.
-
-    The switch platform no longer exists, so without this their registry
-    entries would stay behind as orphans.
-    """
+    """Drop the turbo/sleep/power_saving switch entries so they do not stay as orphans."""
     from homeassistant.helpers import entity_registry as er
 
     entity_registry = er.async_get(hass)

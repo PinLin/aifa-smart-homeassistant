@@ -56,10 +56,6 @@ def lan_search_finds_a_hub():
         yield
 
 
-@pytest.fixture(autouse=True)
-def verify_cleanup():
-    """Same override as test_config_flow: HA-owned threads linger after flows."""
-    yield
 
 
 def _entry(hass: HomeAssistant, options: dict | None = None) -> MockConfigEntry:

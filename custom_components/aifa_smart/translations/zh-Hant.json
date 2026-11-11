@@ -38,7 +38,7 @@
       },
       "transport": {
         "title": "AIFA Smart 選項",
-        "description": "選擇指令送到 AIFA 主機的方式。區網會直接連到主機，不經過 AIFA 雲端；自動會先試區網，區網連不上時改走雲端。",
+        "description": "指令送到 AIFA 主機的方式。",
         "data": {
           "transport": "傳輸方式"
         },
@@ -48,7 +48,7 @@
       },
       "device_code": {
         "title": "代碼設定",
-        "description": "選擇要更換遙控器代碼的冷氣與找代碼的方式。有學習按鍵的冷氣不能更換，和 i-Ctrl Pro 相同。",
+        "description": "選擇要更換遙控器代碼的冷氣與找代碼的方式。有學習按鍵的冷氣不能更換。",
         "data": {
           "sub_device": "冷氣",
           "method": "方式"
@@ -64,7 +64,7 @@
       },
       "brand": {
         "title": "選擇設備品牌",
-        "description": "{name} 目前的代碼是 {current_code}。只列出主機可以直接設定的代碼。",
+        "description": "{name} 目前的代碼是 {current_code}。",
         "data": {
           "brand": "品牌"
         }
@@ -77,14 +77,14 @@
           "action": "動作"
         },
         "data_description": {
-          "action": "和 i-Ctrl Pro 的配對一樣，試按前請先關閉冷氣。"
+          "action": "試按前請先關閉冷氣。"
         }
       }
     },
     "error": {
       "hub_not_found": "以下 AIFA 主機沒有回應區網搜尋：{hubs}。區網控制可能連不到這些主機。再送出一次即可照樣儲存。",
       "no_hub_found": "區網搜尋沒有找到任何 AIFA 主機，區網控制可能無法運作。再送出一次即可照樣儲存。",
-      "learned_keys": "這台冷氣有學習按鍵或用過雲端代碼。和 i-Ctrl Pro 一樣，要先在 App 刪除這些按鍵才能更換代碼。",
+      "learned_keys": "這台冷氣有學習按鍵或用過雲端代碼，要先在 AIFA Smart App 刪除這些按鍵才能更換代碼。",
       "current_code_unsupported": "這台冷氣目前的代碼無法再設回主機，所以不能在這裡更換代碼。",
       "code_unsupported": "這個代碼無法直接設定到主機。",
       "sub_device_unsupported": "這個子裝置不是支援的冷氣。",
@@ -94,9 +94,9 @@
       "set_code_rejected_unverified": "主機回覆不支援代碼 {new_code}，但查詢不到它仍是 {current_code}。已把主機改回 {current_code} 並確認，雲端沒有變更。",
       "set_code_unconfirmed": "主機沒有在時限內確認代碼 {new_code}，無法得知是否已經換過去。已把主機改回 {current_code} 並確認，雲端沒有變更。",
       "cloud_update_failed": "代碼 {new_code} 存到 AIFA 雲端失敗。已把主機改回 {current_code} 並確認。",
-      "cloud_update_unknown": "儲存代碼 {new_code} 時 AIFA 雲端沒有回應，把雲端改回 {current_code} 也失敗。主機已改回 {current_code}，但雲端可能已經是 {new_code}。請到 i-Ctrl Pro 確認代碼。",
-      "restore_unconfirmed": "更換失敗，而且主機沒有確認已改回 {current_code}。主機目前的代碼不明，可能是 {current_code} 或 {new_code}。雲端仍是 {current_code}。請到 i-Ctrl Pro 確認冷氣，或再試一次。",
-      "restore_unconfirmed_cloud_unknown": "更換失敗，而且主機沒有確認已改回 {current_code}。主機目前的代碼不明，可能是 {current_code} 或 {new_code}。AIFA 雲端也沒有回應，可能是 {current_code} 或 {new_code}。請到 i-Ctrl Pro 確認冷氣。",
+      "cloud_update_unknown": "儲存代碼 {new_code} 時 AIFA 雲端沒有回應，把雲端改回 {current_code} 也失敗。主機已改回 {current_code}，但雲端可能已經是 {new_code}。請到 AIFA Smart App 確認代碼。",
+      "restore_unconfirmed": "更換失敗，而且主機沒有確認已改回 {current_code}。主機目前的代碼不明，可能是 {current_code} 或 {new_code}。雲端仍是 {current_code}。請到 AIFA Smart App 確認冷氣，或再試一次。",
+      "restore_unconfirmed_cloud_unknown": "更換失敗，而且主機沒有確認已改回 {current_code}。主機目前的代碼不明，可能是 {current_code} 或 {new_code}。AIFA 雲端也沒有回應，可能是 {current_code} 或 {new_code}。請到 AIFA Smart App 確認冷氣。",
       "code_change_busy": "另一個選項視窗正在更換這台主機的代碼，請先完成或關閉它。",
       "code_trial_running": "上一次試按還沒結束，請稍候。",
       "trial_key_not_sent": "主機已切到代碼 {new_code}，但電源鍵沒有送出，請再試按一次。",
@@ -125,7 +125,7 @@
       "options": {
         "cloud": "雲端",
         "lan": "區網",
-        "auto": "自動（優先區網，失敗改走雲端）"
+        "auto": "自動（區網優先，連不上改走雲端）"
       }
     },
     "action": {
@@ -259,7 +259,7 @@
     },
     "device_code_mismatch": {
       "title": "主機與雲端的遙控器代碼不一致",
-      "description": "主機回報 {name} 的代碼是 {hub_code}，但 AIFA 雲端記錄的是 {cloud_code}。Home Assistant 會用雲端的代碼組指令。請到 i-Ctrl Pro 確認哪個代碼才對，再到 App 或 AIFA Smart 選項的「代碼設定」更換。每次重新啟動或重新載入後都會再檢查一次。"
+      "description": "主機回報 {name} 的代碼是 {hub_code}，但 AIFA 雲端記錄的是 {cloud_code}。Home Assistant 會用雲端的代碼組指令。請到 AIFA Smart App 確認哪個代碼才對，再到 AIFA Smart App 或 AIFA Smart 選項的「代碼設定」更換。每次重新啟動或重新載入後都會再檢查一次。"
     }
   },
   "exceptions": {
@@ -282,25 +282,25 @@
       "message": "AIFA 主機 {device_id} 在指令送出後沒有回報任何狀態。指令可能沒有送達，也可能是主機暫時不回應狀態查詢；請先確認冷氣狀態再重試。"
     },
     "ac_state_mismatch": {
-      "message": "指令送出後，AIFA 主機 {device_id} 回報的冷氣狀態是 {reported}，與預期的 {expected} 不符。和 i-Ctrl Pro App 一樣，指令不會重送。"
+      "message": "指令送出後，AIFA 主機 {device_id} 回報的冷氣狀態是 {reported}，與預期的 {expected} 不符。指令不會重送。"
     },
     "ac_key_requires_power_on": {
-      "message": "冷氣關機中，這個按鍵要開機後才能使用，與 i-Ctrl Pro 相同。"
+      "message": "冷氣關機中，這個按鍵要開機後才能使用。"
     },
     "ac_fan_speed_unchanged": {
       "message": "送出風速鍵後，AIFA 主機 {device_id} 回報的風速沒有改變。風速鍵每按一次會切到下一段，所以沒有重送。"
     },
     "ac_power_on_not_reported": {
-      "message": "送出開機鍵後，AIFA 主機 {device_id} 仍回報冷氣關機，開機鍵沒有生效。和 i-Ctrl Pro App 一樣，開機鍵不會重送。"
+      "message": "送出開機鍵後，AIFA 主機 {device_id} 仍回報冷氣關機，開機鍵沒有生效，不會重送。"
     },
     "ac_mode_not_offered": {
-      "message": "i-Ctrl Pro 沒有提供這台冷氣的 {mode} 模式鍵。"
+      "message": "這台冷氣沒有 {mode} 模式鍵。"
     },
     "ac_temperature_unavailable": {
-      "message": "只有在冷氣開機、模式為冷氣或暖氣，或除濕且有回報設定溫度時才能調整溫度，與 i-Ctrl Pro 相同。"
+      "message": "只有在冷氣開機、模式為冷氣或暖氣，或除濕且有回報設定溫度時才能調整溫度。"
     },
     "ac_anti_mold_mode_unsupported": {
-      "message": "智慧防霉不支援冷氣目前的模式，與 i-Ctrl Pro 相同。"
+      "message": "智慧防霉不支援冷氣目前的模式。"
     },
     "ac_device_code_changed": {
       "message": "這個指令在等待時，冷氣的遙控器代碼已經更換，為避免用舊代碼送出，指令沒有送出。請等 AIFA Smart 重新載入後再試一次。"
@@ -310,6 +310,15 @@
     },
     "ac_device_code_match": {
       "message": "主機正在代碼設定裡找代碼，所以指令沒有送出。請等找代碼結束。"
+    },
+    "macro_not_found": {
+      "message": "AIFA 巨集 {macro_id} 已經不存在，請重新載入 AIFA Smart 以更新巨集按鈕。"
+    },
+    "sub_device_not_found": {
+      "message": "AIFA 子裝置 {sub_device_id} 已經不存在，請重新載入 AIFA Smart 以更新實體。"
+    },
+    "ac_temperature_required": {
+      "message": "設定冷氣需要提供目標溫度。"
     },
     "ac_state_unknown": {
       "message": "AIFA 主機 {device_id} 重新啟動後還沒有回報冷氣狀態，這個設定會改掉冷氣目前的風速與風向，所以沒有送出。請稍後再試一次。"

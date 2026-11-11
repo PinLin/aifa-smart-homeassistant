@@ -101,7 +101,7 @@ def _select(options: list[dict[str, str]]) -> SelectSelector:
 
 
 def _settable_rows(rows: list[AifaDeviceCode]) -> list[AifaDeviceCode]:
-    """Rows i-Ctrl Pro sets with SetCode: remote == false, and 4 digits at most."""
+    """Rows the AIFA Smart app sets with SetCode: remote == false, and 4 digits at most."""
     return [
         row
         for row in rows
@@ -114,7 +114,7 @@ def _candidate_rows(
 ) -> list[AifaDeviceCode]:
     """One row per settable candidate, in the hub's order.
 
-    The brand is kept only when a single brand lists the code. i-Ctrl Pro
+    The brand is kept only when a single brand lists the code. The AIFA Smart app
     sets any candidate, so a code missing from the catalog still gets a row.
     """
     candidates: list[AifaDeviceCode] = []
@@ -291,7 +291,7 @@ class AifaSmartOptionsFlow(_OptionsFlowBase):
     async def async_step_match(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.FlowResult:
-        """Let the hub read the original remote, like i-Ctrl Pro's one-touch match.
+        """Let the hub read the original remote, like the AIFA Smart app's one-touch match.
 
         The match takes up to 15 s, longer than a flow step may wait, so it
         runs as the progress task; a closed dialog cancels it.
@@ -455,7 +455,7 @@ class AifaSmartOptionsFlow(_OptionsFlowBase):
     async def async_step_code(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.FlowResult:
-        """Try codes on the hub, like i-Ctrl Pro's pairing, then save one.
+        """Try codes on the hub, like the AIFA Smart app's pairing, then save one.
 
         A try leaves the hub on the code without touching the cloud; the
         hub goes back to the cloud's code when the flow ends without a save.

@@ -1,6 +1,6 @@
-"""Trying a remote code before saving it, like i-Ctrl Pro's pairing button.
+"""Trying a remote code before saving it, like the AIFA Smart app's pairing button.
 
-i-Ctrl Pro sends SetCode, waits 2 s, presses `ff a0 a0 f0` and lets the user
+The AIFA Smart app sends SetCode, waits 2 s, presses `ff a0 a0 f0` and lets the user
 watch the air conditioner. Only the check mark stores the code in the cloud;
 going back puts the old code on the hub. The cases run the options flow
 against a fake hub on 127.0.0.1.
@@ -244,7 +244,7 @@ async def test_save_after_a_try_only_checks_the_code_then_patches(rig: Rig) -> N
 async def test_save_after_a_try_sends_set_code_again_when_the_check_fails(rig: Rig) -> None:
     form = await rig.open_code_form()
     await _submit(rig, form["flow_id"], "33", "try")
-    # Someone moved the hub off the tried code, e.g. i-Ctrl Pro.
+    # Someone moved the hub off the tried code, e.g. the AIFA Smart app.
     rig.hub.codes[0xA0] = (0x01, 0x15)
 
     result = await _submit(rig, form["flow_id"], "33", "save")

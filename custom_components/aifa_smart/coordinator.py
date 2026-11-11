@@ -115,12 +115,8 @@ ISSUE_POLLING_FAILING = "polling_failing"
 # within 0.8 s on the LAN; 1.5 s leaves room for a busy hub or the cloud relay.
 AC_CONFIRM_PUSH_TIMEOUT = 1.5
 AC_CONFIRM_QUERY_TIMEOUT = 1.5
-# Whether the hub reports the AC as off depends on the code: some codes
-# report b4 = b6 = 0 after the power-off key, others keep reporting
-# b6 = 0x20 and never show off. Only "the hub answered" works for every
-# code, so a power off is confirmed by any report. A power on is confirmed
-# strictly: a report that still shows off means the hub dropped the key,
-# and for a code that never shows off every report shows on.
+# Some codes report off after the power-off key and some never do, so any
+# report confirms a power off; a power on needs a report that is not off.
 AC_POWER_OFF_STRICT_CONFIRM = False
 # How long a sent but unreported state is preferred over the hub's last
 # report before the hub's own report is shown again.
@@ -129,14 +125,14 @@ AC_PENDING_RELEASE_OFF_SECONDS = 26.0
 # The hub echoes SetCode as `fa f5 <slot> <hi> <lo> f0` within a second, or
 # answers `fb f5` and keeps its code when it does not support the new one.
 SET_CODE_ACK_TIMEOUT = 3.0
-# i-Ctrl Pro waits 2 s after SetCode before it sends the next packet.
+# The AIFA Smart app waits 2 s after SetCode before it sends the next packet.
 SET_CODE_SETTLE_SECONDS = 2.0
 # Right after `fb f5` the hub ignores packets for a short while, so the
 # follow-up query waits before it is sent.
 SET_CODE_REJECT_SETTLE = 0.5
 SET_CODE_QUERY_TIMEOUT = 3.0
 ISSUE_DEVICE_CODE_MISMATCH = "device_code_mismatch"
-# i-Ctrl Pro gives up 15 s after StartMatch; a candidate does not restart it.
+# The AIFA Smart app gives up 15 s after StartMatch; a candidate does not restart it.
 CODE_MATCH_TIMEOUT = 15.0
 # A 4-byte end may be the head of a candidate split across reads; the hub
 # sends the rest at once or nothing more.
@@ -335,7 +331,7 @@ def _off_status(device_code: str | None) -> AifaAcStatus:
 
 
 def _app_status_base(state: AifaAcRuntimeState, device_code: str | None) -> AifaAcStatus:
-    """The status i-Ctrl Pro copies into a 15-byte packet: its last On report.
+    """The status the AIFA Smart app copies into a 15-byte packet: its last On report.
 
     The app has no packet to copy before its first report (its mode buttons
     and slider are disabled then); this falls back to the setpoint HA last
@@ -394,13 +390,8 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         self._device_code_catalogs: dict[str, AifaDeviceCodeCatalog] = {}
         self._ac_runtime_states: dict[tuple[str, str], AifaAcRuntimeState] = {}
         self._ac_pending_release_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
-        # Per-hub lock + per-(device, sub_device) last-send timestamp to
-        # serialize commands and enforce a min interval between IR sends.
-        # Without these, two HA service calls within ~1s could both send IR
-        # before the hub reconciles the first command, racing on runtime state
-        # and producing the "dropped command" symptom (see runtime.py
-        # apply_observed_status stale-observed guard for the other half of
-        # the fix).
+        # Two service calls within ~1 s would otherwise both send IR before the
+        # hub reports the first, racing on runtime state.
         self._ac_apply_locks: dict[str, asyncio.Lock] = {}
         self._ac_last_send_at: dict[tuple[str, str | None], float] = {}
         self._hub_report_waiters: dict[str, list[_HubReportWaiter]] = {}
@@ -516,7 +507,7 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
                 is_supported_ac_sub_device(sub.type, sub.device_code)
                 for sub in device.sub_devices
             ):
-                # Like i-Ctrl Pro on every connect: state changed while the
+                # Like the AIFA Smart app on every connect: state changed while the
                 # link was down is never pushed, and a LAN-only start has no
                 # cloud poll to ask for it.
                 self.hass.async_create_background_task(
@@ -575,7 +566,7 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         return device.get_sub_device(sub_device_id)
 
     async def _async_send_unconfirmed(self, command: AifaFunctionCommand) -> dict:
-        """Write one packet like i-Ctrl Pro sends a macro step: no report awaited.
+        """Write one packet like the AIFA Smart app sends a macro step: no report awaited.
 
         A macro step may be any learned IR code that draws no report. Raises
         only when nothing could be written or a write failed, never resends;
@@ -836,7 +827,11 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         """
         macro = self.get_macro(macro_id)
         if macro is None:
-            raise AifaSmartError(f"Macro {macro_id} not found")
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="macro_not_found",
+                translation_placeholders={"macro_id": macro_id},
+            )
         if not macro.commands:
             return []
 
@@ -986,7 +981,11 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         """Send one +/- temperature key press to a classic-temperature AC."""
         sub_device = self.get_sub_device(device_id, sub_device_id)
         if sub_device is None:
-            raise AifaSmartError(f"Sub-device {sub_device_id} not found")
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="sub_device_not_found",
+                translation_placeholders={"sub_device_id": sub_device_id},
+            )
         sub_type = _ac_socket_sub_type(sub_device)
         # The status report carries no setpoint, so any report from the
         # slot confirms the press.
@@ -1001,10 +1000,14 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
     async def async_press_ac_key(
         self, device_id: str, sub_device_id: str, key: AifaAcKey
     ) -> None:
-        """Send one i-Ctrl Pro AC page key."""
+        """Send one AIFA Smart app AC page key."""
         sub_device = self.get_sub_device(device_id, sub_device_id)
         if sub_device is None:
-            raise AifaSmartError(f"Sub-device {sub_device_id} not found")
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="sub_device_not_found",
+                translation_placeholders={"sub_device_id": sub_device_id},
+            )
         state = self.get_ac_runtime_state(
             device_id, sub_device_id, device_code=sub_device.device_code
         )
@@ -1205,10 +1208,9 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
             state.apply_sent_command_status(_off_status(device_code))
             state.release_power_off()
             if not strict and report.mode != "off":
-                # The hub keeps repeating this report after a power off it
-                # never reports, so it cannot settle the state; only a
-                # different report can. A report confirming a slot 1 command
-                # may come from slot 0, so that slot waits for its own.
+                # The hub repeats this report after a power off it never
+                # reports, so only a different report settles the state; a
+                # slot 1 AC waits for its own, as this one may be slot 0's.
                 state.hold_power_off(report if confirm_slot is not None else None)
                 state.command_status_pending = False
             self.async_update_listeners()
@@ -1397,10 +1399,8 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
                 getattr(err, "translation_key", None) == "ac_power_on_not_reported"
                 and held
             ):
-                # Held against the off report just seen: the hub repeating it
-                # keeps the AC off, and any other report, such as a power on
-                # from a remote, is shown. The report the hold was set
-                # against before could be the one a real power on brings.
+                # Only a repeat of this off report keeps the AC off; any other
+                # report, such as a power on from a remote, is shown.
                 state.hold_power_off(state.observed_status)
             raise
         return command
@@ -1552,7 +1552,7 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         record = records.get(sub_device.id) if isinstance(records, dict) else None
         if not isinstance(record, dict) or not record.get("brand_id"):
             return None
-        # Changed elsewhere, e.g. in i-Ctrl Pro, the choice no longer applies.
+        # Changed elsewhere, e.g. in the AIFA Smart app, the choice no longer applies.
         if _code_key(record.get("device_code")) != _code_key(sub_device.device_code):
             return None
         return str(record["brand_id"])
@@ -1699,7 +1699,7 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
     ) -> None:
         """Stop preferring the sent state once the hub had time to push its own.
 
-        Like i-Ctrl Pro, nothing is asked after a command: a matching report
+        Like the AIFA Smart app, nothing is asked after a command: a matching report
         clears the pending state on arrival, and otherwise the hub's last
         report is shown once the window ends.
         """
@@ -1739,7 +1739,7 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         now = dt_util.utcnow()
         updated = False
 
-        # The cloud value is what i-Ctrl Pro displays; the hub's raw packet
+        # The cloud value is what the AIFA Smart app displays; the hub's raw packet
         # converts differently, so it only fills readings the cloud lacks.
         for key, value in (
             ("temperature", decoded.temperature),
@@ -2008,7 +2008,7 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         row: AifaDeviceCode,
         owner: str | None = None,
     ) -> bool:
-        """Switch an air conditioner to another remote code, like i-Ctrl Pro.
+        """Switch an air conditioner to another remote code, like the AIFA Smart app.
 
         The cloud is only updated after the hub confirmed the new code twice:
         its SetCode echo and a status report carrying the code. A hub that a
@@ -2087,7 +2087,7 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         return True
 
     async def async_match_device_code(self, device_id: str, sub_device_id: str) -> list[int]:
-        """Let the hub find codes for the original remote, like i-Ctrl Pro's one-touch match.
+        """Let the hub find codes for the original remote, like the AIFA Smart app's one-touch match.
 
         After StartMatch the user presses the remote's power key at the hub;
         it answers with a candidate, then one more for every NextMatch, until
@@ -2158,7 +2158,7 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
                 if kind is CodeMatchReply.CANDIDATE:
                     short_end_at = None
                 if kind is CodeMatchReply.FAILED:
-                    # i-Ctrl Pro drops the candidates it already has.
+                    # The AIFA Smart app drops the candidates it already has.
                     _LOGGER.warning("AIFA hub %s failed the code match", device_id)
                     raise DeviceCodeChangeError("code_match_failed")
                 if kind is CodeMatchReply.END:
@@ -2217,7 +2217,7 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
     async def async_try_device_code(
         self, device_id: str, sub_device_id: str, row: AifaDeviceCode, *, owner: str
     ) -> None:
-        """Put the hub on a code and press its power key, like i-Ctrl Pro's pairing.
+        """Put the hub on a code and press its power key, like the AIFA Smart app's pairing.
 
         Nothing is stored in the cloud. The hub stays on the code until a
         save, `async_release_code_trial` or an unload puts it back.
@@ -2284,7 +2284,7 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
                         }.get(outcome, "set_code_unconfirmed")
                     )
                 trial.hub_code = code
-                # Like i-Ctrl Pro, nothing is awaited after the press: whether
+                # Like the AIFA Smart app, nothing is awaited after the press: whether
                 # the AC reacted is for the user to see.
                 try:
                     await self._async_send_raw_command(

@@ -157,8 +157,8 @@ class StateBroadcastDedupMixin:
     """Skip async_write_ha_state when tracked properties haven't changed.
 
     Each coordinator refresh fans out to every entity's
-    ``_handle_coordinator_update``. With dozens of sensors / switches /
-    buttons per AIFA account, that turns into a lot of HA state writes
+    ``_handle_coordinator_update``. With dozens of sensors and buttons
+    per AIFA account, that turns into a lot of HA state writes
     for a payload that is mostly identical between cycles. Subclasses
     declare which properties drive their visible state via
     ``_state_attrs`` and inherit this mixin alongside ``CoordinatorEntity``;

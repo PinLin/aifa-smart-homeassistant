@@ -245,10 +245,6 @@ class _StubLan:
         return None
 
 
-@pytest.fixture
-def verify_cleanup():
-    """HA-owned threads linger after full setups, as in the flow tests."""
-    yield
 
 
 def _entry(hass: HomeAssistant, transport: str) -> MockConfigEntry:

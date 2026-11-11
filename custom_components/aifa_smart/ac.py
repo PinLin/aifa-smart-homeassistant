@@ -32,7 +32,6 @@ AIFA_AC_ESTIMATED_CAPABILITIES: Final[tuple[str, ...]] = (
 AIFA_AC_MIN_TEMP = 16
 AIFA_AC_MAX_TEMP = 30
 AIFA_AC_DEFAULT_TARGET_TEMP = 24
-AIFA_AC_DEFAULT_TIMER_IR_VALUE = 0
 AIFA_AC_DEFAULT_FAN_MODE = "high"
 AIFA_AC_DEFAULT_SWING_MODE = "fixed_5"
 CLASSIC_AC_QUERY_PACKET = "fff3f2f0"
@@ -56,10 +55,8 @@ _DEFAULT_SWING_MODES: Final[tuple[str, ...]] = (
     "fixed_4",
     "fixed_5",
 )
-_DEFAULT_PACKET_BYTE_12 = 0x00
-_DEFAULT_PACKET_BYTE_13 = 0x00
 
-# Byte tables of i-Ctrl Pro's AirConditionerStatusOn.toBytes / fromBytes.
+# Byte tables of the AIFA Smart app's AirConditionerStatusOn.toBytes / fromBytes.
 _MODE_BYTE_BY_NAME: Final[dict[str, int]] = {
     "auto": 0x10,
     "cool": 0x20,
@@ -86,7 +83,7 @@ _SWING_BYTE_BY_NAME: Final[dict[str, int]] = {
 }
 
 # i-Ctrl hubs on this firmware mis-read the mode byte of the 15-byte status
-# packet, so the i-Ctrl app sends a single mode key instead. The match is on
+# packet, so the AIFA Smart app sends a single mode key instead. The match is on
 # the hub's own version/subversion, not on the AC device code.
 MODE_KEY_HUB_VERSION: Final = 5
 MODE_KEY_HUB_SUBVERSION: Final = 210623
@@ -100,16 +97,16 @@ _MODE_KEY_BY_NAME: Final[dict[str, int]] = {
 }
 _TEMPERATURE_UP_KEY = 0x06
 _TEMPERATURE_DOWN_KEY = 0x07
-# i-Ctrl Pro shows the +/- keys instead of the setpoint slider only on these
+# The AIFA Smart app shows the +/- keys instead of the setpoint slider only on these
 # hub versions (subversion is not checked).
 CLASSIC_TEMP_KEY_HUB_VERSIONS: Final[frozenset[int]] = frozenset({0, 5, 10})
-# Hard-coded in i-Ctrl Pro rather than read from Remote Config.
+# Hard-coded in the AIFA Smart app rather than read from Remote Config.
 WIND_SPEED_PLUS_MINUS_CODES: Final[frozenset[str]] = frozenset({"19866"})
 # Hub DTO types (ProPlus, AcPlus) whose page carries the anti-mold block.
 ANTI_MOLD_HUB_TYPES: Final[frozenset[str]] = frozenset({"6", "8"})
 
 FAN_SPEED_KEY = 0x05
-# i-Ctrl Pro's key callback turns these two into its anti-mold packet.
+# The AIFA Smart app's key callback turns these two into its anti-mold packet.
 _ANTI_MOLD_ON_KEY = 0x99
 _ANTI_MOLD_OFF_KEY = 0x98
 # keyPress byte of the 15-byte packet the app sends from its mode buttons and
@@ -121,7 +118,7 @@ STATUS_KEY_PRESS_TEMPERATURE_DOWN = 0x07
 
 @dataclass(frozen=True, slots=True)
 class AifaAcKey:
-    """One key of the i-Ctrl Pro AC page that sends `ff a0|slot KK f0`."""
+    """One key of the AIFA Smart app AC page that sends `ff a0|slot KK f0`."""
 
     key: str
     code: int
@@ -358,16 +355,6 @@ def get_supported_ac_modes(device_code: str | None) -> tuple[str, ...]:
     return get_ac_capabilities(device_code).available_modes
 
 
-def get_supported_fan_modes(device_code: str | None) -> tuple[str, ...]:
-    """Return supported fan modes for a device-code."""
-    return get_ac_capabilities(device_code).fan_modes
-
-
-def get_supported_swing_modes(device_code: str | None) -> tuple[str, ...]:
-    """Return supported swing modes for a device-code."""
-    return get_ac_capabilities(device_code).swing_modes
-
-
 def get_default_mode(device_code: str | None) -> str:
     """Return the preferred active mode when turning an AC on."""
     available_modes = get_supported_ac_modes(device_code)
@@ -388,21 +375,8 @@ def clamp_target_temperature(
     return max(profile.min_temp, min(profile.max_temp, int(temperature)))
 
 
-def encode_temperature_bcd(target_temperature: int, *, device_code: str | None = None) -> int:
-    """Encode a Celsius temperature using the BCD byte used by AIFA packets."""
-    tens, ones = divmod(
-        clamp_target_temperature(target_temperature, device_code=device_code), 10
-    )
-    return (tens << 4) | ones
-
-
-def _is_bcd_byte(byte: int) -> bool:
-    """True iff each nibble of `byte` is 0..9 (i.e., a valid BCD digit pair)."""
-    return ((byte >> 4) & 0xF) <= 9 and (byte & 0xF) <= 9
-
-
 def _bcd_encode_device_code(device_code: int) -> tuple[int, int]:
-    """Encode a device code into its two packet bytes like i-Ctrl Pro 1.2.9.
+    """Encode a device code into its two packet bytes like AIFA Smart app 1.2.9.
 
     `deviceCodeToBytes` pads the decimal string to 4 characters, parses
     characters [0:2] and [2:] as hex, and a Uint8List keeps only the low
@@ -440,7 +414,7 @@ def _bcd_encode_device_code(device_code: int) -> tuple[int, int]:
     return (int(padded[0:2], 16) & 0xFF, int(padded[2:], 16) & 0xFF)
 
 
-# SetCode bytes for a 5-digit code alias other codes, and i-Ctrl Pro only
+# SetCode bytes for a 5-digit code alias other codes, and the AIFA Smart app only
 # sends SetCode for catalog rows with remote == false.
 SET_CODE_MAX_DEVICE_CODE = 9999
 SET_CODE_ACK_LENGTH = 6
@@ -462,7 +436,7 @@ def build_set_code_command(slot: int, device_code: int) -> str:
     return bytes([0xFF, 0xF5, slot & 0xFF, high, low, 0xF0]).hex()
 
 
-# i-Ctrl Pro's pairing test press uses the generic power key of every
+# The AIFA Smart app's pairing test press uses the generic power key of every
 # sub-device type, not the AC page's on key 0xA1.
 PAIRING_TEST_KEY = 0xA0
 
@@ -487,7 +461,7 @@ def parse_set_code_ack(packet: bytes) -> tuple[int, int, int] | None:
 
 
 def build_code_match_start_command(slot: int) -> str:
-    """Build i-Ctrl Pro's StartMatch `ff f5 f4 f1 <slot> f0`."""
+    """Build the AIFA Smart app's StartMatch `ff f5 f4 f1 <slot> f0`."""
     return bytes([0xFF, 0xF5, 0xF4, 0xF1, slot & 0xFF, 0xF0]).hex()
 
 
@@ -505,7 +479,7 @@ class CodeMatchReply(StrEnum):
 
 
 def parse_code_match_packet(packet: bytes) -> tuple[CodeMatchReply, int, int | None] | None:
-    """Return (kind, slot, candidate code) like i-Ctrl Pro reads a match reply.
+    """Return (kind, slot, candidate code) like the AIFA Smart app reads a match reply.
 
     `fb f5 <slot> …` fails the match; `fa f5 <slot> xx` (4 bytes) or a frame
     with ff after b2 ends it; any other `fa f5 <slot> …` is a candidate whose
@@ -537,20 +511,6 @@ def device_code_wire_bytes(device_code: str | int | None) -> tuple[int, int] | N
         return None
 
 
-def clamp_timer_ir_value(value: int | None) -> int:
-    """Clamp a timer IR byte into the packet family's known BCD-safe range."""
-    if value is None:
-        return AIFA_AC_DEFAULT_TIMER_IR_VALUE
-    return max(0, min(99, int(value)))
-
-
-def encode_timer_ir_bcd(value: int | None) -> int:
-    """Encode the timer IR field using the AC packet's decimal BCD layout."""
-    clamped_value = clamp_timer_ir_value(value)
-    tens, ones = divmod(clamped_value, 10)
-    return (tens << 4) | ones
-
-
 def build_power_on_command(*, device_code: str | None = None) -> str:
     """Return the short raw packet that turns an AC on."""
     profile = get_ac_profile(device_code) or SHARED_AIFA_AC_PROFILE
@@ -569,7 +529,7 @@ def build_classic_temperature_key_command(sub_type: int, *, up: bool) -> str:
 
 
 def build_ac_key_command(key: AifaAcKey, sub_type: int) -> str:
-    """Build one i-Ctrl Pro AC page key press."""
+    """Build one AIFA Smart app AC page key press."""
     if key.code in (_ANTI_MOLD_ON_KEY, _ANTI_MOLD_OFF_KEY):
         return bytes(
             (
@@ -608,7 +568,7 @@ def shows_classic_temperature_keys(
 def visible_ac_keys(
     device_code: str | None, hub_type: str | None = None
 ) -> tuple[AifaAcKey, ...]:
-    """Return the AC page keys i-Ctrl Pro shows for a device code and hub type."""
+    """Return the AC page keys the AIFA Smart app shows for a device code and hub type."""
     capabilities = get_ac_capabilities(device_code)
     single = capabilities.single_mode
     # Remote Config only: the app has no equivalent of the observed-codes list.
@@ -674,7 +634,7 @@ def build_app_status_command(
     sub_type: int,
     device_code: str | None,
 ) -> str:
-    """Build the 15-byte packet i-Ctrl Pro's `AirConditionerStatusOn.toBytes` sends.
+    """Build the 15-byte packet the AIFA Smart app's `AirConditionerStatusOn.toBytes` sends.
 
     The app copies its last reported On status and changes only the pressed
     field, so every other byte repeats what the hub reported.
@@ -728,7 +688,7 @@ FAN_SPEED_OPTIONS: Final[tuple[str, ...]] = ("auto", "low", "medium", "high")
 
 
 def decode_fan_speed_byte(value: int) -> str:
-    """Decode b7 the way i-Ctrl Pro's `_speedFromByte` does.
+    """Decode b7 the way the AIFA Smart app's `_speedFromByte` does.
 
     Bits are tested in this order and 0x10 is never read, so the hub's
     reports 0x11 / 0x90 / 0x50 / 0x30 are auto / 3 / 2 / 1.
@@ -773,7 +733,7 @@ def decode_observed_status_packet(
     else:
         observed_device_code = str((decoded_device_code * 100) + (_decode_bcd_byte(packet_bytes[3]) or 0))
 
-    # i-Ctrl Pro parses b4/b5 with int.parse, so a non-decimal nibble makes
+    # The AIFA Smart app parses b4/b5 with int.parse, so a non-decimal nibble makes
     # it drop the whole packet.
     timer_ir_value = _decode_bcd_byte(packet_bytes[5])
     if timer_ir_value is None:
