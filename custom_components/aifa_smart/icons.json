@@ -11,7 +11,7 @@
         "default": "mdi:remote"
       },
       "sub_device_code_source": {
-        "default": "mdi:cloud-outline"
+        "default": "mdi:book-open-variant-outline"
       },
       "sub_device_brand": {
         "default": "mdi:tag"
