@@ -1,16 +1,27 @@
 """Shared fixtures for the AIFA Smart integration tests.
 
-The current suite is unit-test heavy (unittest.TestCase classes that
-exercise pure functions, packet helpers, mocked sessions, and stubbed
-coordinator scenarios) — none of them actually boot a HomeAssistant
-instance. We therefore load pytest-homeassistant-custom-component for
-the real `homeassistant` / `aiohttp` packages it brings in, but skip
-the usual autouse `enable_custom_integrations` fixture: that fixture
-depends on the async `hass` fixture, which pytest-asyncio cannot
-resolve from inside `unittest.TestCase` setUp. Tests that need a real
-hass should opt in explicitly via `pytest.mark.usefixtures("hass")`
-once they are converted to pytest-style functions.
+Most tests are unittest.TestCase classes on pure functions, packet helpers
+and coordinators assembled without hass; the files that need a real hass
+use the `hass` fixture of pytest-homeassistant-custom-component.
 """
 from __future__ import annotations
 
+import pytest
+
 pytest_plugins = ["pytest_homeassistant_custom_component"]
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _start_pycares_shutdown_thread() -> None:
+    """Start the DNS resolver's process-wide thread before any test runs.
+
+    HA's client session starts it on first use and it never exits, so
+    verify_cleanup would blame whichever test happened to be first.
+    """
+    try:
+        import pycares
+    except ImportError:
+        return
+    manager = getattr(pycares, "_shutdown_manager", None)
+    if manager is not None:
+        manager.start()

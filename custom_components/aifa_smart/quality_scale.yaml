@@ -33,12 +33,7 @@ rules:
   unique-config-entry: done
 
   # Silver
-  action-exceptions:
-    status: exempt
-    comment: |
-      Service actions (force_refresh, macro buttons) only kick the
-      coordinator or send IR commands; they do not perform user-visible
-      side effects that warrant translated exceptions.
+  action-exceptions: done
   config-entry-unloading: done
   docs-configuration-parameters: done
   docs-installation-parameters: done
@@ -55,11 +50,13 @@ rules:
   discovery:
     status: exempt
     comment: |
-      Cloud-only setup; no local network discovery.
+      Hubs come from the cloud account; the LAN transport searches the
+      network for them but there is no discovery flow.
   discovery-update-info:
     status: exempt
     comment: |
-      Cloud-only setup; no local network discovery.
+      Hubs come from the cloud account; the LAN transport finds a hub's
+      address on its own at every connection.
   docs-data-update: done
   docs-examples: done
   docs-known-limitations: done
@@ -72,7 +69,7 @@ rules:
   entity-device-class: done
   entity-disabled-by-default: done
   entity-translations: done
-  exception-translations: todo
+  exception-translations: done
   icon-translations: done
   reconfiguration-flow: todo
   repair-issues: done

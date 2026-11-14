@@ -4,7 +4,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import (
     CONNECTION_NETWORK_MAC,
     DeviceInfo,
@@ -76,6 +77,40 @@ def sub_device_entity_unique_id(device_id: str, sub_device_id: str, attribute: s
     return entity_unique_id(f"{device_id}_{sub_device_id}", attribute)
 
 
+def async_remove_stale_sub_device_entities(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    devices: dict[str, AifaDevice],
+    domain: str,
+    attributes: tuple[str, ...],
+    keep: set[str],
+) -> None:
+    """Drop entities of these attributes that the app no longer shows.
+
+    Only sub-devices in the current data are touched, so a hub missing from
+    one snapshot keeps its entities.
+    """
+    prefixes = tuple(
+        f"{DOMAIN}_{device.id}_{sub_device.id}_"
+        for device in devices.values()
+        for sub_device in device.sub_devices
+    )
+    registry = er.async_get(hass)
+    for entity in er.async_entries_for_config_entry(registry, entry.entry_id):
+        unique_id = entity.unique_id or ""
+        if (
+            entity.domain == domain
+            and entity.platform == DOMAIN
+            and unique_id not in keep
+            and any(
+                unique_id == f"{prefix}{attribute}"
+                for prefix in prefixes
+                for attribute in attributes
+            )
+        ):
+            registry.async_remove(entity.entity_id)
+
+
 def device_entity_id(platform: str, device_id: str, attribute: str) -> str:
     """Build a stable entity_id for a device-scoped entity.
 
@@ -122,8 +157,8 @@ class StateBroadcastDedupMixin:
     """Skip async_write_ha_state when tracked properties haven't changed.
 
     Each coordinator refresh fans out to every entity's
-    ``_handle_coordinator_update``. With dozens of sensors / switches /
-    buttons per AIFA account, that turns into a lot of HA state writes
+    ``_handle_coordinator_update``. With dozens of sensors and buttons
+    per AIFA account, that turns into a lot of HA state writes
     for a payload that is mostly identical between cycles. Subclasses
     declare which properties drive their visible state via
     ``_state_attrs`` and inherit this mixin alongside ``CoordinatorEntity``;
@@ -232,6 +267,8 @@ class AifaSubDeviceEntity(StateBroadcastDedupMixin, CoordinatorEntity["AifaSmart
     """Base class for entities attached to one AIFA sub-device."""
 
     _attr_has_entity_name = True
+    # Entities that send commands follow the transport; readings stay cloud-bound.
+    _control_entity = False
 
     def __init__(
         self,
@@ -263,11 +300,11 @@ class AifaSubDeviceEntity(StateBroadcastDedupMixin, CoordinatorEntity["AifaSmart
 
     @property
     def available(self) -> bool:
-        return (
-            self.coordinator.last_update_success
-            and self.device is not None
-            and self.sub_device is not None
-        )
+        if self._control_entity:
+            reachable = self.coordinator.is_control_available(self._device_id)
+        else:
+            reachable = self.coordinator.last_update_success
+        return reachable and self.device is not None and self.sub_device is not None
 
     @property
     def device_info(self) -> DeviceInfo | None:

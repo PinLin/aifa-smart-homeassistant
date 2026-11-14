@@ -75,6 +75,7 @@ async def async_get_config_entry_diagnostics(
             else []
         ),
         "catalog": catalog.get_status(),
+        "transport": coordinator.transport_diagnostics(),
     }
     return async_redact_data(snapshot, TO_REDACT)
 

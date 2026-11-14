@@ -11,29 +11,72 @@
         "default": "mdi:remote"
       },
       "sub_device_code_source": {
-        "default": "mdi:cloud-outline"
+        "default": "mdi:book-open-variant-outline"
       },
       "sub_device_brand": {
         "default": "mdi:tag"
       },
       "sub_device_function_count": {
         "default": "mdi:format-list-numbered"
+      },
+      "ac_fan_speed": {
+        "default": "mdi:fan"
       }
     },
     "button": {
       "force_refresh": {
         "default": "mdi:refresh"
-      }
-    },
-    "switch": {
-      "turbo": {
-        "default": "mdi:rocket-launch-outline"
       },
-      "sleep": {
+      "temperature_up": {
+        "default": "mdi:thermometer-plus"
+      },
+      "temperature_down": {
+        "default": "mdi:thermometer-minus"
+      },
+      "ac_timer": {
+        "default": "mdi:timer-outline"
+      },
+      "ac_swing": {
+        "default": "mdi:arrow-oscillating"
+      },
+      "ac_fan_speed": {
+        "default": "mdi:fan"
+      },
+      "ac_power_saving": {
+        "default": "mdi:leaf"
+      },
+      "ac_sleep": {
         "default": "mdi:sleep"
       },
-      "power_saving": {
-        "default": "mdi:leaf"
+      "ac_turbo": {
+        "default": "mdi:rocket-launch-outline"
+      },
+      "ac_quiet": {
+        "default": "mdi:volume-off"
+      },
+      "ac_extra_wind_speed": {
+        "default": "mdi:fan-plus"
+      },
+      "ac_display": {
+        "default": "mdi:monitor"
+      },
+      "ac_mold": {
+        "default": "mdi:water-off"
+      },
+      "ac_wind_speed_high": {
+        "default": "mdi:fan-chevron-up"
+      },
+      "ac_wind_speed_low": {
+        "default": "mdi:fan-chevron-down"
+      },
+      "ac_mode": {
+        "default": "mdi:swap-horizontal"
+      },
+      "ac_anti_mold_on": {
+        "default": "mdi:shield-check-outline"
+      },
+      "ac_anti_mold_off": {
+        "default": "mdi:shield-off-outline"
       }
     }
   }

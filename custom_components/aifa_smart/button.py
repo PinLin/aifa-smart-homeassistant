@@ -1,16 +1,46 @@
-"""Button entities for forcing refresh and triggering saved AIFA macros."""
+"""Button entities for refresh, saved AIFA macros, and AC remote keys."""
 from __future__ import annotations
 
-from homeassistant.components.button import ButtonEntity
+from dataclasses import dataclass
+
+from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .ac import (
+    AC_KEYS,
+    AifaAcKey,
+    is_supported_ac_sub_device,
+    shows_classic_temperature_keys,
+    visible_ac_keys,
+)
 from .const import DOMAIN
 from .coordinator import AifaSmartCoordinator
-from .entity import build_account_device_info
+from .entity import (
+    AifaSubDeviceEntity,
+    async_remove_stale_sub_device_entities,
+    build_account_device_info,
+)
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class AifaClassicTemperatureKeyDescription(ButtonEntityDescription):
+    """Description for one classic AC temperature key."""
+
+    up: bool
+
+
+_CLASSIC_TEMPERATURE_KEYS: tuple[AifaClassicTemperatureKeyDescription, ...] = (
+    AifaClassicTemperatureKeyDescription(
+        key="temperature_up", translation_key="temperature_up", up=True
+    ),
+    AifaClassicTemperatureKeyDescription(
+        key="temperature_down", translation_key="temperature_down", up=False
+    ),
+)
 
 
 async def async_setup_entry(
@@ -21,6 +51,33 @@ async def async_setup_entry(
     """Set up the force-refresh button and dynamic macro buttons."""
     coordinator: AifaSmartCoordinator = entry.runtime_data
     entities: list[ButtonEntity] = [AifaForceRefreshButton(coordinator, entry)]
+    for device in coordinator.data.devices.values():
+        for sub_device in device.sub_devices:
+            if not is_supported_ac_sub_device(sub_device.type, sub_device.device_code):
+                continue
+            entities.extend(
+                AifaAcKeyButton(coordinator, device.id, sub_device.id, key)
+                for key in visible_ac_keys(sub_device.device_code, device.device_type)
+            )
+            # Same check the climate entity uses to drop its setpoint, so the
+            # +/- buttons appear exactly when the slider disappears.
+            if not shows_classic_temperature_keys(device.version, sub_device.device_code):
+                continue
+            entities.extend(
+                AifaClassicTemperatureKeyButton(
+                    coordinator, device.id, sub_device.id, description
+                )
+                for description in _CLASSIC_TEMPERATURE_KEYS
+            )
+    async_remove_stale_sub_device_entities(
+        hass,
+        entry,
+        coordinator.data.devices,
+        "button",
+        tuple(f"{key}_key" for key in AC_KEYS)
+        + tuple(description.key for description in _CLASSIC_TEMPERATURE_KEYS),
+        {entity.unique_id for entity in entities if entity.unique_id is not None},
+    )
     async_add_entities(entities)
 
     known_macro_ids: set[str] = set()
@@ -128,3 +185,54 @@ class AifaMacroButton(CoordinatorEntity[AifaSmartCoordinator], ButtonEntity):
     async def async_press(self) -> None:
         """Run the saved macro through the coordinator."""
         await self.coordinator.async_execute_macro(self._macro_id)
+
+
+class AifaClassicTemperatureKeyButton(AifaSubDeviceEntity, ButtonEntity):
+    """One +/- press on an AC remote that has no absolute setpoint."""
+
+    _control_entity = True
+
+    entity_description: AifaClassicTemperatureKeyDescription
+
+    def __init__(
+        self,
+        coordinator: AifaSmartCoordinator,
+        device_id: str,
+        sub_device_id: str,
+        description: AifaClassicTemperatureKeyDescription,
+    ) -> None:
+        super().__init__(
+            coordinator, device_id, sub_device_id, description.key, platform="button"
+        )
+        self.entity_description = description
+
+    async def async_press(self) -> None:
+        await self.coordinator.async_press_classic_temperature_key(
+            self._device_id, self._sub_device_id, up=self.entity_description.up
+        )
+
+
+class AifaAcKeyButton(AifaSubDeviceEntity, ButtonEntity):
+    """One key of the AIFA Smart app AC page; the app shows no on/off state for it."""
+
+    _control_entity = True
+
+    def __init__(
+        self,
+        coordinator: AifaSmartCoordinator,
+        device_id: str,
+        sub_device_id: str,
+        key: AifaAcKey,
+    ) -> None:
+        # The `_key` suffix keeps these unique IDs apart from the removed
+        # turbo/sleep/power_saving switches.
+        super().__init__(
+            coordinator, device_id, sub_device_id, f"{key.key}_key", platform="button"
+        )
+        self._key = key
+        self._attr_translation_key = f"ac_{key.key}"
+
+    async def async_press(self) -> None:
+        await self.coordinator.async_press_ac_key(
+            self._device_id, self._sub_device_id, self._key
+        )

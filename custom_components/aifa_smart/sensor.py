@@ -11,9 +11,17 @@ from homeassistant.const import PERCENTAGE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 
+from .ac import AC_KEYS, FAN_SPEED_OPTIONS, is_supported_ac_sub_device, visible_ac_keys
 from .coordinator import AifaSmartCoordinator
-from .entity import AifaAccountEntity, AifaDeviceEntity, AifaSubDeviceEntity
+from .runtime import AifaAcRestoreData
+from .entity import (
+    AifaAccountEntity,
+    AifaDeviceEntity,
+    AifaSubDeviceEntity,
+    async_remove_stale_sub_device_entities,
+)
 
 
 async def async_setup_entry(
@@ -44,6 +52,19 @@ async def async_setup_entry(
                     AifaSubDeviceFunctionCountSensor(coordinator, device.id, sub_device.id),
                 ]
             )
+            # Shown with the fan key, the only way to change the speed.
+            if is_supported_ac_sub_device(
+                sub_device.type, sub_device.device_code
+            ) and AC_KEYS["fan_speed"] in visible_ac_keys(sub_device.device_code):
+                entities.append(AifaAcFanSpeedSensor(coordinator, device.id, sub_device.id))
+    async_remove_stale_sub_device_entities(
+        hass,
+        entry,
+        coordinator.data.devices,
+        "sensor",
+        ("fan_speed",),
+        {entity.unique_id for entity in entities if entity.unique_id is not None},
+    )
     async_add_entities(entities)
 
 
@@ -252,3 +273,47 @@ class AifaSubDeviceFunctionCountSensor(_AifaBaseSubDeviceSensor):
     def native_value(self) -> int | None:
         sub_device = self.sub_device
         return None if sub_device is None else len(sub_device.functions)
+
+
+class AifaAcFanSpeedSensor(AifaSubDeviceEntity, RestoreEntity, SensorEntity):
+    """Fan speed from the hub's last status report (b7)."""
+
+    # Reports arrive over the command transport, so follow its availability.
+    _control_entity = True
+    _attr_translation_key = "ac_fan_speed"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = list(FAN_SPEED_OPTIONS)
+    _state_attrs = ("native_value", "available")
+
+    def __init__(
+        self, coordinator: AifaSmartCoordinator, device_id: str, sub_device_id: str
+    ) -> None:
+        super().__init__(
+            coordinator, device_id, sub_device_id, "fan_speed", platform="sensor"
+        )
+
+    @property
+    def _runtime(self):
+        sub_device = self.sub_device
+        return self.coordinator.get_ac_runtime_state(
+            self._device_id,
+            self._sub_device_id,
+            device_code=None if sub_device is None else sub_device.device_code,
+        )
+
+    @property
+    def native_value(self) -> str | None:
+        return self._runtime.last_reported_fan_mode
+
+    @property
+    def extra_restore_state_data(self) -> ExtraStoredData:
+        # Same data as the climate entity's; either one restores both.
+        return AifaAcRestoreData.from_runtime(self._runtime)
+
+    async def async_added_to_hass(self) -> None:
+        """Show the speed from before the restart until the hub reports."""
+        await super().async_added_to_hass()
+        extra = await self.async_get_last_extra_data()
+        data = None if extra is None else AifaAcRestoreData.from_dict(extra.as_dict())
+        if data is not None:
+            self._runtime.restore(data)

@@ -6,28 +6,66 @@ import unittest
 from custom_components.aifa_smart.ac import (
     AIFA_AC_ESTIMATED_CAPABILITIES,
     AIFA_AC_DEFAULT_TARGET_TEMP,
+    CLASSIC_AC_QUERY_PACKET,
     SHARED_AIFA_AC_PROFILE,
-    build_ac_query_packet,
-    build_ac_query_single_type_packet,
+    build_classic_temperature_key_command,
     build_estimated_capabilities,
+    build_mode_key_command,
     build_power_off_command,
     build_power_on_command,
-    build_query_anti_mold_packet,
-    build_status_command,
+    build_app_status_command,
     clamp_target_temperature,
-    clamp_timer_ir_value,
     decode_observed_status_packet,
-    decode_status_command,
-    encode_timer_ir_bcd,
-    encode_temperature_bcd,
     get_ac_capabilities,
     get_ac_profile,
-    get_supported_fan_modes,
-    get_supported_swing_modes,
+    hub_requires_mode_keys,
     is_supported_ac_device_code,
     is_supported_ac_sub_device,
     normalize_ac_mode,
+    AifaAcStatus,
 )
+
+
+def _build(
+    mode: str,
+    temperature: int | None,
+    *,
+    key_press: int,
+    code: str = "136",
+    fan: str = "auto",
+    swing: str = "auto",
+    timer: int = 0,
+    sleep: bool = False,
+    turbo: bool = False,
+    power_saving: bool = False,
+    sub_type: int = 0,
+) -> str:
+    return build_app_status_command(
+        AifaAcStatus(
+            device_code=code,
+            mode=mode,
+            target_temperature=temperature,
+            timer_ir_value=timer,
+            fan_mode=fan,
+            swing_mode=swing,
+            turbo=turbo,
+            sleep=sleep,
+            power_saving=power_saving,
+            packet_byte_12=0,
+            packet_byte_13=0,
+        ),
+        key_press=key_press,
+        sub_type=sub_type,
+        device_code=code,
+    )
+
+
+def _as_report(command: str):
+    """The AIFA Smart app's fromCommandBytes: drop the keyPress byte, then fromBytes."""
+    packet = bytes.fromhex(command)
+    decoded = decode_observed_status_packet(b"\xfe" + packet[1:2] + packet[3:])
+    assert decoded is not None
+    return decoded[1]
 
 
 class AifaAcPacketTests(unittest.TestCase):
@@ -39,7 +77,7 @@ class AifaAcPacketTests(unittest.TestCase):
         self.assertTrue(is_supported_ac_device_code("999"))
         self.assertFalse(is_supported_ac_device_code(None))
         # Empty ac_available_modes only means "no anti-mold"; the AC is still controllable.
-        self.assertTrue(is_supported_ac_device_code("16"))
+        self.assertTrue(is_supported_ac_device_code("115"))
 
     def test_ac_sub_device_detection_checks_type_and_device_code(self) -> None:
         """Climate entities should only attach to AC-like sub-devices."""
@@ -47,11 +85,11 @@ class AifaAcPacketTests(unittest.TestCase):
         self.assertTrue(is_supported_ac_sub_device("0", "999"))
         self.assertFalse(is_supported_ac_sub_device("1", "136"))
         self.assertFalse(is_supported_ac_sub_device("0", None))
-        self.assertTrue(is_supported_ac_sub_device("0", "16"))
+        self.assertTrue(is_supported_ac_sub_device("0", "115"))
 
     def test_empty_anti_mold_list_still_offers_every_mode(self) -> None:
-        """Code 16 (classic temp control) has no anti-mold modes but all five AC modes."""
-        capabilities = get_ac_capabilities("16")
+        """Code 115 (classic temp control) has no anti-mold modes but all five AC modes."""
+        capabilities = get_ac_capabilities("115")
         self.assertEqual(capabilities.available_modes, ("auto", "cool", "heat", "fan", "dry"))
         self.assertEqual(capabilities.anti_mold_modes, ())
         self.assertTrue(capabilities.classic_temp_control)
@@ -59,8 +97,7 @@ class AifaAcPacketTests(unittest.TestCase):
     def test_remote_config_capabilities_for_a_known_ac_code(self) -> None:
         """A known AC catalog entry should expose the full mode/fan/swing set.
 
-        Uses '136' as a representative AC code in the catalog. Per the
-        2026-04-28 BCD-device-aware encoder refactor, capability flags
+        Uses '136' as a representative AC code in the catalog. Capability flags
         (extra_windspeed, supports_turbo, etc.) are catalog-driven plus
         a small set of universal flags — they do NOT vary by device code
         in a 136-specific way.
@@ -71,11 +108,11 @@ class AifaAcPacketTests(unittest.TestCase):
             ("auto", "cool", "heat", "fan", "dry"),
         )
         self.assertEqual(
-            get_supported_fan_modes("136"),
+            capabilities.fan_modes,
             ("auto", "low", "medium", "high"),
         )
         self.assertEqual(
-            get_supported_swing_modes("136"),
+            capabilities.swing_modes,
             ("off", "auto", "fixed_1", "fixed_2", "fixed_3", "fixed_4", "fixed_5"),
         )
         self.assertFalse(capabilities.extra_windspeed)
@@ -83,33 +120,16 @@ class AifaAcPacketTests(unittest.TestCase):
         self.assertTrue(capabilities.supports_sleep)
         self.assertTrue(capabilities.supports_power_saving)
 
-    def test_temperature_encoding_uses_bcd(self) -> None:
-        """AIFA temperatures are encoded as decimal BCD bytes."""
-        self.assertEqual(encode_temperature_bcd(19), 0x19)
-        self.assertEqual(encode_temperature_bcd(24), 0x24)
-        self.assertEqual(encode_temperature_bcd(30), 0x30)
-
-    def test_timer_ir_encoding_uses_bcd(self) -> None:
-        """AIFA timer IR values use the same decimal BCD byte family."""
-        self.assertEqual(clamp_timer_ir_value(None), 0)
-        self.assertEqual(clamp_timer_ir_value(123), 99)
-        self.assertEqual(encode_timer_ir_bcd(0), 0x00)
-        self.assertEqual(encode_timer_ir_bcd(1), 0x01)
-        self.assertEqual(encode_timer_ir_bcd(12), 0x12)
-
     def test_temperature_clamping_respects_supported_range(self) -> None:
         """Out-of-range target temperatures should clamp safely."""
         self.assertEqual(clamp_target_temperature(None), AIFA_AC_DEFAULT_TARGET_TEMP)
-        self.assertEqual(clamp_target_temperature(1), 17)
+        # The app's setpoint slider runs 16..30.
+        self.assertEqual(clamp_target_temperature(1), 16)
         self.assertEqual(clamp_target_temperature(99), 30)
 
-    def test_classic_query_packets_match_reverse_engineered_bytes(self) -> None:
-        """The private classic socket queries should keep the known byte layout."""
-        self.assertEqual(build_ac_query_packet(), "fff3f2f0")
-        self.assertEqual(build_ac_query_single_type_packet(0), "fff3f2a0f0")
-        self.assertEqual(build_ac_query_single_type_packet(1), "fff3f2a1f0")
-        self.assertEqual(build_query_anti_mold_packet(0), "a1faaca0f0")
-        self.assertEqual(build_query_anti_mold_packet(1), "a1faaca1f0")
+    def test_classic_query_packet_matches_reverse_engineered_bytes(self) -> None:
+        """The only query the integration sends is the app's DevicePacketAcQuery."""
+        self.assertEqual(CLASSIC_AC_QUERY_PACKET, "fff3f2f0")
 
     def test_decode_observed_status_packet_recovers_off_state(self) -> None:
         """Observed controller packets should decode into an off state."""
@@ -200,20 +220,18 @@ class AifaAcPacketTests(unittest.TestCase):
         self.assertFalse(status.power_saving)
         self.assertFalse(status.turbo)
 
-    def test_decode_observed_status_packet_power_saving_mask_is_0x02(self) -> None:
-        """Observed-packet decoder must use power_saving mask 0x02, not stale 0x01."""
-        from custom_components.aifa_smart.ac import decode_observed_status_packet
-
-        # 14-byte observed packet: feature byte=0x02 (power_saving on)
-        # Byte layout: fe a0 01 36 26 00 24 01 00 02 00 00 00 f0
-        pkt = bytes.fromhex("fea00136260024010002000000f0")
-        result = decode_observed_status_packet(pkt)
-        self.assertIsNotNone(result)
-        assert result is not None
-        _, status = result
+    def test_decode_observed_status_packet_power_saving_mask_is_0x01(self) -> None:
+        """The AIFA Smart app's fromBytes reads power saving from bit 0 (0x654450)."""
+        pkt = bytes.fromhex("fea00136260024010001000000f0")
+        _, status = decode_observed_status_packet(pkt)  # type: ignore[misc]
         self.assertFalse(status.sleep)
         self.assertTrue(status.power_saving)
         self.assertFalse(status.turbo)
+        # 0x02 is not a flag the app reads.
+        _, status = decode_observed_status_packet(  # type: ignore[misc]
+            bytes.fromhex("fea00136260024010002000000f0")
+        )
+        self.assertFalse(status.power_saving)
 
     def test_decode_observed_status_packet_turbo_mask_unchanged(self) -> None:
         """Turbo at 0x04 was already correct — regression guard."""
@@ -230,104 +248,64 @@ class AifaAcPacketTests(unittest.TestCase):
         self.assertFalse(status.power_saving)
         self.assertTrue(status.turbo)
 
-    def test_build_inferred_mode_speed_and_swing_samples(self) -> None:
-        """Inferred mode / fan / swing values produce expected hex per current map."""
+    def test_build_mode_speed_and_swing_samples(self) -> None:
+        """Every field of the 15-byte packet is copied from the status given."""
         self.assertEqual(
-            build_status_command("dry", 24, device_code="136"),
+            _build("dry", 24, key_press=8, fan="high", swing="fixed_5"),
             "ffa0080136240040802000000000f0",
         )
         self.assertEqual(
-            build_status_command("fan", 24, device_code="136"),
-            "ffa0080136240080800100000000f0",
-        )
-        self.assertEqual(
-            build_status_command("auto", 24, device_code="136"),
-            "ffa0080136240010802000000000f0",
-        )
-        self.assertEqual(
-            build_status_command("cool", 24, device_code="136", fan_mode="medium"),
-            "ffa0060136240020402000000000f0",
-        )
-        self.assertEqual(
-            build_status_command("cool", 24, device_code="136", fan_mode="low"),
+            _build("cool", 24, key_press=6, fan="low", swing="fixed_5"),
             "ffa0060136240020202000000000f0",
         )
         self.assertEqual(
-            build_status_command("cool", 24, device_code="136", fan_mode="auto"),
-            "ffa0060136240020012000000000f0",
-        )
-        self.assertEqual(
-            build_status_command("cool", 24, device_code="136", swing_mode="off"),
+            _build("cool", 24, key_press=6, fan="high", swing="off"),
             "ffa0060136240020800000000000f0",
         )
         self.assertEqual(
-            build_status_command("cool", 24, device_code="136", swing_mode="fixed_1"),
-            "ffa0060136240020800400000000f0",
-        )
-        self.assertEqual(
-            build_status_command("cool", 24, device_code="136", swing_mode="auto"),
-            "ffa0060136240020800100000000f0",
-        )
-        self.assertEqual(
-            build_status_command("cool", 26, device_code="136", timer_ir_value=1, swing_mode="auto"),
+            _build("cool", 26, key_press=6, fan="high", timer=1),
             "ffa0060136260120800100000000f0",
         )
 
-    def test_build_helper_flag_samples(self) -> None:
-        """Helper flags packed into byte 10.
-
-        sleep=0x08 verified 2026-04-27 from AVD AIFA app capture.
-        power_saving=0x02 and turbo=0x04 are still inferred (no AVD path
-        could trigger them) but locked here to preserve integration behavior.
-        """
+    def test_build_helper_flags_are_exclusive_like_the_app(self) -> None:
+        """toBytes writes one flag: power saving 0x01, else turbo 0x04, else sleep 0x08."""
         self.assertEqual(
-            build_status_command("cool", 24, device_code="136", sleep=True),
+            _build("cool", 24, key_press=6, fan="high", swing="fixed_5", sleep=True),
             "ffa0060136240020802008000000f0",
         )
         self.assertEqual(
-            build_status_command("cool", 24, device_code="136", power_saving=True),
-            "ffa0060136240020802002000000f0",
+            _build("cool", 24, key_press=6, fan="high", swing="fixed_5", power_saving=True),
+            "ffa0060136240020802001000000f0",
         )
         self.assertEqual(
-            build_status_command("cool", 24, device_code="136", turbo=True),
+            _build("cool", 24, key_press=6, fan="high", swing="fixed_5", turbo=True),
             "ffa0060136240020802004000000f0",
         )
+        self.assertEqual(
+            _build(
+                "cool", 24, key_press=6, fan="high", swing="fixed_5",
+                power_saving=True, turbo=True, sleep=True,
+            )[20:22],
+            "01",
+        )
 
-    def test_decode_status_helper_flags_are_exclusive(self) -> None:
-        """Helper-byte round-trip: sleep=0x08 verified, PS=0x02 + turbo=0x04 inferred."""
-        decoded = decode_status_command("ffa0060136240020012002000000f0", device_code="136")
+    def test_build_repeats_a_missing_setpoint_and_uses_the_slot(self) -> None:
+        """A report without a setpoint (b4 = 0) goes back out as 0x00."""
+        self.assertEqual(
+            _build("cool", None, key_press=8, code="115", sub_type=1),
+            "ffa1080115000020010100000000f0",
+        )
 
-        self.assertIsNotNone(decoded)
-        assert decoded is not None
-        self.assertTrue(decoded.power_saving)
-        self.assertFalse(decoded.turbo)
-        self.assertFalse(decoded.sleep)
-
-        turbo = decode_status_command("ffa0060136240020012004000000f0", device_code="136")
-        self.assertIsNotNone(turbo)
-        assert turbo is not None
-        self.assertTrue(turbo.turbo)
-        self.assertFalse(turbo.power_saving)
-
-        sleep = decode_status_command("ffa0060136240020012008000000f0", device_code="136")
-        self.assertIsNotNone(sleep)
-        assert sleep is not None
-        self.assertTrue(sleep.sleep)
-        self.assertFalse(sleep.power_saving)
-
-    def test_decode_status_rejects_unsupported_packets(self) -> None:
-        """Short power packets should not decode as full status packets."""
-        self.assertIsNone(decode_status_command("ffa0a1f0"))
-        self.assertIsNone(decode_status_command("not-hex"))
+    def test_build_refuses_an_off_status(self) -> None:
+        with self.assertRaises(ValueError):
+            _build("off", None, key_press=8)
 
 
 class AifaAcEncoderRegressionTests(unittest.TestCase):
-    """Encoder regression tests using device_code='136' as a fixed test vector.
+    """Packets captured from the AIFA app (1.2.5) against the toBytes layout.
 
-    The bit positions exercised here are universal across device codes per
-    Dart-side AirConditionerStatusOn.toBytes reverse engineering; the choice
-    of '136' is purely historical (early captures used that code) and does
-    not imply 136 is special.
+    Byte 2 is the app's keyPress, so each case passes the captured value.
+    Device code 136 is only the code those captures used.
     """
 
     def test_power_on_off_short_packets(self) -> None:
@@ -336,109 +314,78 @@ class AifaAcEncoderRegressionTests(unittest.TestCase):
         self.assertEqual(build_power_off_command(), "ffa0a2f0")
 
     def test_cool_24_app_default_byte_match(self) -> None:
-        """Verified: function 'by by' [step 2] cool 24 default →
+        """App packet: cool 24 default →
         ffa0060136240020010100000000f0.
 
         Reached by encoder when caller passes fan=auto, swing=auto.
         """
-        encoded = build_status_command(
-            "cool", 24, device_code="136", fan_mode="auto", swing_mode="auto"
-        )
+        encoded = _build("cool", 24, key_press=0x06)
         self.assertEqual(encoded, "ffa0060136240020010100000000f0")
 
-        decoded = decode_status_command(encoded, device_code="136")
-        self.assertIsNotNone(decoded)
-        assert decoded is not None
-        self.assertEqual(decoded.mode, "cool")
-        self.assertEqual(decoded.target_temperature, 24)
+        report = _as_report(encoded)
+        self.assertEqual((report.mode, report.target_temperature), ("cool", 24))
 
     def test_cool_19_cold_side_prefix(self) -> None:
-        """Verified: 'by by' [step 3] cool 19 → byte 2 = 0x07 (cool<24 prefix)."""
-        encoded = build_status_command(
-            "cool", 19, device_code="136", fan_mode="auto", swing_mode="auto"
-        )
+        """App packet: cool 19 → byte 2 = 0x07 (cool<24 prefix)."""
+        encoded = _build("cool", 19, key_press=0x07)
         self.assertEqual(encoded, "ffa0070136190020010100000000f0")
 
     def test_cool_20_cold_side_prefix(self) -> None:
-        """Verified: 'by by' [step 4] cool 20 → byte 2 = 0x07."""
-        encoded = build_status_command(
-            "cool", 20, device_code="136", fan_mode="auto", swing_mode="auto"
-        )
+        """App packet: cool 20 → byte 2 = 0x07."""
+        encoded = _build("cool", 20, key_press=0x07)
         self.assertEqual(encoded, "ffa0070136200020010100000000f0")
 
     def test_heat_24_app_default_byte_match(self) -> None:
-        """Verified: 'by by' [step 5] heat 24 default → byte 2 = 0x08."""
-        encoded = build_status_command(
-            "heat", 24, device_code="136", fan_mode="auto", swing_mode="auto"
-        )
+        """App packet: heat 24 default → byte 2 = 0x08."""
+        encoded = _build("heat", 24, key_press=0x08)
         self.assertEqual(encoded, "ffa0080136240008010100000000f0")
 
-        decoded = decode_status_command(encoded, device_code="136")
-        self.assertIsNotNone(decoded)
-        assert decoded is not None
-        self.assertEqual(decoded.mode, "heat")
-        self.assertEqual(decoded.target_temperature, 24)
+        report = _as_report(encoded)
+        self.assertEqual((report.mode, report.target_temperature), ("heat", 24))
 
     def test_fan_only_24_app_default_byte_match(self) -> None:
-        """Verified: function 'fanonlysample' → fan_only 24 with byte 2 = 0x08."""
-        encoded = build_status_command(
-            "fan", 24, device_code="136", fan_mode="auto", swing_mode="auto"
-        )
+        """App packet: fan_only 24 with byte 2 = 0x08."""
+        encoded = _build("fan_only", 24, key_press=0x08)
         self.assertEqual(encoded, "ffa0080136240080010100000000f0")
 
-        decoded = decode_status_command(encoded, device_code="136")
-        self.assertIsNotNone(decoded)
-        assert decoded is not None
-        self.assertEqual(decoded.mode, "fan_only")
-        self.assertEqual(decoded.target_temperature, 24)
+        report = _as_report(encoded)
+        self.assertEqual((report.mode, report.target_temperature), ("fan_only", 24))
 
     def test_cool_28_high_fan_swing_4_byte_match(self) -> None:
-        """Verified: function '自動29' bytes (despite the user-given name).
+        """App packet: cool 28, high fan, 4th swing position.
 
         byte 7 = 0x20 = cool, byte 8 = 0x80 = high, byte 9 = 0x40 = 4th cycle
-        position. The user named this 自動 but the bytes are NOT auto fan.
-        Function names are user labels and do not reflect byte semantics.
+        position. Function names are user labels and do not reflect byte semantics.
         """
-        encoded = build_status_command(
-            "cool", 28, device_code="136", fan_mode="high", swing_mode="fixed_4"
-        )
+        encoded = _build("cool", 28, key_press=0x06, fan="high", swing="fixed_4")
         self.assertEqual(encoded, "ffa0060136280020804000000000f0")
 
     def test_dry_24_app_default_byte_match(self) -> None:
-        """Verified: probe1 cmd 644474 — Dry mode tap → byte 2=0x08, byte 7=0x40."""
-        encoded = build_status_command(
-            "dry", 24, device_code="136", fan_mode="auto", swing_mode="auto"
-        )
+        """App packet: Dry mode tap → byte 2=0x08, byte 7=0x40."""
+        encoded = _build("dry", 24, key_press=0x08)
         self.assertEqual(encoded, "ffa0080136240040010100000000f0")
 
     def test_auto_24_app_default_byte_match(self) -> None:
-        """Verified: probe1 cmd 644455 RESPONSE — Auto mode → byte 2=0x08, byte 7=0x10."""
-        encoded = build_status_command(
-            "auto", 24, device_code="136", fan_mode="auto", swing_mode="auto"
-        )
+        """App packet: Auto mode → byte 2=0x08, byte 7=0x10."""
+        encoded = _build("auto", 24, key_press=0x08)
         self.assertEqual(encoded, "ffa0080136240010010100000000f0")
 
     def test_cool_24_sleep_on_byte_match(self) -> None:
-        """Verified: probe1 cmd 644452 — Sleep button tapped → byte 10 = 0x08.
+        """App packet: Sleep button tapped → byte 10 = 0x08.
 
         Sleep also forces fan to auto (AVD AIFA app silently drops speed:0
-        when Sleep is on). build_status_command callers are expected to pass
-        fan_mode="auto" when sleep=True.
+        when Sleep is on).
         """
-        encoded = build_status_command(
-            "cool", 24, device_code="136", fan_mode="auto", swing_mode="auto", sleep=True
-        )
+        encoded = _build("cool", 24, key_press=0x06, sleep=True)
         self.assertEqual(encoded, "ffa0060136240020010108000000f0")
 
     def test_fan_only_24_medium_byte_match(self) -> None:
-        """Verified: probe1 cmd 644454 RESPONSE — fan_only + speed:2 medium → byte 8=0x40."""
-        encoded = build_status_command(
-            "fan", 24, device_code="136", fan_mode="medium", swing_mode="auto"
-        )
+        """App packet: fan_only + speed:2 medium → byte 8=0x40."""
+        encoded = _build("fan_only", 24, key_press=0x08, fan="medium")
         self.assertEqual(encoded, "ffa0080136240080400100000000f0")
 
     def test_swing_cycle_byte_matches(self) -> None:
-        """Verified: probe1 cmds 644485-644489 — Direction tap cycle.
+        """App packet: Direction tap cycle.
 
         Tapping AVD AIFA app's Direction button cycles through:
           default 0x01 → 0x04 → 0x08 → 0x80 → 0x40 → 0x20
@@ -454,20 +401,17 @@ class AifaAcEncoderRegressionTests(unittest.TestCase):
         }
         for swing, expected in cases.items():
             with self.subTest(swing=swing):
-                encoded = build_status_command(
-                    "cool", 24, device_code="136", fan_mode="auto", swing_mode=swing
-                )
+                encoded = _build("cool", 24, key_press=0x06, swing=swing)
                 self.assertEqual(encoded, expected)
 
 
 class AifaAcDeviceCodeBcdTests(unittest.TestCase):
     """The Dart-side encoder always BCD-encodes device_code into bytes 3-4.
 
-    Static evidence: AirConditionerStatusOn.toBytes calls deviceCodeToBytes
-    which does .toString().padLeft(4, "0") then int.parse(substring(0,2),
-    radix:16) and int.parse(substring(2,4), radix:16) — i.e., interpret each
-    pair of decimal digits as a hex byte. So device 136 → "0136" → bytes
-    [0x01, 0x36].
+    Static evidence (AIFA Smart app 1.2.9, deviceCodeToBytes 0x64d548):
+    .toString().padLeft(4, "0"), then int.parse(substring(0, 2), radix: 16)
+    and int.parse(substring(2), radix: 16), each kept to its low 8 bits by
+    a Uint8List. So device 136 → "0136" → bytes [0x01, 0x36].
     """
 
     def test_device_136_encodes_as_01_36(self) -> None:
@@ -475,24 +419,20 @@ class AifaAcDeviceCodeBcdTests(unittest.TestCase):
 
         self.assertEqual(_bcd_encode_device_code(136), (0x01, 0x36))
 
-    def test_cloud_code_19844_encodes_per_dart_truncation(self) -> None:
-        """5-digit cloud codes (remote=true catalog rows 19844..19999): Dart
-        does substring(2, 4) which silently drops the 5th char. Resulting
-        bytes alias across siblings — the hub disambiguates using its
-        set-code-loaded value, treating bytes 3-4 as a family hint."""
+    def test_cloud_code_19844_encodes_like_the_app(self) -> None:
+        """5-digit codes: substring(2) is "844", 0x844 & 0xff is 0x44."""
         from custom_components.aifa_smart.ac import _bcd_encode_device_code
 
-        self.assertEqual(_bcd_encode_device_code(19844), (0x19, 0x84))
+        self.assertEqual(_bcd_encode_device_code(19844), (0x19, 0x44))
         self.assertEqual(_bcd_encode_device_code(19999), (0x19, 0x99))
 
-    def test_cloud_code_5th_digit_dropped(self) -> None:
-        """19844..19848 all collapse to (0x19, 0x84) because Dart's
-        substring(2, 4) discards index 4. This aliasing is by design on
-        the AIFA hub side."""
+    def test_cloud_codes_keep_their_last_two_digits(self) -> None:
+        """19844..19848 differ on the wire; 19844 and 19944 share bytes."""
         from custom_components.aifa_smart.ac import _bcd_encode_device_code
 
-        for code in (19844, 19845, 19846, 19847, 19848):
-            self.assertEqual(_bcd_encode_device_code(code), (0x19, 0x84))
+        for code, low in ((19844, 0x44), (19845, 0x45), (19846, 0x46), (19847, 0x47), (19848, 0x48)):
+            self.assertEqual(_bcd_encode_device_code(code), (0x19, low))
+        self.assertEqual(_bcd_encode_device_code(19944), _bcd_encode_device_code(19844))
 
     def test_device_above_99999_raises(self) -> None:
         """6+ digit codes don't exist in any AIFA catalog (max real is 19999)
@@ -509,108 +449,81 @@ class AifaAcDeviceCodeBcdTests(unittest.TestCase):
             _bcd_encode_device_code(-1)
 
     def test_build_status_command_raises_on_none_device_code(self) -> None:
-        """A None device_code is now a hard error instead of silently
-        defaulting to device 136."""
-        from custom_components.aifa_smart.ac import build_status_command
-
+        """A None device_code is a hard error instead of a guessed family."""
         with self.assertRaisesRegex(ValueError, "device_code is required"):
-            build_status_command("cool", 24, device_code=None)
+            _build("cool", 24, key_press=8, code=None)  # type: ignore[arg-type]
 
     def test_build_status_command_raises_on_unparseable_device_code(self) -> None:
-        from custom_components.aifa_smart.ac import build_status_command
-
         with self.assertRaisesRegex(ValueError, "cannot be BCD-encoded"):
-            build_status_command("cool", 24, device_code="not-a-number")
+            _build("cool", 24, key_press=8, code="not-a-number")
 
     def test_build_status_command_uses_cloud_code_19844_bcd(self) -> None:
-        """5-digit cloud code support: bytes 3-4 mirror Dart's substring
-        truncation. The hub disambiguates by set-code-loaded value, so this
-        only produces correct AC behavior when PATCH+set-code has aligned
-        the hub with the cloud's deviceCode first."""
-        from custom_components.aifa_smart.ac import build_status_command
-
-        cmd = build_status_command("cool", 24, device_code="19844")
-        self.assertEqual(cmd[6:10], "1984")
+        """Bytes 3-4 follow deviceCodeToBytes for 5-digit codes."""
+        cmd = _build("cool", 24, key_press=8, code="19844")
+        self.assertEqual(cmd[6:10], "1944")
 
     def test_build_status_command_raises_on_overlong_device_code(self) -> None:
-        from custom_components.aifa_smart.ac import build_status_command
-
         with self.assertRaisesRegex(ValueError, "cannot be BCD-encoded"):
-            build_status_command("cool", 24, device_code="100000")
-
-    def test_decode_status_command_accepts_device_11_bytes(self) -> None:
-        """Round-trip: a device-11 packet from build_status_command must
-        decode cleanly via decode_status_command."""
-        from custom_components.aifa_smart.ac import (
-            build_status_command,
-            decode_status_command,
-        )
-
-        cmd = build_status_command(
-            "cool", 24, device_code="11", fan_mode="auto", swing_mode="auto"
-        )
-        decoded = decode_status_command(cmd, device_code="11")
-        self.assertIsNotNone(decoded)
-        assert decoded is not None
-        self.assertEqual(decoded.mode, "cool")
-        self.assertEqual(decoded.target_temperature, 24)
-        self.assertEqual(decoded.fan_mode, "auto")
-        self.assertEqual(decoded.swing_mode, "auto")
-
-    def test_decode_status_command_accepts_device_25_bytes(self) -> None:
-        from custom_components.aifa_smart.ac import (
-            build_status_command,
-            decode_status_command,
-        )
-
-        cmd = build_status_command(
-            "cool", 24, device_code="25", fan_mode="medium", swing_mode="fixed_5"
-        )
-        decoded = decode_status_command(cmd, device_code="25")
-        self.assertIsNotNone(decoded)
-        assert decoded is not None
-        self.assertEqual(decoded.fan_mode, "medium")
-        self.assertEqual(decoded.swing_mode, "fixed_5")
-
-    def test_decode_status_command_rejects_non_bcd_byte_4(self) -> None:
-        """Bytes 3-4 must look like BCD (each nibble 0..9) to be a valid
-        device-code-bearing packet. Garbage byte 4 like 0xff means it's not
-        an AC status packet at all."""
-        from custom_components.aifa_smart.ac import decode_status_command
-
-        # Same shape as a real cool 24 packet but byte 4 = 0xff
-        bogus = "ffa00601ff240020010100000000f0"
-        self.assertIsNone(decode_status_command(bogus))
+            _build("cool", 24, key_press=8, code="100000")
 
     def test_round_trip_sweep_for_common_device_codes(self) -> None:
-        """For each common device code the user might encounter, build a
-        canonical cool-24 packet and decode it back. mode/temp/fan/swing
-        must round-trip; bytes 3-4 must match the BCD of the device code."""
-        from custom_components.aifa_smart.ac import (
-            _bcd_encode_device_code,
-            build_status_command,
-            decode_status_command,
-        )
+        """Build a cool-24 packet and read it back the way fromCommandBytes does."""
+        from custom_components.aifa_smart.ac import _bcd_encode_device_code
 
-        # Codes drawn from the AIFA cloud catalog: popular brands + known
-        # outliers from the cross-device matrix experiments 2026-04-28.
         for code in (1, 2, 7, 11, 25, 100, 134, 136, 170, 173, 999):
             with self.subTest(device_code=code):
-                cmd = build_status_command(
-                    "cool", 24, device_code=str(code),
-                    fan_mode="auto", swing_mode="auto",
-                )
+                cmd = _build("cool", 24, key_press=6, code=str(code), fan="medium", swing="fixed_5")
                 bcd_high, bcd_low = _bcd_encode_device_code(code)
                 self.assertEqual(cmd[6:8], f"{bcd_high:02x}")
                 self.assertEqual(cmd[8:10], f"{bcd_low:02x}")
+                report = _as_report(cmd)
+                self.assertEqual(report.device_code, str(code))
+                self.assertEqual(
+                    (report.mode, report.target_temperature, report.fan_mode, report.swing_mode),
+                    ("cool", 24, "medium", "fixed_5"),
+                )
 
-                decoded = decode_status_command(cmd, device_code=str(code))
-                self.assertIsNotNone(decoded, f"decode failed for code {code}")
-                assert decoded is not None
-                self.assertEqual(decoded.mode, "cool")
-                self.assertEqual(decoded.target_temperature, 24)
-                self.assertEqual(decoded.fan_mode, "auto")
-                self.assertEqual(decoded.swing_mode, "auto")
+
+class ClassicTemperatureKeyCommandTests(unittest.TestCase):
+    def test_up_and_down_keys_for_sub_type_0(self) -> None:
+        self.assertEqual(build_classic_temperature_key_command(0, up=True), "ffa006f0")
+        self.assertEqual(build_classic_temperature_key_command(0, up=False), "ffa007f0")
+
+    def test_sub_type_1_uses_a1(self) -> None:
+        self.assertEqual(build_classic_temperature_key_command(1, up=True), "ffa106f0")
+
+
+class ModeKeyCommandTests(unittest.TestCase):
+    def test_mode_keys_for_sub_type_0(self) -> None:
+        expected = {
+            "auto": "ffa015f0",
+            "cool": "ffa016f0",
+            "heat": "ffa017f0",
+            "dry": "ffa018f0",
+            "fan_only": "ffa019f0",
+        }
+        for mode, command in expected.items():
+            with self.subTest(mode=mode):
+                self.assertEqual(build_mode_key_command(mode, 0), command)
+
+    def test_fan_alias_and_case_normalize(self) -> None:
+        self.assertEqual(build_mode_key_command("fan", 0), "ffa019f0")
+        self.assertEqual(build_mode_key_command("Cool", 0), "ffa016f0")
+
+    def test_sub_type_1_uses_a1(self) -> None:
+        self.assertEqual(build_mode_key_command("cool", 1), "ffa116f0")
+        self.assertEqual(build_mode_key_command("heat", 1), "ffa117f0")
+
+    def test_unknown_mode_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            build_mode_key_command("off", 0)
+
+    def test_hub_requires_mode_keys_only_for_exact_version_pair(self) -> None:
+        self.assertTrue(hub_requires_mode_keys(5, 210623))
+        self.assertFalse(hub_requires_mode_keys(5, 210624))
+        self.assertFalse(hub_requires_mode_keys(4, 210623))
+        self.assertFalse(hub_requires_mode_keys(5, None))
+        self.assertFalse(hub_requires_mode_keys(None, None))
 
 
 if __name__ == "__main__":

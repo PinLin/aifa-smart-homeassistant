@@ -5,7 +5,7 @@
   "documentation": "https://github.com/PinLin/aifa-smart-homeassistant",
   "issue_tracker": "https://github.com/PinLin/aifa-smart-homeassistant/issues",
   "requirements": [],
-  "dependencies": [],
+  "dependencies": ["network"],
   "codeowners": ["@PinLin"],
   "iot_class": "cloud_polling",
   "config_flow": true

@@ -3,13 +3,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from enum import StrEnum
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.core import CALLBACK_TYPE, HassJob, HomeAssistant, callback
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    HomeAssistantError,
+    ServiceValidationError,
+)
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import (
     TimestampDataUpdateCoordinator,
@@ -18,38 +25,76 @@ from homeassistant.helpers.update_coordinator import (
 from homeassistant.util import dt as dt_util
 
 from .ac import (
+    CLASSIC_AC_QUERY_PACKET,
+    FAN_SPEED_KEY,
+    SET_CODE_MAX_DEVICE_CODE,
+    STATUS_KEY_PRESS_MODE,
+    STATUS_KEY_PRESS_TEMPERATURE_DOWN,
+    STATUS_KEY_PRESS_TEMPERATURE_UP,
+    AifaAcKey,
     AifaAcStatus,
+    CodeMatchReply,
+    ac_key_requires_power_on,
+    build_ac_key_command,
+    build_app_status_command,
+    build_classic_temperature_key_command,
+    build_code_match_next_command,
+    build_code_match_start_command,
     build_estimated_capabilities,
+    build_mode_key_command,
+    build_pairing_key_command,
     build_power_off_command,
-    build_status_command,
+    build_power_on_command,
+    build_set_code_command,
     clamp_target_temperature,
-    decode_status_command,
+    device_code_wire_bytes,
     get_ac_capabilities,
     get_default_mode,
+    hub_reports_ac_state,
+    hub_requires_mode_keys,
+    is_anti_mold_key,
     is_supported_ac_sub_device,
     normalize_ac_mode,
+    normalize_catalog_mode,
+    parse_code_match_packet,
+    set_code_slot,
 )
 from .api import (
     AifaClassicSensorState,
     AifaDevice,
+    AifaDeviceCode,
     AifaDeviceCodeCatalog,
     AifaFunction,
     AifaFunctionCommand,
     AifaMacro,
     AifaSensorSample,
-    AifaSubDevice,
     AifaSmartApiClient,
+    AifaSmartApiError,
     AifaSmartAuthError,
     AifaSmartConnectionError,
     AifaSmartError,
+    AifaSubDevice,
 )
 from .classic_listener import (
     AifaClassicSocketListenerSpec,
+    AifaClassicSocketTarget,
     ClassicSocketManager,
     _ac_socket_sub_type,
 )
-from .const import DOMAIN, SCAN_INTERVAL
-from .runtime import AifaAcRuntimeState, resolve_helper_flag_mutex
+from .const import (
+    CONF_SELECTED_BRANDS,
+    DOMAIN,
+    LAN_AUTO_SUPPRESS_SECONDS,
+    LAN_CONNECT_TIMEOUT,
+    SCAN_INTERVAL,
+    TRANSPORT_AUTO,
+    TRANSPORT_CLOUD,
+    TRANSPORT_LAN,
+    transport_from_options,
+)
+from .device_cache import AifaDeviceCache
+from .lan import LanSendResult, LanTransportManager
+from .runtime import AifaAcRuntimeState
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -66,6 +111,248 @@ _AC_SEND_MIN_INTERVAL_SECONDS = 1.0
 # (UpdateFailed / ConfigEntryAuthFailed) regardless of catalog state.
 _FAILURES_BEFORE_ISSUE = 10
 ISSUE_POLLING_FAILING = "polling_failing"
+# The hub reports its status about 0.4 s after a command and answers a query
+# within 0.8 s on the LAN; 1.5 s leaves room for a busy hub or the cloud relay.
+AC_CONFIRM_PUSH_TIMEOUT = 1.5
+AC_CONFIRM_QUERY_TIMEOUT = 1.5
+# Some codes report off after the power-off key and some never do, so any
+# report confirms a power off; a power on needs a report that is not off.
+AC_POWER_OFF_STRICT_CONFIRM = False
+# How long a sent but unreported state is preferred over the hub's last
+# report before the hub's own report is shown again.
+AC_PENDING_RELEASE_SECONDS = 14.0
+AC_PENDING_RELEASE_OFF_SECONDS = 26.0
+# The hub echoes SetCode as `fa f5 <slot> <hi> <lo> f0` within a second, or
+# answers `fb f5` and keeps its code when it does not support the new one.
+SET_CODE_ACK_TIMEOUT = 3.0
+# The AIFA Smart app waits 2 s after SetCode before it sends the next packet.
+SET_CODE_SETTLE_SECONDS = 2.0
+# Right after `fb f5` the hub ignores packets for a short while, so the
+# follow-up query waits before it is sent.
+SET_CODE_REJECT_SETTLE = 0.5
+SET_CODE_QUERY_TIMEOUT = 3.0
+ISSUE_DEVICE_CODE_MISMATCH = "device_code_mismatch"
+# The AIFA Smart app gives up 15 s after StartMatch; a candidate does not restart it.
+CODE_MATCH_TIMEOUT = 15.0
+# A 4-byte end may be the head of a candidate split across reads; the hub
+# sends the rest at once or nothing more.
+CODE_MATCH_SHORT_END_GRACE = 0.3
+# Errors after which bytes may have reached the hub.
+_WRITE_FAILED_KEYS = frozenset({"lan_write_failed", "cloud_write_failed"})
+
+
+class SetCodeOutcome(StrEnum):
+    """What the hub showed after one SetCode."""
+
+    CONFIRMED = "confirmed"
+    # The hub answered with a different code: it did not take this one.
+    MISMATCH = "mismatch"
+    # Nothing came back in time; the hub may or may not use the new code.
+    UNCONFIRMED = "unconfirmed"
+    # Nothing was written, so the hub still uses its old code.
+    NOT_SENT = "not_sent"
+    # The hub answered `fb f5` and a query showed it kept its old code.
+    REJECTED = "rejected"
+    # The hub answered `fb f5`, but no query showed the old code.
+    REJECTED_UNVERIFIED = "rejected_unverified"
+    # The hub echoed the code and no query followed: a query right before
+    # the test press would make the hub drop it.
+    ACKED = "acked"
+
+
+@dataclass(slots=True)
+class CodeTrial:
+    """A hub left on a code it was tried on; the cloud still has `original_code`."""
+
+    owner: str
+    sub_device_id: str
+    slot: int
+    original_code: int
+    # None when the hub never confirmed what it uses.
+    hub_code: int | None
+    press: asyncio.Task[None] | None = None
+    remove_shutdown_job: CALLBACK_TYPE | None = None
+
+
+class DeviceCodeChangeError(HomeAssistantError):
+    """A code change that failed; `reason` is the options-flow error key."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass(frozen=True, slots=True)
+class AcConfirmation:
+    """What a hub status report must show for a command to count as delivered."""
+
+    # None accepts a report for any slot (a slot 1 AC's reports are unverified).
+    sub_type: int | None
+    mode: str | None = None
+    target_temperature: int | None = None
+    # The fan key cycles the speed, so only a b7 different from this proves
+    # the hub took it.
+    fan_speed_changed_from: str | None = None
+    # Any report that does not show off; the hub reports no setpoint or
+    # mode a power key could be checked against.
+    power_on: bool = False
+
+    def covers(self, sub_type: int) -> bool:
+        return self.sub_type is None or sub_type == self.sub_type
+
+    def matches(self, observed: AifaAcStatus) -> bool:
+        if self.fan_speed_changed_from is not None:
+            return observed.mode != "off" and observed.fan_mode != self.fan_speed_changed_from
+        if self.power_on:
+            return observed.mode != "off"
+        if self.mode is None:
+            return True
+        if observed.mode != self.mode:
+            return False
+        # The hub report has no setpoint (0x00) on the firmware seen so far.
+        return (
+            self.target_temperature is None
+            or observed.target_temperature is None
+            or observed.target_temperature == self.target_temperature
+        )
+
+    def describe(self) -> str:
+        if self.power_on:
+            return "on"
+        return self.mode or "any"
+
+
+@dataclass(slots=True)
+class _HubReportWaiter:
+    """Status reports a hub sent while one command waits for confirmation."""
+
+    reports: list[tuple[str, int, AifaAcStatus]] = field(default_factory=list)
+    # SetCode echoes as (source, slot, hi, lo).
+    acks: list[tuple[str, int, int, int]] = field(default_factory=list)
+    # Sources of `fb f5` SetCode refusals.
+    rejects: list[str] = field(default_factory=list)
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Reports during a code change carry a code the cloud does not have yet.
+    changing_code: bool = False
+
+
+@dataclass(slots=True)
+class _CodeMatch:
+    """Replies a hub sent while it looks for the code of a remote."""
+
+    slot: int
+    # (source, kind, candidate code, 4-byte end)
+    replies: list[tuple[str, CodeMatchReply, int | None, bool]] = field(default_factory=list)
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+def _confirmation_slot(sub_type: int) -> int | None:
+    """Slot whose reports can confirm a command; None accepts any slot.
+
+    Which slot the hub reports after a slot 1 command is not verified.
+    """
+    return sub_type if sub_type == 0 else None
+
+
+def _report_source(transport: str) -> str:
+    return "lan" if transport == "lan" else "cloud"
+
+
+async def _async_wait_until(
+    waiter: _HubReportWaiter, predicate: Callable[[], bool], timeout: float
+) -> bool:
+    """Wait until `predicate` holds for what the waiter collected."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        if predicate():
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        waiter.event.clear()
+        try:
+            await asyncio.wait_for(waiter.event.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _async_wait_for_hub_report(
+    waiter: _HubReportWaiter,
+    source: str,
+    confirmation: AcConfirmation,
+    start: int,
+    timeout: float,
+) -> tuple[AifaAcStatus | None, bool, AifaAcStatus | None]:
+    """Return (matching report, any covered report seen, last covered report).
+
+    A report that does not match keeps the wait going: the hub's own echo
+    may still follow an older report or one caused by a remote.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    index = start
+    replied = False
+    last: AifaAcStatus | None = None
+    while True:
+        while index < len(waiter.reports):
+            report_source, sub_type, observed = waiter.reports[index]
+            index += 1
+            if report_source != source or not confirmation.covers(sub_type):
+                continue
+            replied = True
+            last = observed
+            if confirmation.matches(observed):
+                return observed, True, observed
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return None, replied, last
+        waiter.event.clear()
+        try:
+            await asyncio.wait_for(waiter.event.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            pass
+
+
+def _off_status(device_code: str | None) -> AifaAcStatus:
+    return AifaAcStatus(
+        device_code=device_code,
+        mode="off",
+        target_temperature=None,
+        timer_ir_value=0,
+        fan_mode=None,
+        swing_mode=None,
+        turbo=False,
+        sleep=False,
+        power_saving=False,
+        packet_byte_12=0,
+        packet_byte_13=0,
+    )
+
+
+def _app_status_base(state: AifaAcRuntimeState, device_code: str | None) -> AifaAcStatus:
+    """The status the AIFA Smart app copies into a 15-byte packet: its last On report.
+
+    The app has no packet to copy before its first report (its mode buttons
+    and slider are disabled then); this falls back to the setpoint HA last
+    asked for with fan auto, swing off and no flags.
+    """
+    observed = state.observed_status
+    if observed is not None and observed.mode != "off":
+        return observed
+    return AifaAcStatus(
+        device_code=device_code,
+        mode=state.last_active_hvac_mode or get_default_mode(device_code),
+        target_temperature=state.requested_target_temperature,
+        timer_ir_value=0,
+        fan_mode="auto",
+        swing_mode="off",
+        turbo=False,
+        sleep=False,
+        power_saving=False,
+        packet_byte_12=0,
+        packet_byte_13=0,
+    )
 
 
 @dataclass(slots=True)
@@ -80,6 +367,18 @@ class AifaAccountData:
 class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
     """Coordinate AIFA Smart data refreshes."""
 
+    _transport: str = TRANSPORT_CLOUD
+    _lan_manager: LanTransportManager | None = None
+    _device_cache: AifaDeviceCache | None = None
+    # True from an offline start until the first successful cloud refresh.
+    running_on_cache: bool = False
+    # Sub-devices whose reported code was compared with the cloud since setup.
+    _device_code_checked: set[tuple[str, str]] | None = None
+    # Set on unload; a refresh that is not an entry task may still finish.
+    _closed: bool = False
+    # Set when unload starts, so no code trial begins after it undid them.
+    _closing: bool = False
+
     def __init__(
         self,
         hass: HomeAssistant,
@@ -90,20 +389,23 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         self.client = client
         self._device_code_catalogs: dict[str, AifaDeviceCodeCatalog] = {}
         self._ac_runtime_states: dict[tuple[str, str], AifaAcRuntimeState] = {}
-        self._ac_follow_up_probe_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
-        # Per-(device, sub_device) lock + last-send timestamp to serialize
-        # async_apply_ac_state and enforce a min interval between IR sends.
-        # Without these, two HA service calls within ~1s could both send IR
-        # before the hub reconciles the first command, racing on runtime state
-        # and producing the "dropped command" symptom (see runtime.py
-        # apply_observed_status stale-observed guard for the other half of
-        # the fix).
-        self._ac_apply_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._ac_pending_release_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+        # Two service calls within ~1 s would otherwise both send IR before the
+        # hub reports the first, racing on runtime state.
+        self._ac_apply_locks: dict[str, asyncio.Lock] = {}
         self._ac_last_send_at: dict[tuple[str, str | None], float] = {}
+        self._hub_report_waiters: dict[str, list[_HubReportWaiter]] = {}
+        self._code_trials: dict[str, CodeTrial] = {}
+        self._code_changes_running: set[str] = set()
+        self._code_matches: dict[str, _CodeMatch] = {}
+        self._code_match_tasks: set[asyncio.Task[list[int]]] = set()
+        self._lan_queried_at: dict[str, datetime | None] = {}
         self._consecutive_failures = 0
+        # The base class registers async_shutdown on the entry's unload.
         super().__init__(
             hass,
             logger=_LOGGER,
+            config_entry=entry,
             name=f"{DOMAIN}_{entry.entry_id}",
             update_interval=timedelta(seconds=SCAN_INTERVAL),
         )
@@ -111,21 +413,132 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         self._classic_listener = ClassicSocketManager(
             hass=hass,
             client=client,
-            on_observed_status=self._apply_classic_observed_status,
+            on_observed_status=self._apply_cloud_stream_status,
             on_sensor_state=self._apply_classic_sensor_state,
             on_data_changed=self.async_update_listeners,
             on_notify_full_refresh=self.async_request_refresh,
+            on_set_code_ack=self._apply_cloud_set_code_ack,
+            on_set_code_reject=self._apply_cloud_set_code_reject,
+            on_code_match=self._apply_cloud_code_match,
         )
+        self._device_code_checked = set()
+        self._transport = transport_from_options(entry.options)
+        self._lan_failed_at: dict[str, float] = {}
+        self._transport_counters: dict[str, int | str | None] = {
+            "sent_lan": 0,
+            "sent_cloud": 0,
+            "auto_fallbacks": 0,
+            "lan_write_failures": 0,
+            "last_transport": None,
+        }
+        if self._transport != TRANSPORT_CLOUD:
+            self._lan_manager = LanTransportManager(
+                hass=hass,
+                on_observed_status=self._apply_lan_observed_status,
+                on_data_changed=self.async_update_listeners,
+                on_link_state_changed=self._on_lan_link_state_changed,
+                on_set_code_ack=self._apply_lan_set_code_ack,
+                on_set_code_reject=self._apply_lan_set_code_reject,
+                on_code_match=self._apply_lan_code_match,
+            )
+            self._device_cache = AifaDeviceCache(hass, entry.entry_id)
+
+    @property
+    def transport(self) -> str:
+        """Transport selected in the entry options."""
+        return self._transport
+
+    @property
+    def lan_manager(self) -> LanTransportManager | None:
+        """LAN transport manager, present only for the lan and auto modes."""
+        return self._lan_manager
+
+    def transport_diagnostics(self) -> dict[str, object]:
+        """Transport state for diagnostics; carries no MAC or credential."""
+        lan = self._lan_manager
+        listener = self._classic_listener
+        return {
+            "mode": self._transport,
+            "running_on_cache": self.running_on_cache,
+            "broadcast_addresses": list(lan.broadcast_addresses) if lan is not None else [],
+            "lan": lan.snapshot() if lan is not None else {},
+            "cloud_listener": {
+                device_id: {
+                    "listening": listener.has_active_listener(device_id),
+                    "writer": listener.has_active_writer(device_id),
+                }
+                for device_id in listener.specs
+            },
+            "counters": dict(self._transport_counters),
+        }
+
+    def is_control_available(self, device_id: str) -> bool:
+        """Availability of entities that send commands to the hub.
+
+        Cloud mode keeps the poll-based rule. LAN mode follows the link with a
+        grace period so a reconnect does not flap entities. Auto mode is usable
+        while either path is.
+        """
+        if self._transport == TRANSPORT_CLOUD:
+            return self.last_update_success
+        lan_available = self._lan_manager is not None and self._lan_manager.is_available(
+            device_id
+        )
+        if self._transport == TRANSPORT_LAN:
+            return lan_available
+        return lan_available or self.last_update_success
+
+    def _on_lan_link_state_changed(self) -> None:
+        self.async_update_listeners()
+        lan_manager = self._lan_manager
+        account = self.data
+        if lan_manager is None or account is None:
+            return
+        for device in account.devices.values():
+            link = lan_manager.links.get(device.id)
+            if link is None or not link.connected:
+                continue
+            # Link-state callbacks also fire on drops and grace expiry; the
+            # connect timestamp tells a new connection from those.
+            if self._lan_queried_at.get(device.id) == link.connected_at:
+                continue
+            self._lan_queried_at[device.id] = link.connected_at
+            if any(
+                is_supported_ac_sub_device(sub.type, sub.device_code)
+                for sub in device.sub_devices
+            ):
+                # Like the AIFA Smart app on every connect: state changed while the
+                # link was down is never pushed, and a LAN-only start has no
+                # cloud poll to ask for it.
+                self.hass.async_create_background_task(
+                    lan_manager.async_request_status(device.id),
+                    name=f"{DOMAIN}_lan_connect_query_{device.id}",
+                )
 
     async def async_shutdown(self) -> None:
-        """Cancel background classic-socket and follow-up probe tasks."""
+        """Cancel background classic-socket and pending-release tasks."""
+        # Before the links close: a reload must not leave the hub on a code
+        # the cloud does not have.
+        self._closing = True
+        for device_id, trial in list(self._code_trials.items()):
+            await self._async_end_code_trial(device_id, trial)
+        # Waiting out a match would hold the unload for up to 15 s.
+        for task in list(self._code_match_tasks):
+            _LOGGER.warning("Unloading during a code match; the hub may wait for NextMatch")
+            task.cancel()
+        if self._code_match_tasks:
+            await asyncio.gather(*self._code_match_tasks, return_exceptions=True)
+        self._closed = True
+        await super().async_shutdown()
         await self._classic_listener.shutdown()
+        if self._lan_manager is not None:
+            await self._lan_manager.shutdown()
         tasks = [
             task
-            for task in list(self._ac_follow_up_probe_tasks.values())
+            for task in list(self._ac_pending_release_tasks.values())
             if task is not None and not task.done()
         ]
-        self._ac_follow_up_probe_tasks.clear()
+        self._ac_pending_release_tasks.clear()
         for task in tasks:
             task.cancel()
         if tasks:
@@ -136,6 +549,8 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         if self.data is None:
             return
         self._classic_listener.sync_specs(self.data.devices)
+        if self._lan_manager is not None:
+            self._lan_manager.sync_specs(self.data.devices)
 
     def get_device(self, device_id: str) -> AifaDevice | None:
         """Return a single device by ID."""
@@ -150,50 +565,249 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
             return None
         return device.get_sub_device(sub_device_id)
 
-    async def _async_dispatch_raw_commands(
-        self, commands: list[AifaFunctionCommand]
-    ) -> list[dict]:
-        """Send raw commands through the long-lived classic TLS socket.
+    async def _async_send_unconfirmed(self, command: AifaFunctionCommand) -> dict:
+        """Write one packet like the AIFA Smart app sends a macro step: no report awaited.
 
-        Mirrors AIFA app's behaviour: AC control commands ride the same long-
-        lived TLS socket to ``aifaremote.com:8751`` that streams hub
-        broadcasts. AIFA app itself does not fall back to REST when the
-        socket is unavailable — it queues until the socket comes back. We
-        match that contract by raising on missing socket / write error so
-        the caller can surface the failure rather than silently routing
-        through a REST path that AIFA app reserves for geofence automation.
+        A macro step may be any learned IR code that draws no report. Raises
+        only when nothing could be written or a write failed, never resends;
+        the cloud path has no REST fallback, as in the app.
         """
-        if not commands:
-            return []
+        self._raise_if_code_trial(command.device_id, command.sub_device_id)
+        # Any packet would wait out the match on the hub lock.
+        self._raise_if_code_match(command.device_id)
+        # A report during an AC command's wait must not come from this packet.
+        async with self._ac_apply_lock(command.device_id):
+            self._raise_if_code_trial(command.device_id, command.sub_device_id)
+            self._raise_if_code_match(command.device_id)
+            transport = await self._async_send_raw_command(command)
+        return self._send_response(command, transport)
 
-        responses: list[dict] = []
-        for command in commands:
-            sent_via_tls = await self._classic_listener.async_send_packet(
-                command.device_id, command.command
+    @staticmethod
+    def _send_response(command: AifaFunctionCommand, transport: str) -> dict:
+        response: dict = {
+            "deviceId": command.device_id,
+            "status": "success",
+            "transport": transport,
+        }
+        if command.sub_device_id is not None:
+            response["subDeviceId"] = command.sub_device_id
+        return response
+
+    async def _async_send_raw_command(self, command: AifaFunctionCommand) -> str:
+        """Send one raw packet over the configured transport and name it."""
+        if self._transport == TRANSPORT_LAN:
+            return await self._async_send_raw_command_lan(command)
+        if self._transport == TRANSPORT_AUTO and self._lan_manager is not None:
+            return await self._async_send_raw_command_auto(command, self._lan_manager)
+        return await self._async_send_raw_command_cloud(command)
+
+    async def _async_send_confirmed(
+        self,
+        command: AifaFunctionCommand,
+        confirmation: AcConfirmation,
+        *,
+        on_written: Callable[[], None] | None = None,
+    ) -> tuple[str, AifaAcStatus]:
+        """Send one packet and return once a hub status report confirms it.
+
+        Callers hold the hub's apply lock, so a report belongs either to this
+        command or to an outside source such as a remote; the content check
+        tells those apart wherever the report carries the changed field.
+        Only reports read from the connection that carried the command
+        count, because a half-open connection still accepts writes.
+        A report that does not match raises without a resend, like i-Ctrl
+        Pro, which never repeats a key; the entity shows that report.
+        `on_written` runs once the packet is out, before the reports it draws.
+        """
+        device_id = command.device_id
+        waiter = _HubReportWaiter()
+        waiters = self._hub_report_waiters.setdefault(device_id, [])
+        waiters.append(waiter)
+        try:
+            transport = await self._async_send_raw_command(command)
+            if on_written is not None:
+                on_written()
+            # Counted from after the write: a report that arrived while a
+            # LAN link was still connecting predates the command.
+            start = len(waiter.reports)
+            source = _report_source(transport)
+            matched, replied, last_report = await _async_wait_for_hub_report(
+                waiter,
+                source,
+                confirmation,
+                start,
+                AC_CONFIRM_PUSH_TIMEOUT,
             )
-            if not sent_via_tls:
-                raise AifaSmartError(
-                    f"No active TLS connection for device {command.device_id}; "
-                    "cannot send command"
+            if matched is None and await self._async_query_hub_status(
+                device_id, transport
+            ):
+                matched, replied, last_report = await _async_wait_for_hub_report(
+                    waiter, source, confirmation, start, AC_CONFIRM_QUERY_TIMEOUT
                 )
+            if matched is not None:
+                return transport, matched
+            if not replied:
+                # Silence is not a dead link: after some keys the hub ignores
+                # queries for a while yet still takes keys, so the link is
+                # left to keepalive, write failures and the LAN idle check.
+                _LOGGER.warning(
+                    "AIFA hub %s sent no status after a command over %s",
+                    device_id,
+                    transport,
+                )
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="hub_no_response",
+                    translation_placeholders={"device_id": device_id},
+                )
+            if confirmation.fan_speed_changed_from is not None:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="ac_fan_speed_unchanged",
+                    translation_placeholders={"device_id": device_id},
+                )
+            if confirmation.power_on:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="ac_power_on_not_reported",
+                    translation_placeholders={"device_id": device_id},
+                )
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="ac_state_mismatch",
+                translation_placeholders={
+                    "device_id": device_id,
+                    "expected": confirmation.describe(),
+                    "reported": last_report.mode if last_report is not None else "",
+                },
+            )
+        finally:
+            waiters.remove(waiter)
+            if not waiters and self._hub_report_waiters.get(device_id) is waiters:
+                del self._hub_report_waiters[device_id]
 
-            response: dict = {
-                "deviceId": command.device_id,
-                "status": "success",
-                "transport": "classic_tls",
-            }
-            if command.sub_device_id is not None:
-                response["subDeviceId"] = command.sub_device_id
-            responses.append(response)
-        return responses
+    async def _async_query_hub_status(self, device_id: str, transport: str) -> bool:
+        """Ask the hub for its status on the connection that carried the command."""
+        try:
+            if transport == "lan":
+                lan_manager = self._lan_manager
+                return lan_manager is not None and await lan_manager.async_request_status(
+                    device_id
+                )
+            return await self._classic_listener.async_send_packet(
+                device_id, CLASSIC_AC_QUERY_PACKET
+            )
+        except (OSError, RuntimeError) as err:
+            _LOGGER.debug("AIFA status query to %s failed: %s", device_id, err)
+            return False
 
-    async def async_send_function_commands(
-        self, commands: list[AifaFunctionCommand]
-    ) -> list[dict]:
-        """Send a prepared command sequence and refresh coordinator data."""
-        responses = await self._async_dispatch_raw_commands(commands)
-        await self.async_request_refresh()
-        return responses
+    async def _async_send_raw_command_cloud(self, command: AifaFunctionCommand) -> str:
+        if not await self._async_write_cloud(command.device_id, command.command):
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="cloud_unavailable",
+                translation_placeholders={"device_id": command.device_id},
+            )
+        return "classic_tls"
+
+    async def _async_write_cloud(self, device_id: str, packet: str) -> bool:
+        """False when nothing was written; a failed write may have left bytes."""
+        try:
+            return await self._classic_listener.async_send_packet(device_id, packet)
+        except (OSError, RuntimeError) as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="cloud_write_failed",
+                translation_placeholders={"device_id": device_id},
+            ) from err
+
+    async def _async_send_over_lan(self, command: AifaFunctionCommand) -> LanSendResult:
+        if self._lan_manager is None:
+            return LanSendResult.NOT_CONNECTED
+        result = await self._lan_manager.async_send_packet(
+            command.device_id, command.command, connect_timeout=LAN_CONNECT_TIMEOUT
+        )
+        if result is LanSendResult.SENT:
+            self._count_transport("sent_lan", last="lan")
+        elif result is LanSendResult.WRITE_FAILED:
+            self._count_transport("lan_write_failures")
+        return result
+
+    async def _async_send_raw_command_lan(self, command: AifaFunctionCommand) -> str:
+        """LAN only: never touch the cloud, even when the hub is unreachable."""
+        result = await self._async_send_over_lan(command)
+        if result is LanSendResult.SENT:
+            return "lan"
+        if result is LanSendResult.WRITE_FAILED:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="lan_write_failed",
+                translation_placeholders={"device_id": command.device_id},
+            )
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="lan_unavailable",
+            translation_placeholders={"device_id": command.device_id},
+        )
+
+    async def _async_send_raw_command_auto(
+        self, command: AifaFunctionCommand, lan_manager: LanTransportManager
+    ) -> str:
+        """Prefer LAN; use the cloud only when nothing was written locally.
+
+        A failed write may already have reached the hub, and relative keys
+        (temperature +/-, fan cycling) would step twice if resent, so
+        WRITE_FAILED never falls back.
+        """
+        device_id = command.device_id
+        failed_at = self._lan_failed_at.get(device_id)
+        suppressed = (
+            failed_at is not None
+            and time.monotonic() - failed_at < LAN_AUTO_SUPPRESS_SECONDS
+            and not lan_manager.is_connected(device_id)
+        )
+        if not suppressed:
+            result = await self._async_send_over_lan(command)
+            if result is LanSendResult.SENT:
+                self._lan_failed_at.pop(device_id, None)
+                return "lan"
+            self._lan_failed_at[device_id] = time.monotonic()
+            if result is LanSendResult.WRITE_FAILED:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="lan_write_failed",
+                    translation_placeholders={"device_id": device_id},
+                )
+            self._count_transport("auto_fallbacks")
+
+        if not await self._async_write_cloud(device_id, command.command):
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="no_transport",
+                translation_placeholders={"device_id": device_id},
+            )
+        self._count_transport("sent_cloud", last="classic_tls")
+        return "classic_tls"
+
+    def _count_transport(self, key: str, *, last: str | None = None) -> None:
+        counters = self._transport_counters
+        counters[key] = int(counters[key] or 0) + 1
+        if last is not None:
+            counters["last_transport"] = last
+
+    async def _async_refresh_after_send(self) -> None:
+        """Refresh after a command without making LAN control wait on the cloud.
+
+        The debouncer runs the first refresh inline, so awaiting it would hold
+        the apply lock for the whole cloud round trip (30 s when unreachable).
+        """
+        if self._transport == TRANSPORT_CLOUD:
+            await self.async_request_refresh()
+            return
+        self.hass.async_create_background_task(
+            self.async_request_refresh(),
+            name=f"{DOMAIN}_refresh_after_send",
+        )
 
     def get_macro(self, macro_id: str) -> AifaMacro | None:
         """Look up a saved macro by id from the latest account snapshot."""
@@ -206,10 +820,18 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         return None
 
     async def async_execute_macro(self, macro_id: str) -> list[dict]:
-        """Run all commands of a saved macro in order, honoring per-step delays."""
+        """Run all commands of a saved macro in order, honoring per-step delays.
+
+        A step goes out once both the transports' queue spacing and the
+        macro's own delay have passed, without waiting for the hub to report.
+        """
         macro = self.get_macro(macro_id)
         if macro is None:
-            raise AifaSmartError(f"Macro {macro_id} not found")
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="macro_not_found",
+                translation_placeholders={"macro_id": macro_id},
+            )
         if not macro.commands:
             return []
 
@@ -219,22 +841,20 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         responses: list[dict] = []
         last_index = len(ordered) - 1
         for index, command in enumerate(ordered):
-            responses.extend(
-                await self._async_dispatch_raw_commands(
-                    [
-                        AifaFunctionCommand(
-                            id=f"macro-{macro.id}-{index}",
-                            device_id=str(command.device_id),
-                            sub_device_id=command.sub_device_id,
-                            command=command.command,
-                        )
-                    ]
+            responses.append(
+                await self._async_send_unconfirmed(
+                    AifaFunctionCommand(
+                        id=f"macro-{macro.id}-{index}",
+                        device_id=str(command.device_id),
+                        sub_device_id=command.sub_device_id,
+                        command=command.command,
+                    )
                 )
             )
             if index < last_index and command.delay and command.delay > 0:
                 await asyncio.sleep(command.delay / 1000)
 
-        await self.async_request_refresh()
+        await self._async_refresh_after_send()
         return responses
 
     def _prune_stale_runtime_state(self, devices: dict[str, AifaDevice]) -> None:
@@ -243,7 +863,7 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         Without this, removing a sub-device in the AIFA app leaves stale keys
         in `_ac_runtime_states`, `_ac_apply_locks`, `_ac_last_send_at`,
         `_device_code_catalogs`, and orphan tasks in
-        `_ac_follow_up_probe_tasks` for the lifetime of the integration.
+        `_ac_pending_release_tasks` for the lifetime of the integration.
         """
         live_pairs: set[tuple[str, str]] = set()
         live_sub_device_ids: set[str] = set()
@@ -255,9 +875,10 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         for key in list(self._ac_runtime_states.keys()):
             if key not in live_pairs:
                 self._ac_runtime_states.pop(key, None)
-        for key in list(self._ac_apply_locks.keys()):
-            if key not in live_pairs:
-                self._ac_apply_locks.pop(key, None)
+        for device_id, lock in list(self._ac_apply_locks.items()):
+            # A hub missing from one snapshot may still have a command in flight.
+            if device_id not in devices and not lock.locked():
+                self._ac_apply_locks.pop(device_id, None)
         for key in list(self._ac_last_send_at.keys()):
             device_id, sub_device_id = key
             if sub_device_id is None:
@@ -268,10 +889,10 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         for sub_device_id in list(self._device_code_catalogs.keys()):
             if sub_device_id not in live_sub_device_ids:
                 self._device_code_catalogs.pop(sub_device_id, None)
-        for key in list(self._ac_follow_up_probe_tasks.keys()):
+        for key in list(self._ac_pending_release_tasks.keys()):
             if key in live_pairs:
                 continue
-            task = self._ac_follow_up_probe_tasks.pop(key, None)
+            task = self._ac_pending_release_tasks.pop(key, None)
             if task is not None and not task.done():
                 task.cancel()
 
@@ -297,37 +918,207 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         *,
         hvac_mode: str | None = None,
         target_temperature: int | None = None,
-        fan_mode: str | None = None,
-        swing_mode: str | None = None,
-        turbo: bool | None = None,
-        sleep: bool | None = None,
-        power_saving: bool | None = None,
         device_code: str | None = None,
     ) -> str:
-        """Send one AC power or status command and update requested fallback state."""
-        # Serialize concurrent applies for the same AC and enforce a minimum
-        # gap between sends. The hub needs ~1s to reconcile each command;
-        # without this, a second send racing the first observed packet
-        # produces the "dropped command" symptom.
+        """Send one AC state change and return once the hub has confirmed it.
+
+        `hvac_mode="on"` sends only the power key, like the app's On button;
+        a target temperature is set in the mode the AC is showing.
+        Raises HomeAssistantError when the hub does not answer or reports a
+        different state; the command is not resent and the entity shows the
+        hub's last report.
+        """
         lock_key = (device_id, sub_device_id)
-        lock = self._ac_apply_locks.get(lock_key)
+        # A code match holds the lock for up to 15 s; refuse at once.
+        self._raise_if_code_trial(device_id, sub_device_id)
+        async with self._ac_apply_lock(device_id):
+            self._raise_if_code_trial(device_id, sub_device_id)
+            current = self.get_sub_device(device_id, sub_device_id)
+            if (
+                device_code is not None
+                and current is not None
+                and current.device_code != device_code
+            ):
+                # A code change finished while this command waited for the
+                # lock; its packet would carry the old code.
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="ac_device_code_changed",
+                    translation_placeholders={"device_id": device_id},
+                )
+            await self._async_throttle_ac_send(lock_key)
+            state = self.get_ac_runtime_state(
+                device_id, sub_device_id, device_code=device_code
+            )
+            # Read before pending is cleared: a pending power off must still
+            # count as off when deciding whether the power key is needed.
+            shown_hvac_mode = state.exposed_hvac_mode
+
+            def supersede() -> None:
+                # A written command supersedes any state still pending
+                # release; reports during the wait must apply as they come.
+                # One that never went out leaves the shown state alone.
+                self._cancel_ac_pending_release(lock_key)
+                state.clear_pending_command_status()
+
+            try:
+                return await self._async_apply_ac_state_locked(
+                    device_id,
+                    sub_device_id,
+                    hvac_mode=hvac_mode,
+                    target_temperature=target_temperature,
+                    device_code=device_code,
+                    shown_hvac_mode=shown_hvac_mode,
+                    on_first_write=supersede,
+                )
+            except Exception:
+                self.async_update_listeners()
+                raise
+
+    async def async_press_classic_temperature_key(
+        self, device_id: str, sub_device_id: str, *, up: bool
+    ) -> None:
+        """Send one +/- temperature key press to a classic-temperature AC."""
+        sub_device = self.get_sub_device(device_id, sub_device_id)
+        if sub_device is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="sub_device_not_found",
+                translation_placeholders={"sub_device_id": sub_device_id},
+            )
+        sub_type = _ac_socket_sub_type(sub_device)
+        # The status report carries no setpoint, so any report from the
+        # slot confirms the press.
+        await self._async_send_ac_key(
+            device_id,
+            sub_device_id,
+            "classic-temperature-key",
+            build_classic_temperature_key_command(sub_type, up=up),
+            lambda: AcConfirmation(sub_type=_confirmation_slot(sub_type)),
+        )
+
+    async def async_press_ac_key(
+        self, device_id: str, sub_device_id: str, key: AifaAcKey
+    ) -> None:
+        """Send one AIFA Smart app AC page key."""
+        sub_device = self.get_sub_device(device_id, sub_device_id)
+        if sub_device is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="sub_device_not_found",
+                translation_placeholders={"sub_device_id": sub_device_id},
+            )
+        state = self.get_ac_runtime_state(
+            device_id, sub_device_id, device_code=sub_device.device_code
+        )
+        shown_mode = state.exposed_hvac_mode
+        if shown_mode == "off" and ac_key_requires_power_on(key, sub_device.device_code):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="ac_key_requires_power_on",
+            )
+        # The app swaps the anti-mold button for a notice in a mode the
+        # Remote Config list does not allow.
+        if is_anti_mold_key(key) and normalize_catalog_mode(shown_mode) not in (
+            get_ac_capabilities(sub_device.device_code).anti_mold_modes
+        ):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="ac_anti_mold_mode_unsupported",
+            )
+        sub_type = _ac_socket_sub_type(sub_device)
+        reports_state = sub_type == 0 and hub_reports_ac_state(sub_device.device_code)
+
+        def written() -> None:
+            if state.power_off_held:
+                # A key the app allows while off may change the report; that
+                # does not mean the AC turned on.
+                state.hold_power_off(None)
+
+        def confirmation() -> AcConfirmation:
+            # Read under the hub lock so the baseline is the report right
+            # before this press. Without a report there is nothing to compare.
+            observed = state.observed_status
+            if (
+                key.code == FAN_SPEED_KEY
+                and reports_state
+                and observed is not None
+                and observed.fan_mode is not None
+            ):
+                return AcConfirmation(
+                    sub_type=sub_type, fan_speed_changed_from=observed.fan_mode
+                )
+            return AcConfirmation(sub_type=_confirmation_slot(sub_type))
+
+        await self._async_send_ac_key(
+            device_id,
+            sub_device_id,
+            f"ac-key-{key.key}",
+            build_ac_key_command(key, sub_type),
+            confirmation,
+            on_written=written,
+        )
+
+    async def _async_send_ac_key(
+        self,
+        device_id: str,
+        sub_device_id: str,
+        command_id: str,
+        packet: str,
+        confirmation: Callable[[], AcConfirmation],
+        *,
+        on_written: Callable[[], None] | None = None,
+    ) -> None:
+        lock_key = (device_id, sub_device_id)
+        self._raise_if_code_trial(device_id, sub_device_id)
+        async with self._ac_apply_lock(device_id):
+            self._raise_if_code_trial(device_id, sub_device_id)
+            await self._async_throttle_ac_send(lock_key)
+            await self._async_send_confirmed(
+                AifaFunctionCommand(
+                    id=command_id,
+                    device_id=device_id,
+                    sub_device_id=sub_device_id,
+                    command=packet,
+                ),
+                confirmation(),
+                on_written=on_written,
+            )
+
+    def _raise_if_code_trial(self, device_id: str, sub_device_id: str | None) -> None:
+        """Refuse AC packets while the hub is left on a code being tried or matches one.
+
+        Every AC on a hub shares slot 0, so all of them are refused.
+        """
+        matching = device_id in self._code_matches
+        if (not matching and device_id not in self._code_trials) or sub_device_id is None:
+            return
+        sub_device = self.get_sub_device(device_id, sub_device_id)
+        if sub_device is None or not is_supported_ac_sub_device(
+            sub_device.type, sub_device.device_code
+        ):
+            return
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="ac_device_code_match" if matching else "ac_device_code_trial",
+            translation_placeholders={"device_id": device_id},
+        )
+
+    def _raise_if_code_match(self, device_id: str) -> None:
+        if device_id in self._code_matches:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="ac_device_code_match",
+                translation_placeholders={"device_id": device_id},
+            )
+
+    def _ac_apply_lock(self, device_id: str) -> asyncio.Lock:
+        """One lock per hub: a report cannot tell which of two commands it answers."""
+        lock = self._ac_apply_locks.get(device_id)
         if lock is None:
             lock = asyncio.Lock()
-            self._ac_apply_locks[lock_key] = lock
-        async with lock:
-            await self._async_throttle_ac_send(lock_key)
-            return await self._async_apply_ac_state_locked(
-                device_id,
-                sub_device_id,
-                hvac_mode=hvac_mode,
-                target_temperature=target_temperature,
-                fan_mode=fan_mode,
-                swing_mode=swing_mode,
-                turbo=turbo,
-                sleep=sleep,
-                power_saving=power_saving,
-                device_code=device_code,
-            )
+            self._ac_apply_locks[device_id] = lock
+        return lock
 
     async def _async_throttle_ac_send(
         self, key: tuple[str, str | None]
@@ -349,142 +1140,307 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         *,
         hvac_mode: str | None = None,
         target_temperature: int | None = None,
-        fan_mode: str | None = None,
-        swing_mode: str | None = None,
-        turbo: bool | None = None,
-        sleep: bool | None = None,
-        power_saving: bool | None = None,
         device_code: str | None = None,
+        shown_hvac_mode: str | None = None,
+        on_first_write: Callable[[], None] | None = None,
     ) -> str:
         state = self.get_ac_runtime_state(
             device_id,
             sub_device_id,
             device_code=device_code,
         )
-        baseline_observed_revision = state.observed_revision
-        resolved_mode = normalize_ac_mode(
-            (hvac_mode or state.requested_hvac_mode or get_default_mode(device_code)).lower()
+        lock_key = (device_id, sub_device_id)
+        hub = self.get_device(device_id)
+        sub_device = self.get_sub_device(device_id, sub_device_id)
+        sub_type = 0 if sub_device is None else _ac_socket_sub_type(sub_device)
+        confirm_slot = _confirmation_slot(sub_type)
+        device_code = device_code or state.device_code
+        # Only slot 0 echoes are verified; the power and status packets carry
+        # no slot bit, so a slot 1 AC's report slot is unknown.
+        reports_state = sub_type == 0 and hub_reports_ac_state(device_code)
+        current_mode = shown_hvac_mode or state.exposed_hvac_mode
+        if (
+            hvac_mode not in ("on", "off")
+            and reports_state
+            and state.observed_status is None
+            and state.restored_hvac_mode is not None
+        ):
+            # The mode restored after a restart is not a report: a 15-byte
+            # packet built without one would reset fan, swing and flags.
+            await self._async_fetch_first_report(device_id, sub_type)
+            current_mode = state.exposed_hvac_mode
+
+        if hvac_mode == "on":
+            return await self._async_power_on_ac_locked(
+                device_id,
+                sub_device_id,
+                state,
+                device_code,
+                confirm_slot,
+                strict=reports_state,
+                on_written=on_first_write,
+            )
+
+        resolved_mode = (
+            current_mode
+            if hvac_mode is None
+            else normalize_ac_mode(hvac_mode.lower())
         )
-        if resolved_mode == "off":
+        if resolved_mode == "off" and target_temperature is None:
             command = build_power_off_command(device_code=device_code)
-            await self.async_send_function_commands(
-                [
-                    AifaFunctionCommand(
-                        id="manual-off",
-                        device_id=device_id,
-                        sub_device_id=sub_device_id,
-                        command=command,
-                    )
-                ]
-            )
-            state.requested_hvac_mode = "off"
-            state.requested_turbo = False
-            state.requested_sleep = False
-            state.requested_power_saving = False
-            state.last_power_command = command
-            state.last_status_command = None
-            state.apply_sent_command_status(
-                AifaAcStatus(
-                    device_code=device_code or state.device_code,
-                    mode="off",
-                    target_temperature=None,
-                    timer_ir_value=0,
-                    fan_mode=None,
-                    swing_mode=None,
-                    turbo=False,
-                    sleep=False,
-                    power_saving=False,
-                    packet_byte_12=0,
-                    packet_byte_13=0,
-                )
-            )
-            self.async_update_listeners()
-            await self._async_probe_ac_observed_state(
-                device_id,
-                sub_device_id,
-                minimum_observed_revision=baseline_observed_revision,
-                expected_mode="off",
-            )
-            self._schedule_ac_follow_up_probe(
-                device_id,
-                sub_device_id,
-                expected_mode="off",
-            )
-            return command
-
-        resolved_target_temperature = clamp_target_temperature(
-            target_temperature if target_temperature is not None else state.requested_target_temperature,
-            device_code=device_code,
-        )
-        resolved_fan_mode = fan_mode or state.requested_fan_mode
-        resolved_swing_mode = swing_mode or state.requested_swing_mode
-        resolved_power_saving, resolved_turbo, resolved_sleep = resolve_helper_flag_mutex(
-            runtime_power_saving=state.requested_power_saving,
-            runtime_turbo=state.requested_turbo,
-            runtime_sleep=state.requested_sleep,
-            caller_power_saving=power_saving,
-            caller_turbo=turbo,
-            caller_sleep=sleep,
-        )
-
-        command = build_status_command(
-            resolved_mode,
-            resolved_target_temperature,
-            device_code=device_code,
-            fan_mode=resolved_fan_mode,
-            swing_mode=resolved_swing_mode,
-            turbo=resolved_turbo,
-            sleep=resolved_sleep,
-            power_saving=resolved_power_saving,
-        )
-        await self.async_send_function_commands(
-            [
+            strict = AC_POWER_OFF_STRICT_CONFIRM and reports_state
+            _, report = await self._async_send_confirmed(
                 AifaFunctionCommand(
-                    id="manual-status",
+                    id="manual-off",
                     device_id=device_id,
                     sub_device_id=sub_device_id,
                     command=command,
+                ),
+                AcConfirmation(
+                    sub_type=confirm_slot,
+                    mode="off" if strict else None,
+                ),
+                on_written=on_first_write,
+            )
+            state.requested_hvac_mode = "off"
+            state.last_power_command = command
+            state.last_status_command = None
+            state.apply_sent_command_status(_off_status(device_code))
+            state.release_power_off()
+            if not strict and report.mode != "off":
+                # The hub repeats this report after a power off it never
+                # reports, so only a different report settles the state; a
+                # slot 1 AC waits for its own, as this one may be slot 0's.
+                state.hold_power_off(report if confirm_slot is not None else None)
+                state.command_status_pending = False
+            self.async_update_listeners()
+            if state.command_status_pending:
+                self._schedule_ac_pending_release(
+                    device_id,
+                    sub_device_id,
+                    expected_mode="off",
                 )
-            ]
+            return command
+
+        def confirmation(*, mode: str, temperature: int | None = None) -> AcConfirmation:
+            if not reports_state:
+                return AcConfirmation(sub_type=confirm_slot)
+            return AcConfirmation(
+                sub_type=sub_type,
+                mode=mode,
+                target_temperature=temperature,
+            )
+
+        power_on_command: str | None = None
+        if target_temperature is None:
+            if current_mode == "off":
+                # The app's mode buttons only work while on, so press its On
+                # button first and build on the report that follows.
+                power_on_command = await self._async_send_power_on(
+                    device_id,
+                    sub_device_id,
+                    state,
+                    device_code,
+                    confirm_slot,
+                    strict=reports_state,
+                    on_written=on_first_write,
+                )
+                on_first_write = None
+                await self._async_throttle_ac_send(lock_key)
+            base = _app_status_base(state, device_code)
+            if hub is not None and hub_requires_mode_keys(hub.version, hub.subversion):
+                command_id = "manual-mode-key"
+                packet = build_mode_key_command(resolved_mode, sub_type)
+                # A mode key leaves the AC's own setpoint alone.
+                sent_status = replace(base, mode=resolved_mode, target_temperature=None)
+            else:
+                command_id = "manual-status"
+                sent_status = replace(base, mode=resolved_mode)
+                packet = build_app_status_command(
+                    sent_status,
+                    key_press=STATUS_KEY_PRESS_MODE,
+                    sub_type=sub_type,
+                    device_code=device_code,
+                )
+            packet_confirmation = confirmation(mode=resolved_mode)
+        else:
+            base = _app_status_base(state, device_code)
+            # The app's slider is disabled in these states.
+            if (
+                resolved_mode in ("off", "auto", "fan_only")
+                or (resolved_mode == "dry" and not base.target_temperature)
+            ):
+                raise ServiceValidationError(
+                    translation_domain=DOMAIN,
+                    translation_key="ac_temperature_unavailable",
+                )
+            temperature = clamp_target_temperature(target_temperature, device_code=device_code)
+            key_press = (
+                STATUS_KEY_PRESS_TEMPERATURE_UP
+                if temperature > (base.target_temperature or 0)
+                else STATUS_KEY_PRESS_TEMPERATURE_DOWN
+            )
+            command_id = "manual-status"
+            sent_status = replace(base, mode=resolved_mode, target_temperature=temperature)
+            packet = build_app_status_command(
+                sent_status,
+                key_press=key_press,
+                sub_type=sub_type,
+                device_code=device_code,
+            )
+            packet_confirmation = confirmation(mode=resolved_mode, temperature=temperature)
+
+        await self._async_send_confirmed(
+            AifaFunctionCommand(
+                id=command_id,
+                device_id=device_id,
+                sub_device_id=sub_device_id,
+                command=packet,
+            ),
+            packet_confirmation,
+            on_written=on_first_write,
         )
 
         state.requested_hvac_mode = resolved_mode
-        state.requested_target_temperature = resolved_target_temperature
-        state.requested_fan_mode = resolved_fan_mode
-        state.requested_swing_mode = resolved_swing_mode
-        state.requested_turbo = resolved_turbo
-        state.requested_sleep = resolved_sleep
-        state.requested_power_saving = resolved_power_saving
+        if sent_status.target_temperature is not None:
+            state.requested_target_temperature = clamp_target_temperature(
+                sent_status.target_temperature, device_code=device_code
+            )
         state.last_active_hvac_mode = resolved_mode
-        state.last_status_command = command
-        state.last_power_command = None
-        decoded_command = decode_status_command(command, device_code=device_code)
-        if decoded_command is not None:
-            state.apply_sent_command_status(decoded_command)
+        state.last_status_command = packet
+        state.last_power_command = power_on_command
+        if reports_state:
+            state.apply_confirmed_command_status(sent_status)
         else:
-            state.command_status = None
-            state.command_status_pending = False
-            state.observed_status = None
-            state.state_source = "requested_fallback"
-            state.helper_flags_state_source = "requested_fallback"
+            state.apply_sent_command_status(sent_status)
         self.async_update_listeners()
-        await self._async_probe_ac_observed_state(
+        if state.command_status_pending:
+            self._schedule_ac_pending_release(
+                device_id,
+                sub_device_id,
+                expected_mode=resolved_mode,
+            )
+        return packet
+
+    async def _async_fetch_first_report(self, device_id: str, sub_type: int) -> None:
+        """Ask the hub for the report a restored state lacks; raise without one."""
+        waiter = _HubReportWaiter()
+        waiters = self._hub_report_waiters.setdefault(device_id, [])
+        waiters.append(waiter)
+        try:
+            transport = await self._async_send_raw_command(
+                AifaFunctionCommand(
+                    id="status-query",
+                    device_id=device_id,
+                    sub_device_id=None,
+                    command=CLASSIC_AC_QUERY_PACKET,
+                )
+            )
+            source = _report_source(transport)
+            if await _async_wait_until(
+                waiter,
+                lambda: any(
+                    report_source == source and slot == sub_type
+                    for report_source, slot, _ in waiter.reports
+                ),
+                AC_CONFIRM_QUERY_TIMEOUT,
+            ):
+                return
+        finally:
+            waiters.remove(waiter)
+            if not waiters and self._hub_report_waiters.get(device_id) is waiters:
+                del self._hub_report_waiters[device_id]
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="ac_state_unknown",
+            translation_placeholders={"device_id": device_id},
+        )
+
+    async def _async_send_power_on(
+        self,
+        device_id: str,
+        sub_device_id: str,
+        state: AifaAcRuntimeState,
+        device_code: str | None,
+        confirm_slot: int | None,
+        *,
+        strict: bool,
+        on_written: Callable[[], None] | None = None,
+    ) -> str:
+        """Send the app's On key; the report it draws must apply as it comes.
+
+        With `strict`, a hub that still reports off raises
+        ac_power_on_not_reported, the key is not resent, and the AC stays
+        off, including a held power off.
+        """
+        command = build_power_on_command(device_code=device_code)
+        held = state.power_off_held
+
+        def written() -> None:
+            # Only a key that went out can have turned the AC on; until then
+            # the stale report the hub repeats must keep showing off.
+            state.release_power_off()
+            if on_written is not None:
+                on_written()
+
+        try:
+            await self._async_send_confirmed(
+                AifaFunctionCommand(
+                    id="manual-power-on",
+                    device_id=device_id,
+                    sub_device_id=sub_device_id,
+                    command=command,
+                ),
+                AcConfirmation(sub_type=confirm_slot, power_on=strict),
+                on_written=written,
+            )
+        except HomeAssistantError as err:
+            if (
+                getattr(err, "translation_key", None) == "ac_power_on_not_reported"
+                and held
+            ):
+                # Only a repeat of this off report keeps the AC off; any other
+                # report, such as a power on from a remote, is shown.
+                state.hold_power_off(state.observed_status)
+            raise
+        return command
+
+    async def _async_power_on_ac_locked(
+        self,
+        device_id: str,
+        sub_device_id: str,
+        state: AifaAcRuntimeState,
+        device_code: str | None,
+        confirm_slot: int | None,
+        *,
+        strict: bool,
+        on_written: Callable[[], None] | None = None,
+    ) -> str:
+        command = await self._async_send_power_on(
             device_id,
             sub_device_id,
-            minimum_observed_revision=baseline_observed_revision,
-            expected_mode=resolved_mode,
-            expected_target_temperature=resolved_target_temperature,
-            expected_fan_mode=resolved_fan_mode,
-            expected_swing_mode=resolved_swing_mode,
+            state,
+            device_code,
+            confirm_slot,
+            strict=strict,
+            on_written=on_written,
         )
-        self._schedule_ac_follow_up_probe(
-            device_id,
-            sub_device_id,
-            expected_mode=resolved_mode,
-            expected_target_temperature=resolved_target_temperature,
-            expected_fan_mode=resolved_fan_mode,
-            expected_swing_mode=resolved_swing_mode,
-        )
+        state.last_power_command = command
+        observed = state.observed_status
+        if observed is None or observed.mode == "off":
+            # Nothing reported the mode the AC came back in; show the last one.
+            # Not pending, so the next report, whatever it says, replaces it.
+            mode = state.last_active_hvac_mode or get_default_mode(device_code)
+            state.requested_hvac_mode = mode
+            state.apply_sent_command_status(
+                replace(_app_status_base(state, device_code), mode=mode)
+            )
+            state.command_status_pending = False
+        else:
+            state.requested_hvac_mode = observed.mode
+            state.command_status = None
+            state.state_source = "aifa_socket"
+        self.async_update_listeners()
         return command
 
     async def _async_update_data(self) -> AifaAccountData:
@@ -498,7 +1454,42 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
             raise
         self._consecutive_failures = 0
         self._clear_polling_issue()
+        self.running_on_cache = False
+        if not self._closed:
+            # The next entry owns the cache once this one has unloaded.
+            await self._async_save_device_cache(result)
         return result
+
+    async def _async_save_device_cache(self, result: AifaAccountData) -> None:
+        if self._device_cache is None:
+            return
+        try:
+            await self._device_cache.async_save(result.devices, result.macros)
+        except Exception as err:  # noqa: BLE001 - a disk problem must not fail the poll
+            _LOGGER.warning("Unable to write the AIFA device cache: %s", err)
+
+    async def async_start_from_cache(self) -> bool:
+        """Seed data from the device cache after a failed first refresh.
+
+        last_update_success stays False, so cloud-bound entities remain
+        unavailable while LAN control works; polling keeps retrying the cloud.
+        """
+        if self._device_cache is None:
+            return False
+        cached = await self._device_cache.async_load()
+        if cached is None:
+            return False
+        devices, macros, saved_at = cached
+        for device in devices.values():
+            for sub_device in device.sub_devices:
+                self._async_refresh_runtime_state(device.id, sub_device)
+        self.data = AifaAccountData(
+            devices=devices,
+            macros=macros,
+            fetched_at=saved_at or dt_util.utcnow(),
+        )
+        self.running_on_cache = True
+        return True
 
     def _raise_polling_issue(self) -> None:
         """Surface a Repairs entry once sustained polling failure crosses the threshold."""
@@ -535,10 +1526,12 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
                         functions_by_id[function.id] = function
                 device.functions = list(functions_by_id.values())
 
-                await self._async_refresh_device_observed_states(device)
                 enriched[device.id] = device
 
-            self._classic_listener.sync_specs(enriched)
+            if not self._closed:
+                self._classic_listener.sync_specs(enriched)
+                if self._lan_manager is not None:
+                    self._lan_manager.sync_specs(enriched)
             self._prune_stale_runtime_state(enriched)
             return AifaAccountData(
                 devices=enriched,
@@ -552,17 +1545,35 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         except AifaSmartError as err:
             raise UpdateFailed(str(err)) from err
 
-    async def _async_enrich_sub_device(self, sub_device: AifaSubDevice) -> None:
-        """Attach selected device-code metadata and AC capability hints."""
-        catalog = self._device_code_catalogs.get(sub_device.id)
-        if catalog is None:
-            catalog = await self.client.async_get_sub_device_device_codes(sub_device.id)
-            self._device_code_catalogs[sub_device.id] = catalog
+    def selected_brand_id(self, sub_device: AifaSubDevice) -> str | None:
+        """The brand chosen in the options flow while the code is still the one chosen."""
+        options = getattr(getattr(self, "entry", None), "options", None) or {}
+        records = options.get(CONF_SELECTED_BRANDS)
+        record = records.get(sub_device.id) if isinstance(records, dict) else None
+        if not isinstance(record, dict) or not record.get("brand_id"):
+            return None
+        # Changed elsewhere, e.g. in the AIFA Smart app, the choice no longer applies.
+        if _code_key(record.get("device_code")) != _code_key(sub_device.device_code):
+            return None
+        return str(record["brand_id"])
 
-        sub_device.available_brand_count = len(catalog.brands)
-        sub_device.available_device_code_count = len(catalog.device_codes)
-
-        selected = catalog.find_by_code(sub_device.device_code)
+    def _apply_catalog_row(
+        self, sub_device: AifaSubDevice, catalog: AifaDeviceCodeCatalog
+    ) -> None:
+        brand_id = self.selected_brand_id(sub_device)
+        selected = None
+        if brand_id is not None:
+            code = _code_key(sub_device.device_code)
+            selected = next(
+                (
+                    row
+                    for row in catalog.device_codes
+                    if row.brand_id == brand_id and _code_key(row.code) == code
+                ),
+                None,
+            )
+        if selected is None:
+            selected = catalog.find_by_code(sub_device.device_code)
         if selected is not None:
             sub_device.device_code_brand_id = selected.brand_id
             sub_device.device_code_brand_name = selected.brand_name
@@ -573,6 +1584,53 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
             sub_device.device_code_type = selected.type
             sub_device.device_code_remote = selected.remote
             sub_device.device_code_popular = selected.popular
+
+    def _record_selected_brand(
+        self, sub_device_id: str, brand_id: str | None, device_code: str | int
+    ) -> None:
+        options = self.entry.options
+        records = dict(options.get(CONF_SELECTED_BRANDS) or {})
+        if brand_id:
+            records[sub_device_id] = {
+                "brand_id": brand_id,
+                "device_code": _code_key(device_code),
+            }
+        else:
+            records.pop(sub_device_id, None)
+        self.hass.config_entries.async_update_entry(
+            self.entry, options={**options, CONF_SELECTED_BRANDS: records}
+        )
+
+    async def async_select_brand(
+        self, device_id: str, sub_device_id: str, row: AifaDeviceCode
+    ) -> None:
+        """Keep the brand chosen with the code the AC already uses.
+
+        Shown from the cached catalog; without one the next poll shows it.
+        """
+        sub_device = self.get_sub_device(device_id, sub_device_id)
+        if sub_device is None:
+            return
+        self._record_selected_brand(sub_device_id, row.brand_id, sub_device.device_code)
+        catalog = self._device_code_catalogs.get(sub_device_id)
+        if catalog is None:
+            return
+        self._apply_catalog_row(sub_device, catalog)
+        if self.data is not None:
+            await self._async_save_device_cache(self.data)
+        self.async_update_listeners()
+
+    async def _async_enrich_sub_device(self, sub_device: AifaSubDevice) -> None:
+        """Attach selected device-code metadata and AC capability hints."""
+        catalog = self._device_code_catalogs.get(sub_device.id)
+        if catalog is None:
+            catalog = await self.client.async_get_sub_device_device_codes(sub_device.id)
+            self._device_code_catalogs[sub_device.id] = catalog
+
+        sub_device.available_brand_count = len(catalog.brands)
+        sub_device.available_device_code_count = len(catalog.device_codes)
+
+        self._apply_catalog_row(sub_device, catalog)
 
         if (sub_device.type or "").strip() == "0" and sub_device.device_code:
             capabilities = get_ac_capabilities(sub_device.device_code)
@@ -610,10 +1668,6 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
             state.requested_target_temperature,
             device_code=sub_device.device_code,
         )
-        if state.requested_fan_mode not in get_ac_capabilities(sub_device.device_code).fan_modes:
-            state.requested_fan_mode = get_ac_capabilities(sub_device.device_code).fan_modes[0]
-        if state.requested_swing_mode not in get_ac_capabilities(sub_device.device_code).swing_modes:
-            state.requested_swing_mode = get_ac_capabilities(sub_device.device_code).swing_modes[-1]
 
         if state.observed_status is not None and state.observed_status.device_code is None:
             state.observed_status = AifaAcStatus(
@@ -628,228 +1682,49 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
                 power_saving=state.observed_status.power_saving,
                 packet_byte_12=state.observed_status.packet_byte_12,
                 packet_byte_13=state.observed_status.packet_byte_13,
+                reported_fan_mode=state.observed_status.reported_fan_mode,
             )
 
-    async def _async_refresh_device_observed_states(self, device: AifaDevice) -> None:
-        """Refresh observed AC runtime state for all supported sub-devices on one hub."""
-        if not device.online or not device.mac:
-            return
-
-        ac_sub_devices = [
-            sub_device
-            for sub_device in device.sub_devices
-            if is_supported_ac_sub_device(sub_device.type, sub_device.device_code)
-        ]
-        if not ac_sub_devices:
-            return
-
-        observed_by_sub_type = await self.client.async_query_classic_ac_statuses(
-            device.mac,
-            sub_types={_ac_socket_sub_type(sub_device) for sub_device in ac_sub_devices},
-        )
-        if not observed_by_sub_type:
-            return
-
-        for sub_device in ac_sub_devices:
-            state = self.get_ac_runtime_state(
-                device.id,
-                sub_device.id,
-                device_code=sub_device.device_code,
-            )
-            observed = observed_by_sub_type.get(_ac_socket_sub_type(sub_device))
-            if observed is None:
-                continue
-            state.apply_observed_status(observed)
-
-    async def _async_probe_ac_observed_state(
-        self,
-        device_id: str,
-        sub_device_id: str,
-        *,
-        minimum_observed_revision: int | None = None,
-        expected_mode: str | None = None,
-        expected_target_temperature: int | None = None,
-        expected_fan_mode: str | None = None,
-        expected_swing_mode: str | None = None,
-    ) -> bool:
-        """Probe one AC sub-device through the private classic socket."""
-        device = self.get_device(device_id)
-        sub_device = self.get_sub_device(device_id, sub_device_id)
-        if (
-            device is None
-            or sub_device is None
-            or not device.online
-            or not device.mac
-            or not is_supported_ac_sub_device(sub_device.type, sub_device.device_code)
-        ):
-            return False
-
-        if self._classic_listener.has_active_listener(device_id) and await self._async_wait_for_classic_socket_update(
-            device_id,
-            sub_device_id,
-            minimum_observed_revision=minimum_observed_revision,
-            expected_mode=expected_mode,
-            expected_target_temperature=expected_target_temperature,
-            expected_fan_mode=expected_fan_mode,
-            expected_swing_mode=expected_swing_mode,
-        ):
-            return True
-
-        observed_by_sub_type = await self.client.async_query_classic_ac_statuses(
-            device.mac,
-            sub_types={_ac_socket_sub_type(sub_device)},
-        )
-        observed = observed_by_sub_type.get(_ac_socket_sub_type(sub_device))
-        if observed is None:
-            return False
-
-        state = self.get_ac_runtime_state(
-            device_id,
-            sub_device_id,
-            device_code=sub_device.device_code,
-        )
-        state.apply_observed_status(observed)
-        self.async_update_listeners()
-        return True
-
-    async def _async_wait_for_classic_socket_update(
-        self,
-        device_id: str,
-        sub_device_id: str,
-        *,
-        minimum_observed_revision: int | None = None,
-        expected_mode: str | None = None,
-        expected_target_temperature: int | None = None,
-        expected_fan_mode: str | None = None,
-        expected_swing_mode: str | None = None,
-        timeout: float = 2.5,
-    ) -> bool:
-        """Wait briefly for the long-lived classic socket listener to push a fresh state."""
-        if not self._classic_listener.has_active_listener(device_id):
-            return False
-
-        state = self.get_ac_runtime_state(device_id, sub_device_id)
-        baseline_revision = (
-            state.observed_revision if minimum_observed_revision is None else minimum_observed_revision
-        )
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while loop.time() < deadline:
-            if state.observed_status is not None and state.observed_revision > baseline_revision:
-                if expected_mode is None:
-                    return True
-                if self._ac_state_matches_expectation(
-                    device_id,
-                    sub_device_id,
-                    expected_mode=expected_mode,
-                    expected_target_temperature=expected_target_temperature,
-                    expected_fan_mode=expected_fan_mode,
-                    expected_swing_mode=expected_swing_mode,
-                ):
-                    return True
-            await asyncio.sleep(0.1)
-        return False
-
-    def _schedule_ac_follow_up_probe(
-        self,
-        device_id: str,
-        sub_device_id: str,
-        *,
-        expected_mode: str | None,
-        expected_target_temperature: int | None = None,
-        expected_fan_mode: str | None = None,
-        expected_swing_mode: str | None = None,
-    ) -> None:
-        """Schedule background socket re-probes until the observed state settles."""
-        key = (device_id, sub_device_id)
-        task = self._ac_follow_up_probe_tasks.pop(key, None)
+    def _cancel_ac_pending_release(self, key: tuple[str, str]) -> None:
+        task = self._ac_pending_release_tasks.pop(key, None)
         if task is not None and not task.done():
             task.cancel()
 
-        self._ac_follow_up_probe_tasks[key] = self.hass.async_create_task(
-            self._async_follow_up_ac_probe(
-                device_id,
-                sub_device_id,
-                expected_mode=expected_mode,
-                expected_target_temperature=expected_target_temperature,
-                expected_fan_mode=expected_fan_mode,
-                expected_swing_mode=expected_swing_mode,
-            )
+    def _schedule_ac_pending_release(
+        self,
+        device_id: str,
+        sub_device_id: str,
+        *,
+        expected_mode: str | None,
+    ) -> None:
+        """Stop preferring the sent state once the hub had time to push its own.
+
+        Like the AIFA Smart app, nothing is asked after a command: a matching report
+        clears the pending state on arrival, and otherwise the hub's last
+        report is shown once the window ends.
+        """
+        key = (device_id, sub_device_id)
+        self._cancel_ac_pending_release(key)
+        window = (
+            AC_PENDING_RELEASE_OFF_SECONDS
+            if expected_mode == "off"
+            else AC_PENDING_RELEASE_SECONDS
+        )
+        self._ac_pending_release_tasks[key] = self.hass.async_create_task(
+            self._async_release_ac_pending(key, window)
         )
 
-    async def _async_follow_up_ac_probe(
-        self,
-        device_id: str,
-        sub_device_id: str,
-        *,
-        expected_mode: str | None,
-        expected_target_temperature: int | None = None,
-        expected_fan_mode: str | None = None,
-        expected_swing_mode: str | None = None,
+    async def _async_release_ac_pending(
+        self, key: tuple[str, str], window: float
     ) -> None:
-        """Poll the private socket in the background until the AC state settles."""
-        key = (device_id, sub_device_id)
-        delays = (2.0, 4.0, 8.0, 12.0) if expected_mode == "off" else (2.0, 4.0, 8.0)
         try:
-            for delay in delays:
-                await asyncio.sleep(delay)
-                if not await self._async_probe_ac_observed_state(
-                    device_id,
-                    sub_device_id,
-                    expected_mode=expected_mode,
-                    expected_target_temperature=expected_target_temperature,
-                    expected_fan_mode=expected_fan_mode,
-                    expected_swing_mode=expected_swing_mode,
-                ):
-                    continue
-                if self._ac_state_matches_expectation(
-                    device_id,
-                    sub_device_id,
-                    expected_mode=expected_mode,
-                    expected_target_temperature=expected_target_temperature,
-                    expected_fan_mode=expected_fan_mode,
-                    expected_swing_mode=expected_swing_mode,
-                ):
-                    break
-        except asyncio.CancelledError:
-            raise
+            await asyncio.sleep(window)
         finally:
-            current = self._ac_follow_up_probe_tasks.get(key)
-            if current is asyncio.current_task():
-                state = self.get_ac_runtime_state(device_id, sub_device_id)
+            if self._ac_pending_release_tasks.get(key) is asyncio.current_task():
+                self._ac_pending_release_tasks.pop(key, None)
+                state = self.get_ac_runtime_state(*key)
                 state.clear_pending_command_status()
                 self.async_update_listeners()
-                self._ac_follow_up_probe_tasks.pop(key, None)
-
-    def _ac_state_matches_expectation(
-        self,
-        device_id: str,
-        sub_device_id: str,
-        *,
-        expected_mode: str | None,
-        expected_target_temperature: int | None = None,
-        expected_fan_mode: str | None = None,
-        expected_swing_mode: str | None = None,
-    ) -> bool:
-        """Return True when the latest observed AC state matches the requested shape."""
-        state = self.get_ac_runtime_state(device_id, sub_device_id)
-        observed = state.observed_status
-        if observed is None:
-            return False
-        if expected_mode is None:
-            return True
-        if observed.mode != expected_mode:
-            return False
-        if expected_target_temperature is not None and observed.target_temperature not in (
-            None,
-            expected_target_temperature,
-        ):
-            return False
-        if expected_fan_mode is not None and observed.fan_mode not in (None, expected_fan_mode):
-            return False
-        if expected_swing_mode is not None and observed.swing_mode not in (None, expected_swing_mode):
-            return False
-        return True
 
     def _apply_classic_sensor_state(
         self,
@@ -864,7 +1739,7 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
         now = dt_util.utcnow()
         updated = False
 
-        # The cloud value is what i-Ctrl Pro displays; the hub's raw packet
+        # The cloud value is what the AIFA Smart app displays; the hub's raw packet
         # converts differently, so it only fills readings the cloud lacks.
         for key, value in (
             ("temperature", decoded.temperature),
@@ -885,15 +1760,39 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
             device.updated_at = now
         return updated
 
-    def _apply_classic_observed_status(
+    def _apply_lan_observed_status(
         self,
         spec: AifaClassicSocketListenerSpec,
         sub_type: int,
         observed: AifaAcStatus,
     ) -> bool:
-        """Apply one observed classic AC status to all matching sub-devices on the hub."""
+        return self._apply_classic_observed_status(spec, sub_type, observed, source="lan")
+
+    def _apply_cloud_stream_status(
+        self,
+        spec: AifaClassicSocketListenerSpec,
+        sub_type: int,
+        observed: AifaAcStatus,
+    ) -> bool:
+        return self._apply_classic_observed_status(spec, sub_type, observed, source="cloud")
+
+    def _apply_classic_observed_status(
+        self,
+        spec: AifaClassicSocketListenerSpec,
+        sub_type: int,
+        observed: AifaAcStatus,
+        *,
+        source: str | None = None,
+    ) -> bool:
+        """Apply one observed classic AC status to all matching sub-devices on the hub.
+
+        `source` names the long-lived connection a report was read from; only
+        those reports can confirm a command sent on that connection.
+        """
         updated = False
         for target in spec.targets:
+            if self._reported_slot(spec.device_id, target) == sub_type:
+                self._check_reported_device_code(spec.device_id, target, observed)
             if target.sub_type != sub_type:
                 continue
             status = observed
@@ -910,6 +1809,7 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
                     power_saving=observed.power_saving,
                     packet_byte_12=observed.packet_byte_12,
                     packet_byte_13=observed.packet_byte_13,
+                    reported_fan_mode=observed.reported_fan_mode,
                 )
             state = self.get_ac_runtime_state(
                 spec.device_id,
@@ -919,4 +1819,799 @@ class AifaSmartCoordinator(TimestampDataUpdateCoordinator[AifaAccountData]):
             previous_revision = state.observed_revision
             state.apply_observed_status(status)
             updated = updated or state.observed_revision != previous_revision
+        if source is not None:
+            for waiter in self._hub_report_waiters.get(spec.device_id, ()):
+                waiter.reports.append((source, sub_type, observed))
+                waiter.event.set()
         return updated
+
+    def _apply_lan_set_code_ack(
+        self, spec: AifaClassicSocketListenerSpec, slot: int, high: int, low: int
+    ) -> bool:
+        return self._record_set_code_ack(spec.device_id, "lan", slot, high, low)
+
+    def _apply_cloud_set_code_ack(
+        self, spec: AifaClassicSocketListenerSpec, slot: int, high: int, low: int
+    ) -> bool:
+        return self._record_set_code_ack(spec.device_id, "cloud", slot, high, low)
+
+    def _record_set_code_ack(
+        self, device_id: str, source: str, slot: int, high: int, low: int
+    ) -> bool:
+        """Hand an echo to the waiters; True when a code change of ours takes it."""
+        claimed = False
+        for waiter in self._hub_report_waiters.get(device_id, ()):
+            waiter.acks.append((source, slot, high, low))
+            waiter.event.set()
+            claimed = claimed or waiter.changing_code
+        return claimed and slot in (0xA0, 0xA1)
+
+    def _apply_lan_set_code_reject(self, spec: AifaClassicSocketListenerSpec) -> None:
+        self._record_set_code_reject(spec.device_id, "lan")
+
+    def _apply_cloud_set_code_reject(self, spec: AifaClassicSocketListenerSpec) -> None:
+        self._record_set_code_reject(spec.device_id, "cloud")
+
+    def _record_set_code_reject(self, device_id: str, source: str) -> None:
+        """Hand a `fb f5` to a code change of ours; nobody else uses it."""
+        for waiter in self._hub_report_waiters.get(device_id, ()):
+            if waiter.changing_code:
+                waiter.rejects.append(source)
+                waiter.event.set()
+
+    def _apply_lan_code_match(self, spec: AifaClassicSocketListenerSpec, packet: bytes) -> bool:
+        return self._record_code_match(spec.device_id, "lan", packet)
+
+    def _apply_cloud_code_match(self, spec: AifaClassicSocketListenerSpec, packet: bytes) -> bool:
+        return self._record_code_match(spec.device_id, "cloud", packet)
+
+    def _record_code_match(self, device_id: str, source: str, packet: bytes) -> bool:
+        """Hand a match reply to a running match; True when it takes the packet.
+
+        Nothing else may read a candidate: it has the shape of a SetCode echo.
+        """
+        match = self._code_matches.get(device_id)
+        parsed = parse_code_match_packet(packet)
+        if match is None or parsed is None or parsed[1] != match.slot:
+            return False
+        kind, _, code = parsed
+        match.replies.append((source, kind, code, len(packet) == 4))
+        match.event.set()
+        return True
+
+    def _reported_slot(self, device_id: str, target: AifaClassicSocketTarget) -> int:
+        """Slot whose reports carry this AC's code: fe a1 for subType 1.
+
+        target.sub_type is 0 for every AC (_ac_socket_sub_type), so it cannot
+        tell two ACs on one hub apart.
+        """
+        sub_device = self.get_sub_device(device_id, target.sub_device_id)
+        return set_code_slot(None if sub_device is None else sub_device.sub_type) & 0x01
+
+    def _check_reported_device_code(
+        self, device_id: str, target: AifaClassicSocketTarget, observed: AifaAcStatus
+    ) -> None:
+        """Compare the hub's first reported code with the cloud's, once per setup.
+
+        Only raises a repair issue: which side is right is for the user to say.
+        """
+        checked = self._device_code_checked
+        key = (device_id, target.sub_device_id)
+        if checked is None or key in checked:
+            return
+        if device_id in self._code_trials or any(
+            w.changing_code for w in self._hub_report_waiters.get(device_id, ())
+        ):
+            return
+        # 5-digit codes are never echoed, and their bytes alias other codes.
+        if not hub_reports_ac_state(target.device_code):
+            checked.add(key)
+            return
+        cloud_bytes = device_code_wire_bytes(target.device_code)
+        hub_bytes = device_code_wire_bytes(observed.device_code)
+        if cloud_bytes is None or hub_bytes is None:
+            return
+        checked.add(key)
+        issue_id = f"{ISSUE_DEVICE_CODE_MISMATCH}_{target.sub_device_id}"
+        if cloud_bytes == hub_bytes:
+            ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+            return
+        sub_device = self.get_sub_device(device_id, target.sub_device_id)
+        _LOGGER.warning(
+            "AIFA hub %s reports code %s for sub-device %s, the cloud has %s",
+            device_id,
+            observed.device_code,
+            target.sub_device_id,
+            target.device_code,
+        )
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            issue_id,
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=ISSUE_DEVICE_CODE_MISMATCH,
+            translation_placeholders={
+                "name": sub_device.name if sub_device is not None else target.sub_device_id,
+                "hub_code": str(observed.device_code),
+                "cloud_code": str(target.device_code),
+            },
+        )
+
+    async def async_change_device_code(
+        self,
+        device_id: str,
+        sub_device_id: str,
+        row: AifaDeviceCode,
+        *,
+        owner: str | None = None,
+    ) -> bool:
+        """Run the change in a task of its own and wait for it.
+
+        Closing the dialog cancels the flow step; the change must still run
+        to the end, or the hub could stay on a code the cloud never got.
+        `owner` names the flow whose code trial the change may finish.
+        """
+        if device_id in self._code_matches:
+            raise DeviceCodeChangeError("code_match_running")
+        task = self.hass.async_create_background_task(
+            self._async_change_device_code(device_id, sub_device_id, row, owner),
+            name=f"{DOMAIN}_change_device_code_{sub_device_id}",
+        )
+        # A trial started behind a running change would take the code the
+        # cloud had before it.
+        self._code_changes_running.add(device_id)
+        task.add_done_callback(lambda _: self._code_changes_running.discard(device_id))
+        return await asyncio.shield(task)
+
+    def _code_change_target(
+        self, device_id: str, sub_device_id: str, row: AifaDeviceCode
+    ) -> tuple[AifaSubDevice, int, int, int]:
+        """Return (sub-device, slot, cloud code, new code), or raise why not."""
+        sub_device, slot, old_code = self._code_change_sub_device(device_id, sub_device_id)
+        new_code = settable_device_code(row.code)
+        if new_code is None or row.remote is not False:
+            raise DeviceCodeChangeError("code_unsupported")
+        return sub_device, slot, old_code, new_code
+
+    def _code_change_sub_device(
+        self, device_id: str, sub_device_id: str
+    ) -> tuple[AifaSubDevice, int, int]:
+        """Return (sub-device, slot, cloud code), or raise why its code cannot change."""
+        sub_device = self.get_sub_device(device_id, sub_device_id)
+        if sub_device is None or not is_supported_ac_sub_device(
+            sub_device.type, sub_device.device_code
+        ):
+            raise DeviceCodeChangeError("sub_device_unsupported")
+        if sub_device.learned_key_count:
+            raise DeviceCodeChangeError("learned_keys")
+        # Control packets and reports use slot 0 for every AC
+        # (_ac_socket_sub_type), so a slot 1 SetCode would change a code
+        # the integration never uses.
+        if set_code_slot(sub_device.sub_type) != 0xA0:
+            raise DeviceCodeChangeError("sub_device_unsupported")
+        old_code = settable_device_code(sub_device.device_code)
+        if old_code is None:
+            raise DeviceCodeChangeError("current_code_unsupported")
+        return sub_device, set_code_slot(sub_device.sub_type), old_code
+
+    def _owned_code_trial(self, device_id: str, owner: str | None) -> CodeTrial | None:
+        trial = self._code_trials.get(device_id)
+        if trial is not None and trial.owner != owner:
+            raise DeviceCodeChangeError("code_change_busy")
+        return trial
+
+    async def _async_change_device_code(
+        self,
+        device_id: str,
+        sub_device_id: str,
+        row: AifaDeviceCode,
+        owner: str | None = None,
+    ) -> bool:
+        """Switch an air conditioner to another remote code, like the AIFA Smart app.
+
+        The cloud is only updated after the hub confirmed the new code twice:
+        its SetCode echo and a status report carrying the code. A hub that a
+        trial left on the new code only needs the report. Any failure puts
+        the old code back on the hub, and on the cloud when a PATCH may have
+        landed. Returns False when the code is already in use.
+        """
+        sub_device, slot, old_code, new_code = self._code_change_target(
+            device_id, sub_device_id, row
+        )
+        if new_code == old_code:
+            return False
+
+        async with self._ac_apply_lock(device_id):
+            trial = self._owned_code_trial(device_id, owner)
+            hub_code = old_code if trial is None else trial.hub_code
+            if (
+                trial is not None
+                and hub_code == new_code
+                and await self._async_confirm_hub_code(device_id, slot, new_code)
+            ):
+                outcome = SetCodeOutcome.CONFIRMED
+            else:
+                outcome = await self._async_set_hub_code(
+                    device_id, slot, new_code, current_code=hub_code
+                )
+            if outcome is SetCodeOutcome.NOT_SENT:
+                raise DeviceCodeChangeError("set_code_not_sent")
+            if outcome is SetCodeOutcome.REJECTED:
+                raise DeviceCodeChangeError("set_code_rejected")
+            if outcome is not SetCodeOutcome.CONFIRMED:
+                restored = await self._async_restore_hub_code(device_id, slot, old_code)
+                self._note_trial_hub_code(device_id, owner, old_code if restored else None)
+                if not restored:
+                    raise DeviceCodeChangeError("restore_unconfirmed")
+                raise DeviceCodeChangeError(
+                    {
+                        SetCodeOutcome.MISMATCH: "set_code_mismatch",
+                        SetCodeOutcome.REJECTED_UNVERIFIED: "set_code_rejected_unverified",
+                    }.get(outcome, "set_code_unconfirmed")
+                )
+            self._note_trial_hub_code(device_id, owner, new_code)
+            try:
+                await self.client.async_update_sub_device_code(sub_device_id, new_code)
+            except AifaSmartError as err:
+                _LOGGER.warning(
+                    "Storing code %s for AIFA sub-device %s in the cloud failed: %s",
+                    new_code,
+                    sub_device_id,
+                    err,
+                )
+                restored = await self._async_restore_hub_code(device_id, slot, old_code)
+                self._note_trial_hub_code(device_id, owner, old_code if restored else None)
+                cloud_known = not _update_may_have_landed(err) or await self._async_restore_cloud_code(
+                    sub_device_id, old_code
+                )
+                if restored:
+                    raise DeviceCodeChangeError(
+                        "cloud_update_failed" if cloud_known else "cloud_update_unknown"
+                    ) from err
+                raise DeviceCodeChangeError(
+                    "restore_unconfirmed" if cloud_known else "restore_unconfirmed_cloud_unknown"
+                ) from err
+            trial = self._code_trials.get(device_id)
+            if trial is not None and trial.owner == owner:
+                # The cloud now has the code the hub uses.
+                self._drop_code_trial(device_id, trial)
+
+        self._record_selected_brand(sub_device_id, row.brand_id, new_code)
+        # A poll during the change may have replaced the sub-device object.
+        current = self.get_sub_device(device_id, sub_device_id) or sub_device
+        await self._async_apply_new_device_code(device_id, current, new_code)
+        # Entities, key lists and listener specs are all built from the code
+        # at setup; scheduled here so a closed dialog still gets the reload.
+        self.hass.config_entries.async_schedule_reload(self.entry.entry_id)
+        return True
+
+    async def async_match_device_code(self, device_id: str, sub_device_id: str) -> list[int]:
+        """Let the hub find codes for the original remote, like the AIFA Smart app's one-touch match.
+
+        After StartMatch the user presses the remote's power key at the hub;
+        it answers with a candidate, then one more for every NextMatch, until
+        an end frame. Returns the candidates in the hub's order; nothing is
+        set on the hub or stored in the cloud.
+        """
+        _, slot, _ = self._code_change_sub_device(device_id, sub_device_id)
+        if self._closing or self._code_change_running(device_id):
+            raise DeviceCodeChangeError("code_change_busy")
+        if device_id in self._code_matches:
+            raise DeviceCodeChangeError("code_match_running")
+        # Registered before the lock, so trials, changes and AC commands are
+        # refused while this waits for it.
+        match = _CodeMatch(slot=slot)
+        self._code_matches[device_id] = match
+        # The hub has no StopMatch and waits for NextMatch after a candidate,
+        # so a closed dialog must not cut the match short: it runs to its end
+        # frame or the 15 s timeout in a task of its own.
+        task = self.hass.async_create_background_task(
+            self._async_run_code_match(device_id, match),
+            name=f"{DOMAIN}_match_device_code_{sub_device_id}",
+        )
+        if not task.done():
+            self._code_match_tasks.add(task)
+            task.add_done_callback(self._code_match_tasks.discard)
+        return await asyncio.shield(task)
+
+    async def _async_run_code_match(self, device_id: str, match: _CodeMatch) -> list[int]:
+        try:
+            async with self._ac_apply_lock(device_id):
+                if self._closing or self._code_change_running(device_id):
+                    raise DeviceCodeChangeError("code_change_busy")
+                return await self._async_match_device_code(device_id, match)
+        finally:
+            if self._code_matches.get(device_id) is match:
+                del self._code_matches[device_id]
+
+    def _code_change_running(self, device_id: str) -> bool:
+        """Whether a SetCode may be under way: a candidate would look like its echo."""
+        return (
+            device_id in self._code_changes_running
+            or device_id in self._code_trials
+            or any(w.changing_code for w in self._hub_report_waiters.get(device_id, ()))
+        )
+
+    async def _async_match_device_code(self, device_id: str, match: _CodeMatch) -> list[int]:
+        # Replies before StartMatch belong to an earlier match.
+        index = len(match.replies)
+        transport = await self._async_send_match_packet(
+            device_id, build_code_match_start_command(match.slot)
+        )
+        source = _report_source(transport)
+        next_packet = build_code_match_next_command(match.slot)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + CODE_MATCH_TIMEOUT
+        codes: list[int] = []
+        short_end_at: float | None = None
+        while True:
+            while index < len(match.replies):
+                reply_source, kind, code, short = match.replies[index]
+                index += 1
+                if reply_source != source:
+                    continue
+                if kind is CodeMatchReply.END and short:
+                    if short_end_at is None:
+                        short_end_at = loop.time() + CODE_MATCH_SHORT_END_GRACE
+                    continue
+                if kind is CodeMatchReply.CANDIDATE:
+                    short_end_at = None
+                if kind is CodeMatchReply.FAILED:
+                    # The AIFA Smart app drops the candidates it already has.
+                    _LOGGER.warning("AIFA hub %s failed the code match", device_id)
+                    raise DeviceCodeChangeError("code_match_failed")
+                if kind is CodeMatchReply.END:
+                    _LOGGER.debug("AIFA hub %s matched codes %s", device_id, codes)
+                    if not codes:
+                        raise DeviceCodeChangeError("code_match_none")
+                    return codes
+                if code is not None and code not in codes:
+                    codes.append(code)
+                # The hub waits for NextMatch before it sends another one.
+                await self._async_send_match_packet(device_id, next_packet, transport)
+            if short_end_at is not None and loop.time() >= short_end_at:
+                _LOGGER.debug("AIFA hub %s matched codes %s", device_id, codes)
+                if not codes:
+                    raise DeviceCodeChangeError("code_match_none")
+                return codes
+            remaining = deadline - loop.time()
+            if short_end_at is not None:
+                # The grace may run past the timeout: the end did arrive in time.
+                remaining = short_end_at - loop.time()
+            elif remaining <= 0:
+                _LOGGER.warning(
+                    "AIFA hub %s did not end the code match in %s s (candidates %s)",
+                    device_id,
+                    CODE_MATCH_TIMEOUT,
+                    codes,
+                )
+                raise DeviceCodeChangeError("code_match_timeout")
+            match.event.clear()
+            try:
+                await asyncio.wait_for(match.event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _async_send_match_packet(
+        self, device_id: str, packet: str, transport: str | None = None
+    ) -> str:
+        """Send one match packet; NextMatch goes where StartMatch went."""
+        command = AifaFunctionCommand(
+            id="code-match", device_id=device_id, sub_device_id=None, command=packet
+        )
+        try:
+            if transport is None:
+                return await self._async_send_raw_command(command)
+            if transport == "lan":
+                return await self._async_send_raw_command_lan(command)
+            return await self._async_send_raw_command_cloud(command)
+        except (HomeAssistantError, OSError, RuntimeError) as err:
+            _LOGGER.warning("Code match packet %s to AIFA hub %s failed: %s", packet, device_id, err)
+            raise DeviceCodeChangeError("code_match_not_sent") from err
+
+    def code_trial(self, device_id: str) -> CodeTrial | None:
+        """The trial that left this hub off its cloud code, if any."""
+        return self._code_trials.get(device_id)
+
+    async def async_try_device_code(
+        self, device_id: str, sub_device_id: str, row: AifaDeviceCode, *, owner: str
+    ) -> None:
+        """Put the hub on a code and press its power key, like the AIFA Smart app's pairing.
+
+        Nothing is stored in the cloud. The hub stays on the code until a
+        save, `async_release_code_trial` or an unload puts it back.
+        """
+        _, slot, old_code, new_code = self._code_change_target(
+            device_id, sub_device_id, row
+        )
+        if self._closing or device_id in self._code_changes_running:
+            raise DeviceCodeChangeError("code_change_busy")
+        if device_id in self._code_matches:
+            raise DeviceCodeChangeError("code_match_running")
+        trial = self._owned_code_trial(device_id, owner)
+        if trial is None:
+            # Registered before the press starts, so a flow removed while it
+            # runs still finds the trial to undo.
+            trial = CodeTrial(
+                owner=owner,
+                sub_device_id=sub_device_id,
+                slot=slot,
+                original_code=old_code,
+                hub_code=old_code,
+            )
+            self._code_trials[device_id] = trial
+            trial.remove_shutdown_job = self.hass.async_add_shutdown_job(
+                HassJob(self._async_end_code_trial_on_stop),
+                device_id,
+                trial,
+            )
+        elif trial.press is not None and not trial.press.done():
+            raise DeviceCodeChangeError("code_trial_running")
+        # Closing the dialog cancels the flow step; the press must still end
+        # with a known hub code.
+        trial.press = self.hass.async_create_background_task(
+            self._async_try_device_code(device_id, trial, new_code),
+            name=f"{DOMAIN}_try_device_code_{sub_device_id}",
+        )
+        await asyncio.shield(trial.press)
+
+    async def _async_try_device_code(
+        self, device_id: str, trial: CodeTrial, code: int
+    ) -> None:
+        try:
+            async with self._ac_apply_lock(device_id):
+                if self._code_trials.get(device_id) is not trial:
+                    raise DeviceCodeChangeError("code_change_busy")
+                outcome = await self._async_set_hub_code(
+                    device_id, trial.slot, code, current_code=trial.hub_code, trial=True
+                )
+                if outcome is SetCodeOutcome.NOT_SENT:
+                    raise DeviceCodeChangeError("set_code_not_sent")
+                if outcome is SetCodeOutcome.REJECTED:
+                    raise DeviceCodeChangeError("set_code_rejected")
+                if outcome is not SetCodeOutcome.ACKED:
+                    restored = await self._async_restore_hub_code(
+                        device_id, trial.slot, trial.original_code
+                    )
+                    trial.hub_code = trial.original_code if restored else None
+                    if not restored:
+                        raise DeviceCodeChangeError("restore_unconfirmed")
+                    raise DeviceCodeChangeError(
+                        {
+                            SetCodeOutcome.MISMATCH: "set_code_mismatch",
+                            SetCodeOutcome.REJECTED_UNVERIFIED: "set_code_rejected_unverified",
+                        }.get(outcome, "set_code_unconfirmed")
+                    )
+                trial.hub_code = code
+                # Like the AIFA Smart app, nothing is awaited after the press: whether
+                # the AC reacted is for the user to see.
+                try:
+                    await self._async_send_raw_command(
+                        AifaFunctionCommand(
+                            id=f"pairing-key-{code}",
+                            device_id=device_id,
+                            sub_device_id=None,
+                            command=build_pairing_key_command(trial.slot),
+                        )
+                    )
+                except (HomeAssistantError, OSError, RuntimeError) as err:
+                    _LOGGER.warning(
+                        "Pairing key to AIFA hub %s after SetCode %s failed: %s",
+                        device_id,
+                        code,
+                        err,
+                    )
+                    raise DeviceCodeChangeError("trial_key_not_sent") from err
+                self._ac_last_send_at[(device_id, trial.sub_device_id)] = time.monotonic()
+        finally:
+            if self._code_trials.get(device_id) is trial and trial.hub_code == trial.original_code:
+                self._drop_code_trial(device_id, trial)
+
+    @callback
+    def async_release_code_trial(self, device_id: str, owner: str) -> None:
+        """Put the hub back on its cloud code once the owning flow is gone."""
+        trial = self._code_trials.get(device_id)
+        if trial is None or trial.owner != owner:
+            return
+        self.hass.async_create_background_task(
+            self._async_end_code_trial(device_id, trial),
+            name=f"{DOMAIN}_end_code_trial_{trial.sub_device_id}",
+        )
+
+    async def async_end_code_trial(self, device_id: str, owner: str) -> bool:
+        """Put the hub back on its cloud code and wait; False when unconfirmed.
+
+        An unconfirmed restore keeps the trial, so the next call sends
+        SetCode again instead of taking the hub's code as known.
+        """
+        trial = self._code_trials.get(device_id)
+        if trial is None:
+            return True
+        if trial.owner != owner:
+            raise DeviceCodeChangeError("code_change_busy")
+        task = self.hass.async_create_background_task(
+            self._async_end_code_trial(device_id, trial, keep_unconfirmed=True),
+            name=f"{DOMAIN}_end_code_trial_{trial.sub_device_id}",
+        )
+        return await asyncio.shield(task)
+
+    async def _async_end_code_trial_on_stop(self, device_id: str, trial: CodeTrial) -> None:
+        # HA iterates its shutdown jobs while running them; removing this one
+        # from inside, as a restore that fails at once would, skips the next.
+        trial.remove_shutdown_job = None
+        await self._async_end_code_trial(device_id, trial)
+
+    async def _async_end_code_trial(
+        self, device_id: str, trial: CodeTrial, *, keep_unconfirmed: bool = False
+    ) -> bool:
+        press = trial.press
+        if press is not None and not press.done():
+            await asyncio.wait({press})
+        async with self._ac_apply_lock(device_id):
+            if self._code_trials.get(device_id) is not trial:
+                return True
+            restored = trial.hub_code == trial.original_code or await self._async_restore_hub_code(
+                device_id, trial.slot, trial.original_code
+            )
+            if restored or not keep_unconfirmed:
+                # Even unconfirmed once the flow is gone: keeping the trial
+                # would refuse every AC command with no dialog left to end it.
+                self._drop_code_trial(device_id, trial)
+            else:
+                trial.hub_code = None
+            return restored
+
+    def _note_trial_hub_code(
+        self, device_id: str, owner: str | None, code: int | None
+    ) -> None:
+        trial = self._code_trials.get(device_id)
+        if trial is None or trial.owner != owner:
+            return
+        trial.hub_code = code
+        if code == trial.original_code:
+            self._drop_code_trial(device_id, trial)
+
+    def _drop_code_trial(self, device_id: str, trial: CodeTrial) -> None:
+        if self._code_trials.get(device_id) is trial:
+            del self._code_trials[device_id]
+        if trial.remove_shutdown_job is not None:
+            trial.remove_shutdown_job()
+            trial.remove_shutdown_job = None
+        # Reports during the trial were not compared with the cloud code;
+        # the next one is, so a hub left on another code raises the issue.
+        if self._device_code_checked is not None:
+            self._device_code_checked.discard((device_id, trial.sub_device_id))
+
+    async def _async_confirm_hub_code(self, device_id: str, slot: int, code: int) -> bool:
+        """Query the hub and return True when its report carries `code`."""
+        waiter = _HubReportWaiter(changing_code=True)
+        waiters = self._hub_report_waiters.setdefault(device_id, [])
+        waiters.append(waiter)
+        try:
+            try:
+                transport = await self._async_send_raw_command(
+                    AifaFunctionCommand(
+                        id="set-code-check",
+                        device_id=device_id,
+                        sub_device_id=None,
+                        command=CLASSIC_AC_QUERY_PACKET,
+                    )
+                )
+            except (HomeAssistantError, OSError, RuntimeError) as err:
+                _LOGGER.debug("Code check query to AIFA hub %s failed: %s", device_id, err)
+                return False
+            source = _report_source(transport)
+            wanted = device_code_wire_bytes(code)
+            report_sub_type = slot & 0x01
+            return await _async_wait_until(
+                waiter,
+                lambda: any(
+                    report_source == source
+                    and sub_type == report_sub_type
+                    and device_code_wire_bytes(observed.device_code) == wanted
+                    for report_source, sub_type, observed in waiter.reports
+                ),
+                SET_CODE_QUERY_TIMEOUT,
+            )
+        finally:
+            waiters.remove(waiter)
+            if not waiters and self._hub_report_waiters.get(device_id) is waiters:
+                del self._hub_report_waiters[device_id]
+
+    async def _async_restore_hub_code(self, device_id: str, slot: int, code: int) -> bool:
+        outcome = await self._async_set_hub_code(device_id, slot, code)
+        if outcome is not SetCodeOutcome.CONFIRMED:
+            _LOGGER.error(
+                "AIFA hub %s did not confirm the restored code %s (%s); "
+                "the hub's code is unknown",
+                device_id,
+                code,
+                outcome,
+            )
+            return False
+        return True
+
+    async def _async_restore_cloud_code(self, sub_device_id: str, code: int) -> bool:
+        """Put the old code back after a PATCH whose result is unknown."""
+        try:
+            await self.client.async_update_sub_device_code(sub_device_id, code)
+        except AifaSmartError as err:
+            _LOGGER.error(
+                "Restoring code %s for AIFA sub-device %s in the cloud failed: %s",
+                code,
+                sub_device_id,
+                err,
+            )
+            return False
+        return True
+
+    async def _async_set_hub_code(
+        self,
+        device_id: str,
+        slot: int,
+        code: int,
+        *,
+        current_code: int | None = None,
+        trial: bool = False,
+    ) -> SetCodeOutcome:
+        """Send SetCode, then check the echo and a queried status report.
+
+        A `fb f5` refusal ends the wait for the echo at once. A query then
+        decides: `current_code` makes it REJECTED and anything else
+        REJECTED_UNVERIFIED; without `current_code`, as when restoring, the
+        code sent makes it CONFIRMED. With `trial` an echo of the code ends
+        it as ACKED after the settle time, ready for the test press.
+        Callers hold the hub's apply lock.
+        """
+        command = AifaFunctionCommand(
+            id=f"set-code-{code}",
+            device_id=device_id,
+            sub_device_id=None,
+            command=build_set_code_command(slot, code),
+        )
+        expected_bytes = device_code_wire_bytes(code)
+        report_sub_type = slot & 0x01
+        waiter = _HubReportWaiter(changing_code=True)
+        waiters = self._hub_report_waiters.setdefault(device_id, [])
+        waiters.append(waiter)
+        try:
+            try:
+                transport = await self._async_send_raw_command(command)
+            except HomeAssistantError as err:
+                if getattr(err, "translation_key", None) in _WRITE_FAILED_KEYS:
+                    return SetCodeOutcome.UNCONFIRMED
+                _LOGGER.warning("SetCode to AIFA hub %s was not sent: %s", device_id, err)
+                return SetCodeOutcome.NOT_SENT
+            except (OSError, RuntimeError) as err:
+                _LOGGER.warning("SetCode to AIFA hub %s failed while writing: %s", device_id, err)
+                return SetCodeOutcome.UNCONFIRMED
+            source = _report_source(transport)
+            expected_ack = (source, slot, *expected_bytes)  # type: ignore[misc]
+            # A late refusal of an earlier SetCode is not about this one.
+            rejects_start = len(waiter.rejects)
+
+            if not await _async_wait_until(
+                waiter,
+                lambda: expected_ack in waiter.acks
+                or source in waiter.rejects[rejects_start:],
+                SET_CODE_ACK_TIMEOUT,
+            ):
+                if any(ack[0] == source for ack in waiter.acks):
+                    _LOGGER.warning(
+                        "AIFA hub %s echoed %s instead of SetCode %s",
+                        device_id,
+                        waiter.acks,
+                        command.command,
+                    )
+                    return SetCodeOutcome.MISMATCH
+                _LOGGER.warning("AIFA hub %s did not echo SetCode %s", device_id, command.command)
+                return SetCodeOutcome.UNCONFIRMED
+
+            rejected = expected_ack not in waiter.acks
+            wanted_bytes = expected_bytes
+            if rejected:
+                _LOGGER.warning(
+                    "AIFA hub %s refused SetCode %s with fb f5", device_id, command.command
+                )
+                if current_code is not None:
+                    wanted_bytes = device_code_wire_bytes(current_code)
+                await asyncio.sleep(SET_CODE_REJECT_SETTLE)
+            else:
+                await asyncio.sleep(SET_CODE_SETTLE_SECONDS)
+                if trial:
+                    return SetCodeOutcome.ACKED
+            start = len(waiter.reports)
+
+            def covered() -> list[AifaAcStatus]:
+                return [
+                    observed
+                    for report_source, sub_type, observed in waiter.reports[start:]
+                    if report_source == source and sub_type == report_sub_type
+                ]
+
+            unverified = (
+                SetCodeOutcome.REJECTED_UNVERIFIED
+                if rejected and current_code is not None
+                else None
+            )
+            if not await self._async_query_hub_status(device_id, transport):
+                return unverified or SetCodeOutcome.UNCONFIRMED
+            if await _async_wait_until(
+                waiter,
+                lambda: any(
+                    device_code_wire_bytes(observed.device_code) == wanted_bytes
+                    for observed in covered()
+                ),
+                SET_CODE_QUERY_TIMEOUT,
+            ):
+                if rejected and current_code is not None:
+                    return SetCodeOutcome.REJECTED
+                return SetCodeOutcome.CONFIRMED
+            if unverified is not None:
+                _LOGGER.warning(
+                    "AIFA hub %s refused SetCode %s but did not report code %s",
+                    device_id,
+                    code,
+                    current_code,
+                )
+                return unverified
+            reports = covered()
+            if reports:
+                _LOGGER.warning(
+                    "AIFA hub %s reports code %s after SetCode %s",
+                    device_id,
+                    reports[-1].device_code,
+                    code,
+                )
+                return SetCodeOutcome.MISMATCH
+            return SetCodeOutcome.UNCONFIRMED
+        finally:
+            waiters.remove(waiter)
+            if not waiters and self._hub_report_waiters.get(device_id) is waiters:
+                del self._hub_report_waiters[device_id]
+
+    async def _async_apply_new_device_code(
+        self, device_id: str, sub_device: AifaSubDevice, new_code: int
+    ) -> None:
+        """Use the new code locally until the entry reloads from the cloud."""
+        sub_device.device_code = str(new_code)
+        try:
+            await self._async_enrich_sub_device(sub_device)
+        except AifaSmartError as err:
+            _LOGGER.debug("Refreshing code metadata for %s failed: %s", sub_device.id, err)
+        self._async_refresh_runtime_state(device_id, sub_device)
+        if self._device_code_checked is not None:
+            self._device_code_checked.discard((device_id, sub_device.id))
+        ir.async_delete_issue(
+            self.hass, DOMAIN, f"{ISSUE_DEVICE_CODE_MISMATCH}_{sub_device.id}"
+        )
+        if self.data is not None:
+            await self._async_save_device_cache(self.data)
+        self.async_update_listeners()
+
+
+def settable_device_code(device_code: str | None) -> int | None:
+    """The code as SetCode can carry it, or None."""
+    try:
+        code = int(str(device_code).strip())
+    except (TypeError, ValueError):
+        return None
+    return code if 0 < code <= SET_CODE_MAX_DEVICE_CODE else None
+
+
+def _code_key(device_code: str | int | None) -> str | None:
+    """A code as the cloud and the catalog spell it, so "0115" matches 115."""
+    code = settable_device_code(device_code)
+    if code is not None:
+        return str(code)
+    return None if device_code is None else str(device_code).strip()
+
+
+def _update_may_have_landed(err: AifaSmartError) -> bool:
+    """A timeout or a 5xx may hide a stored PATCH; a 4xx or auth error does not."""
+    if isinstance(err, AifaSmartAuthError):
+        return False
+    if isinstance(err, AifaSmartApiError):
+        return err.status is None or err.status >= 500
+    return True

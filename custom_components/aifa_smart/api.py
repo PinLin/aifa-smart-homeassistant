@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 import ssl
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -11,14 +12,6 @@ from typing import Any, Callable, Mapping
 
 import aiohttp
 
-from .ac import (
-    AifaAcStatus,
-    CLASSIC_WAKE_REPLY_PACKET,
-    build_ac_query_packet,
-    build_ac_query_single_type_packet,
-    build_query_anti_mold_packet,
-    decode_observed_status_packet,
-)
 from .const import (
     API_BASE_URL,
     CLASSIC_SOCKET_HOST,
@@ -30,10 +23,16 @@ from .const import (
     OAUTH_CLIENT_ID,
     OAUTH_TOKEN_PATH,
     SUB_DEVICE_DEVICE_CODES_PATH,
-    SUB_DEVICE_SET_CODE_PATH,
+    SUB_DEVICE_PATH,
 )
 
 _LOGGER = logging.getLogger(__name__)
+_KEEPALIVE_IDLE = 60
+_KEEPALIVE_INTERVAL = 10
+_KEEPALIVE_COUNT = 3
+# Unacknowledged writes bypass keepalive; without this a vanished peer would
+# keep accepting "sent" commands until the kernel retransmit limit (~15 min).
+_USER_TIMEOUT_MS = 20000
 _CLASSIC_SOCKET_HANDSHAKE_PREFIX = bytes.fromhex("a1fad7c0")
 _CLASSIC_WAKE_UP_PREFIX = bytes.fromhex("f1ee")
 _CLASSIC_NOTIFY_PREFIX = bytes.fromhex("faf5")
@@ -215,6 +214,8 @@ class AifaSubDevice:
     ac_supports_power_saving: bool | None = None
     ac_supports_turbo: bool | None = None
     estimated_capabilities: list[str] = field(default_factory=list)
+    # The AIFA Smart app refuses to change the code while any learned key exists.
+    learned_key_count: int = 0
     functions: list[AifaFunction] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -235,6 +236,8 @@ class AifaDevice:
     functions: list[AifaFunction] = field(default_factory=list)
     updated_at: datetime | None = None
     sensor_samples: dict[str, AifaSensorSample] = field(default_factory=dict)
+    version: int | None = None
+    subversion: int | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     def get_sub_device(self, sub_device_id: str) -> AifaSubDevice | None:
@@ -499,6 +502,162 @@ def extract_classic_status_packets(buffer: bytes) -> tuple[list[bytes], bytes]:
     return packets, b""
 
 
+def extract_set_code_ack_packets(buffer: bytes) -> tuple[list[bytes], bytes]:
+    """Extract the hub's `fa f5 <slot> <hi> <lo> f0` SetCode echoes."""
+    packets: list[bytes] = []
+    scan_index = 0
+    buffer_length = len(buffer)
+
+    while scan_index <= buffer_length - 6:
+        start = buffer.find(b"\xfa\xf5", scan_index)
+        if start < 0 or start + 6 > buffer_length:
+            break
+        candidate = buffer[start : start + 6]
+        if candidate[-1] == _CLASSIC_PACKET_END:
+            packets.append(candidate)
+            scan_index = start + 6
+            continue
+        scan_index = start + 1
+
+    incomplete_start = buffer.rfind(b"\xfa", scan_index)
+    if incomplete_start >= 0 and buffer_length - incomplete_start < 6:
+        return packets, buffer[incomplete_start:]
+    return packets, b""
+
+
+# (prefix, length) of the frames ending in f0 that may hold the bytes fb f5.
+_SET_CODE_REJECT_SKIPPED_FRAMES: dict[int, tuple[tuple[int, ...], int]] = {
+    0xFE: ((0xA0, 0xA1), 14),
+    0xFA: ((0xF5,), 6),
+    0xF1: ((0xEE,), 4),
+}
+
+
+def extract_set_code_reject_packets(buffer: bytes) -> tuple[list[bytes], bytes]:
+    """Extract the hub's 2-byte `fb f5` answer to a SetCode it does not support.
+
+    The reply has no end byte, so the bytes of a status report or an echo
+    could look like one; complete frames of those kinds are stepped over,
+    and one cut off at the end is kept until the rest arrives.
+    """
+    packets: list[bytes] = []
+    index = 0
+    length = len(buffer)
+    while index < length:
+        byte = buffer[index]
+        if byte == 0xFB:
+            if index + 1 >= length:
+                return packets, buffer[index:]
+            if buffer[index + 1] == 0xF5:
+                packets.append(buffer[index : index + 2])
+                index += 2
+                continue
+            index += 1
+            continue
+        frame = _SET_CODE_REJECT_SKIPPED_FRAMES.get(byte)
+        if frame is None:
+            index += 1
+            continue
+        second_bytes, frame_length = frame
+        if index + 1 >= length:
+            return packets, buffer[index:]
+        if buffer[index + 1] not in second_bytes:
+            index += 1
+            continue
+        if index + frame_length > length:
+            return packets, buffer[index:]
+        if buffer[index + frame_length - 1] == _CLASSIC_PACKET_END:
+            index += frame_length
+            continue
+        index += 1
+    return packets, b""
+
+
+_CODE_MATCH_SLOTS = (0xA0, 0xA1)
+_CODE_MATCH_SKIPPED_FRAMES = {
+    prefix: frame
+    for prefix, frame in _SET_CODE_REJECT_SKIPPED_FRAMES.items()
+    if prefix != 0xFA
+}
+
+
+def _is_bcd_byte(byte: int) -> bool:
+    return byte >> 4 <= 9 and byte & 0x0F <= 9
+
+
+def extract_code_match_packets(
+    buffer: bytes, *, held: bool = False
+) -> tuple[list[bytes], bytes]:
+    """Extract the hub's replies to a code match from a buffer ending at a chunk.
+
+    `fb f5 <slot>` (failed) comes out as 3 bytes, `fa f5 <slot> <hi> <lo> f0`
+    as 6. The AIFA Smart app tells the 4-byte end `fa f5 <slot> xx` by the length of
+    the notification; a byte stream has none, so it is 4 bytes when the 6
+    bytes it starts do not end in f0, or when the chunk ends after it. A
+    chunk may also end inside a candidate, so when xx can open its BCD code
+    the 4 bytes are also kept for the next chunk; the caller waits a moment
+    before it trusts such an end. `held` says the buffer starts with such
+    4 bytes, already returned, so they only come out again as a candidate.
+    A 2-byte `fb f5` (a refused SetCode) and status or heartbeat frames are
+    stepped over.
+    """
+    packets: list[bytes] = []
+    index = 0
+    length = len(buffer)
+    while index < length:
+        byte = buffer[index]
+        if byte in (0xFA, 0xFB):
+            if index + 2 >= length:
+                if buffer[index + 1 : index + 2] in (b"", b"\xf5"):
+                    return packets, buffer[index:]
+                index += 1
+                continue
+            if buffer[index + 1] != 0xF5:
+                index += 1
+                continue
+            if buffer[index + 2] not in _CODE_MATCH_SLOTS:
+                index += 2 if byte == 0xFB else 1
+                continue
+            if byte == 0xFB:
+                packets.append(buffer[index : index + 3])
+                index += 3
+                continue
+            if index + 6 <= length and buffer[index + 5] == _CLASSIC_PACKET_END:
+                packets.append(buffer[index : index + 6])
+                index += 6
+                continue
+            if index + 4 < length < index + 6:
+                return packets, buffer[index:]
+            again = held and index == 0
+            if index + 4 == length and _is_bcd_byte(buffer[index + 3]):
+                if not again:
+                    packets.append(buffer[index : index + 4])
+                return packets, buffer[index:]
+            if index + 4 <= length:
+                if not again:
+                    packets.append(buffer[index : index + 4])
+                index += 4
+                continue
+            return packets, buffer[index:]
+        frame = _CODE_MATCH_SKIPPED_FRAMES.get(byte)
+        if frame is None:
+            index += 1
+            continue
+        second_bytes, frame_length = frame
+        if index + 1 >= length:
+            return packets, buffer[index:]
+        if buffer[index + 1] not in second_bytes:
+            index += 1
+            continue
+        if index + frame_length > length:
+            return packets, buffer[index:]
+        if buffer[index + frame_length - 1] == _CLASSIC_PACKET_END:
+            index += frame_length
+            continue
+        index += 1
+    return packets, b""
+
+
 def extract_classic_wake_packets(buffer: bytes) -> tuple[list[bytes], bytes]:
     """Extract wake-up packets that require the classic ``ccdd`` reply."""
     packets: list[bytes] = []
@@ -614,7 +773,7 @@ def decode_classic_sensor_packet(
                 + (1.05 * raw_temperature)
                 + 0.235
             )
-            # i-Ctrl Pro subtracts 1 °C for deviceType 4 (i-Ctrl AC) hubs.
+            # The AIFA Smart app subtracts 1 °C for deviceType 4 (i-Ctrl AC) hubs.
             if device_type is not None and device_type.strip() == "4":
                 temperature -= 1.0
 
@@ -630,24 +789,6 @@ _extract_classic_status_packets = extract_classic_status_packets
 _extract_classic_wake_packets = extract_classic_wake_packets
 _extract_classic_notify_packets = extract_classic_notify_packets
 _extract_classic_sensor_packets = extract_classic_sensor_packets
-
-
-def build_classic_ac_query_steps(sub_types: set[int] | None) -> list[tuple[str, float]]:
-    """Build the app-like classic AC query sequence for one or more sub-types."""
-    normalized_sub_types: list[int] = []
-    for item in sub_types or set():
-        value = int(item)
-        if value in {0, 1} and value not in normalized_sub_types:
-            normalized_sub_types.append(value)
-
-    query_steps: list[tuple[str, float]] = []
-    if normalized_sub_types:
-        for item in normalized_sub_types:
-            query_steps.append((build_ac_query_single_type_packet(item), 0.30))
-            query_steps.append((build_query_anti_mold_packet(item), 0.60))
-    else:
-        query_steps.append((build_ac_query_packet(), 0.30))
-    return query_steps
 
 
 def _parse_device(raw: Mapping[str, Any]) -> AifaDevice | None:
@@ -688,6 +829,8 @@ def _parse_device(raw: Mapping[str, Any]) -> AifaDevice | None:
         updated_at=_coerce_datetime(
             _pick(raw, "updatedAt", "updated_at", "timestamp", "timeStamp", "time")
         ),
+        version=_coerce_int(_pick(raw, "version")),
+        subversion=_coerce_int(_pick(raw, "subversion")),
         raw=dict(raw),
     )
     return device
@@ -706,8 +849,26 @@ def _parse_sub_device(raw: Mapping[str, Any], device_id: Any) -> AifaSubDevice |
         type=_coerce_str(_pick(raw, "type")),
         sub_type=_coerce_str(_pick(raw, "subType", "sub_type")),
         device_code=_coerce_str(_pick(raw, "deviceCode", "device_code")),
+        learned_key_count=_count_learned_keys(raw.get("learnedKeys"), sub_device_id),
         raw=dict(raw),
     )
+
+
+def _count_learned_keys(rows: Any, sub_device_id: Any) -> int:
+    """Count learned keys like the AIFA Smart app: rows whose subDeviceId is this sub-device.
+
+    A row without subDeviceId sits under this sub-device, so it counts too.
+    """
+    if not isinstance(rows, list):
+        return 0
+    count = 0
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        owner = _pick(row, "subDeviceId", "sub_device_id")
+        if owner is None or str(owner) == str(sub_device_id):
+            count += 1
+    return count
 
 
 def _parse_function_command(raw: Mapping[str, Any], fallback_order: int) -> AifaFunctionCommand | None:
@@ -910,6 +1071,32 @@ def _parse_macro(raw: Mapping[str, Any]) -> AifaMacro | None:
     )
 
 
+def enable_tcp_keepalive(sock: socket.socket | None) -> None:
+    """Detect half-open links, e.g. when the hub loses power or the WAN drops.
+
+    The probes stop at the TCP peer (the cloud relay for the TLS socket), so
+    they never reach the hub as packets it has to handle.
+    """
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        idle_opt = getattr(socket, "TCP_KEEPIDLE", None) or getattr(
+            socket, "TCP_KEEPALIVE", None
+        )
+        if idle_opt is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, idle_opt, _KEEPALIVE_IDLE)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KEEPALIVE_INTERVAL)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KEEPALIVE_COUNT)
+        if hasattr(socket, "TCP_USER_TIMEOUT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, _USER_TIMEOUT_MS)
+    except OSError as err:
+        _LOGGER.debug("Unable to enable TCP keepalive on an AIFA socket: %s", err)
+
+
+
 class AifaSmartApiClient:
     """Client for the AIFA Smart cloud API."""
 
@@ -1022,27 +1209,14 @@ class AifaSmartApiClient:
             return AifaDeviceCodeCatalog()
         return _parse_device_code_catalog(payload)
 
-    async def async_push_sub_device_code(
-        self, *, sub_device_id: int, device_code_id: int
+    async def async_update_sub_device_code(
+        self, sub_device_id: str, device_code: int
     ) -> None:
-        """Tell the hub to load a Classic device-code IR profile.
-
-        POST /sub-devices/{id}/set-code with `{"deviceCodeId": N}`. Cloud
-        relays the request via TLS 8751; on 204 the hub writes the code
-        into NAND-persistent storage and resumes broadcasting its BCD in
-        the idle frame `fea00<HHLL>...f0`.
-
-        Verified empirically (2026-04-29 against firmware v4):
-        - Hub state survives full power cycle (NAND-backed).
-        - Cloud rejects with 404 "Device not connected" when the hub is
-          offline — set-code is NOT queued for later delivery.
-        - 5-digit (Plus) codes return 202 "No device code set or device
-          code is downloaded"; the IR data must first be pushed via the
-          TLS DevicePacket.plusDownload* protocol, not implemented here.
-        """
-        path = SUB_DEVICE_SET_CODE_PATH.format(sub_device_id=sub_device_id)
+        """Store a new code in the cloud: PATCH /sub-devices/{id} with only deviceCode."""
         await self._authorized_request(
-            "POST", path, json={"deviceCodeId": device_code_id}
+            "PATCH",
+            SUB_DEVICE_PATH.format(sub_device_id=sub_device_id),
+            json={"deviceCode": int(device_code)},
         )
 
     async def async_transfer_packet(
@@ -1127,134 +1301,6 @@ class AifaSmartApiClient:
             except OSError:
                 pass
             raise
-
-    async def async_query_classic_ac_statuses(
-        self,
-        mac: str,
-        *,
-        sub_types: set[int] | None = None,
-        timeout: float = 6.0,
-    ) -> dict[int, AifaAcStatus]:
-        """Query observed AC controller state through the private classic socket.
-
-        Current behavior mirrors the app more closely than the earlier generic probe:
-        - for known AC sub-types we send ``acQuerySingleType(subType)``
-        - then, after a short gap, ``queryAntiMold(subType)``
-        - if the controller sends a wake-up frame, we reply with ``ccdd``
-        """
-        query_steps = build_classic_ac_query_steps(sub_types)
-        normalized_sub_types = {
-            int(item) for item in (sub_types or set()) if int(item) in {0, 1}
-        }
-
-        observed: dict[int, AifaAcStatus] = {}
-        writer: asyncio.StreamWriter | None = None
-        status_buffer = b""
-        wake_buffer = b""
-
-        try:
-            socket_session = await self.async_open_classic_socket(mac, timeout=timeout)
-            reader = socket_session.reader
-            writer = socket_session.writer
-            status_buffer += socket_session.initial_bytes
-            wake_buffer += socket_session.initial_bytes
-
-            loop = asyncio.get_running_loop()
-            per_packet_window = max(1.0, min(2.0, timeout / max(1, len(query_steps) + 1)))
-
-            async def _drain_for(window_seconds: float) -> None:
-                nonlocal status_buffer, wake_buffer
-                deadline = loop.time() + window_seconds
-                while loop.time() < deadline:
-                    try:
-                        chunk = await asyncio.wait_for(
-                            reader.read(4096),
-                            timeout=min(0.45, max(0.05, deadline - loop.time())),
-                        )
-                    except asyncio.TimeoutError:
-                        continue
-                    if not chunk:
-                        break
-
-                    status_buffer += chunk
-                    wake_buffer += chunk
-
-                    wake_packets, wake_buffer = extract_classic_wake_packets(wake_buffer)
-                    if wake_packets:
-                        _LOGGER.debug(
-                            "Classic socket wake-up packet(s) received for %s: %s",
-                            mac,
-                            [packet.hex() for packet in wake_packets],
-                        )
-                        writer.write(bytes.fromhex(CLASSIC_WAKE_REPLY_PACKET))
-                        await writer.drain()
-
-                    packets, status_buffer = extract_classic_status_packets(status_buffer)
-                    for raw_packet in packets:
-                        decoded = decode_observed_status_packet(raw_packet)
-                        if decoded is None:
-                            continue
-                        sub_type, status = decoded
-                        observed[sub_type] = status
-
-                    if normalized_sub_types and all(
-                        sub_type in observed for sub_type in normalized_sub_types
-                    ):
-                        break
-
-            for packet, settle_seconds in query_steps:
-                writer.write(bytes.fromhex(packet))
-                await writer.drain()
-                await _drain_for(min(per_packet_window, settle_seconds))
-                if normalized_sub_types and all(
-                    sub_type in observed for sub_type in normalized_sub_types
-                ):
-                    return observed
-
-            final_deadline = loop.time() + 1.0
-            while loop.time() < final_deadline:
-                try:
-                    chunk = await asyncio.wait_for(
-                        reader.read(4096),
-                        timeout=min(0.5, max(0.05, final_deadline - loop.time())),
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                if not chunk:
-                    break
-
-                status_buffer += chunk
-                wake_buffer += chunk
-
-                wake_packets, wake_buffer = extract_classic_wake_packets(wake_buffer)
-                if wake_packets:
-                    _LOGGER.debug(
-                        "Classic socket wake-up packet(s) received for %s: %s",
-                        mac,
-                        [packet.hex() for packet in wake_packets],
-                    )
-                    writer.write(bytes.fromhex(CLASSIC_WAKE_REPLY_PACKET))
-                    await writer.drain()
-
-                packets, status_buffer = extract_classic_status_packets(status_buffer)
-                for raw_packet in packets:
-                    decoded = decode_observed_status_packet(raw_packet)
-                    if decoded is None:
-                        continue
-                    sub_type, status = decoded
-                    observed[sub_type] = status
-
-            return observed
-        except (asyncio.TimeoutError, OSError) as err:
-            _LOGGER.debug("Classic socket query failed for %s: %s", mac, err)
-            return {}
-        finally:
-            if writer is not None:
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except OSError:
-                    pass
 
     async def _authorized_request(
         self, method: str, path: str, **kwargs: Any

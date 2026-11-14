@@ -45,7 +45,7 @@ class CatalogParseAndMergeTests(unittest.TestCase):
         return {
             "entries": {
                 "ac_available_modes": '{"1": ["cool", "heat"], "2": ["cool"]}',
-                "ac_classic_temp_control": '{"codes": [16, 19]}',
+                "ac_classic_temp_control": '{"codes": [115, 116]}',
                 "ac_extra_windspeed": '{"codes": [99]}',
                 "ac_show_display_mold": '{"codes": [134]}',
                 "ac_single_mode_codes": '{"codes": [281]}',
@@ -61,11 +61,11 @@ class CatalogParseAndMergeTests(unittest.TestCase):
         from datetime import datetime, timezone
         parsed = catalog.parse_firebase_payload(
             self._sample_rc_response(),
-            fetched_at=datetime(2026, 5, 3, tzinfo=timezone.utc),
+            fetched_at=datetime(2000, 5, 3, tzinfo=timezone.utc),
         )
         self.assertEqual(parsed.available_modes_by_device_code["1"], ("cool", "heat"))
         self.assertEqual(parsed.available_modes_by_device_code["2"], ("cool",))
-        self.assertIn("16", parsed.classic_temp_control_codes)
+        self.assertIn("115", parsed.classic_temp_control_codes)
         self.assertIn("99", parsed.extra_windspeed_codes)
         self.assertIn("134", parsed.show_display_mold_codes)
         self.assertIn("281", parsed.single_mode_codes)
@@ -126,7 +126,7 @@ class CatalogCacheSerializationTests(unittest.TestCase):
         from datetime import datetime, timezone
         return catalog.Catalog(
             available_modes_by_device_code={"1": ("cool", "heat")},
-            classic_temp_control_codes=frozenset(["16"]),
+            classic_temp_control_codes=frozenset(["115"]),
             extra_windspeed_codes=frozenset(["99"]),
             show_display_mold_codes=frozenset(["134"]),
             single_mode_codes=frozenset(["281"]),
@@ -134,7 +134,7 @@ class CatalogCacheSerializationTests(unittest.TestCase):
             observed_extra_windspeed_codes=frozenset(["1"]),
             observed_turbo_codes=frozenset(["2"]),
             source="live",
-            fetched_at=datetime(2026, 5, 3, 12, 0, 0, tzinfo=timezone.utc),
+            fetched_at=datetime(2000, 5, 3, 12, 0, 0, tzinfo=timezone.utc),
             template_version=47,
         )
 
@@ -175,7 +175,7 @@ class CatalogCacheSerializationTests(unittest.TestCase):
         """A hand-edited cache with a naive timestamp must coerce to UTC, not
         leave T6's cooldown arithmetic crashing on naive vs aware subtraction."""
         dumped = catalog.dump_for_cache(self._live_catalog())
-        dumped["fetched_at"] = "2026-05-03T12:00:00"  # naive — no offset
+        dumped["fetched_at"] = "2000-05-03T12:00:00"  # naive — no offset
         restored = catalog.load_from_cache(dumped)
         self.assertIsNotNone(restored)
         assert restored is not None

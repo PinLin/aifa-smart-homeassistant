@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-# Extracted from AIFA Smart 1.2.5 APK resources.arsc (2026-05-03):
+# Extracted from AIFA Smart 1.2.5 APK resources.arsc:
 PROJECT_ID = "i-ctrl-pro"
 PROJECT_NUMBER = "240868916940"
 APP_ID = "1:240868916940:android:a1bbaac859617483224c69"

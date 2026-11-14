@@ -13,7 +13,7 @@ DEVICES_PATH = "/devices"
 FUNCTIONS_PATH = "/functions"
 DEVICE_TRANSFER_PATH = "/devices/transfer"
 SUB_DEVICE_DEVICE_CODES_PATH = "/sub-devices/{sub_device_id}/device-codes"
-SUB_DEVICE_SET_CODE_PATH = "/sub-devices/{sub_device_id}/set-code"
+SUB_DEVICE_PATH = "/sub-devices/{sub_device_id}"
 MACROS_PATH = "/macros"
 
 # Firebase Remote Config — used to refresh AC capability metadata at runtime.
@@ -35,8 +35,23 @@ CONF_REFRESH_TOKEN = "refresh_token"
 CONF_TOKEN_TYPE = "token_type"
 CONF_TOKEN_EXPIRES_AT = "token_expires_at"
 
-# Hub pushes SENSOR{...} every 60s via TLS 8751 broadcast — empirically
-# verified 2026-04-29 by 5-min passive observation. AC observed state and
+CONF_TRANSPORT = "transport"
+TRANSPORT_CLOUD = "cloud"
+TRANSPORT_LAN = "lan"
+TRANSPORT_AUTO = "auto"
+TRANSPORTS = (TRANSPORT_CLOUD, TRANSPORT_LAN, TRANSPORT_AUTO)
+DEFAULT_TRANSPORT = TRANSPORT_CLOUD
+
+# {sub-device id: {"brand_id": ..., "device_code": ...}} chosen in the code
+# options page. The cloud keeps only the code, which several brands share.
+CONF_SELECTED_BRANDS = "selected_brands"
+
+# The AIFA app also gives the LAN connect-back 3 s before using the cloud.
+LAN_CONNECT_TIMEOUT = 3.0
+LAN_AUTO_SUPPRESS_SECONDS = 60
+LAN_UNAVAILABLE_GRACE_SECONDS = 60
+
+# Hub pushes SENSOR{...} every 60s via TLS 8751 broadcast. AC observed state and
 # sensor packets both arrive on the long-lived classic listener, so the
 # REST poll is mainly a structural-data refresher (devices, functions,
 # macros, favorites, device-codes catalog). Hard-coding to 60s aligns with
@@ -47,3 +62,9 @@ ATTR_DEVICE_TYPE = "device_type"
 ATTR_SUB_DEVICE_COUNT = "sub_device_count"
 ATTR_LAST_UPDATE = "last_update"
 ATTR_RAW_DEVICE = "raw_device"
+
+
+def transport_from_options(options: object) -> str:
+    """Return the configured transport, falling back to the cloud default."""
+    value = options.get(CONF_TRANSPORT) if hasattr(options, "get") else None
+    return value if value in TRANSPORTS else DEFAULT_TRANSPORT
